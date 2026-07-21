@@ -1,13 +1,13 @@
 from __future__ import annotations
 import importlib.util
 import json
-import shutil
 import sys
 from pathlib import Path
 from typing import Dict, Tuple
 import pandas as pd
-from .trainers import RunConfig
-from .utils import adapter_is_complete, llm_adapters_dir
+from .evaluation_identity import prepare_evaluation_cache
+from .trainers import RunConfig, completed_adapter_status
+from .utils import llm_adapters_dir
 MATH_TASKS = ['gsm8k', 'AQuA', 'mawps', 'SVAMP']
 
 def _task_dir_name(task: str) -> str:
@@ -35,8 +35,12 @@ def _safe_load(path: Path):
 def evaluate_math10k(cfg: RunConfig, batch_size: int=64, num_beams: int=4, max_new_tokens: int=256, max_input_length: int=1024) -> Tuple[pd.DataFrame, pd.DataFrame]:
     cfg.finalize()
     adapter_dir = Path(cfg.output_dir)
-    if not adapter_is_complete(adapter_dir):
+    adapter_status = completed_adapter_status(cfg)
+    if adapter_status is None:
         raise RuntimeError(f'Adapter is not complete: {adapter_dir}')
+    evaluation_revision = (
+        adapter_status.get('resolved_model_revision') or cfg.model_revision
+    )
     adapters = llm_adapters_dir(cfg.root)
     eval_py = adapters / 'evaluate.py'
     spec = importlib.util.spec_from_file_location('llm_adapters_math_evaluate', eval_py)
@@ -46,8 +50,23 @@ def evaluate_math10k(cfg: RunConfig, batch_size: int=64, num_beams: int=4, max_n
     spec.loader.exec_module(llm_eval)
     result_dir = Path(cfg.result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
-    shared_exp_dir = adapters / 'experiment'
-    shared_exp_dir.mkdir(parents=True, exist_ok=True)
+    prepare_evaluation_cache(
+        result_dir,
+        {
+            'config_fingerprint': cfg.config_fingerprint,
+            'dataset': cfg.dataset,
+            'base_model': cfg.base_model,
+            'requested_model_revision': cfg.model_revision,
+            'resolved_model_revision': evaluation_revision,
+            'tasks': MATH_TASKS,
+            'batch_size': int(batch_size),
+            'num_beams': int(num_beams),
+            'max_new_tokens': int(max_new_tokens),
+            'max_input_length': int(max_input_length),
+        },
+        artifact_names=[f'{_task_dir_name(task)}.json' for task in MATH_TASKS],
+        force=bool(cfg.force_eval),
+    )
     try:
         lora_weights = str(adapter_dir.relative_to(adapters))
     except ValueError:
@@ -58,20 +77,18 @@ def evaluate_math10k(cfg: RunConfig, batch_size: int=64, num_beams: int=4, max_n
         ds_name = _task_dir_name(task)
         unique_json = result_dir / f'{ds_name}.json'
         acc, data = _safe_load(unique_json)
-        if acc is not None and (not cfg.force_eval):
+        if acc is not None:
             print(f'[eval cache] {task}: {unique_json}')
             results[ds_name] = float(acc)
             rows.append({'dataset': ds_name, 'accuracy': float(acc), 'n': len(data), 'json': str(unique_json)})
             continue
-        shared_json = shared_exp_dir / f'other-LoRA-{ds_name}.json'
-        if shared_json.exists():
-            shared_json.unlink()
-        sys.argv = ['evaluate.py', '--dataset', task, '--model', 'other', '--adapter', 'LoRA', '--base_model', cfg.base_model, '--lora_weights', lora_weights, '--batch_size', str(int(batch_size)), '--num_beams', str(int(num_beams)), '--max_new_tokens', str(int(max_new_tokens)), '--max_input_length', str(int(max_input_length)), '--log_every', '0']
+        sys.argv = ['evaluate.py', '--dataset', task, '--model', 'other', '--adapter', 'LoRA', '--base_model', cfg.base_model, '--lora_weights', lora_weights, '--output_file', str(unique_json), '--batch_size', str(int(batch_size)), '--num_beams', str(int(num_beams)), '--max_new_tokens', str(int(max_new_tokens)), '--max_input_length', str(int(max_input_length)), '--log_every', '0']
+        if evaluation_revision:
+            sys.argv.extend(['--model_revision', str(evaluation_revision)])
         print('[eval]', ' '.join(sys.argv))
         llm_eval.main()
-        if not shared_json.exists():
-            raise FileNotFoundError(f'Expected eval output not found: {shared_json}')
-        shutil.copy2(shared_json, unique_json)
+        if not unique_json.exists():
+            raise FileNotFoundError(f'Expected eval output not found: {unique_json}')
         acc, data = _safe_load(unique_json)
         if acc is None:
             raise RuntimeError(f'Could not parse eval output: {unique_json}')

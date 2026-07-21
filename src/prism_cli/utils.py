@@ -8,6 +8,7 @@ import random
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -26,6 +27,12 @@ def tag_text(x: str) -> str:
 def set_seed(seed: int=42) -> None:
     random.seed(seed)
     os.environ.setdefault('PYTHONHASHSEED', str(seed))
+    try:
+        import numpy as np
+    except ImportError:
+        pass
+    else:
+        np.random.seed(int(seed) % (2**32))
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -45,9 +52,12 @@ def generate_prompt(data_point: Dict[str, Any]) -> str:
         return f"Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request. \n\n                ### Instruction:\n                {data_point['instruction']}\n                \n                ### Input:\n                {data_point['input']}\n                \n                ### Response:\n                {data_point['output']}"
     return f"Below is an instruction that describes a task. Write a response that appropriately completes the request.  \n\n                ### Instruction:\n                {data_point['instruction']}\n                \n                ### Response:\n                {data_point['output']}"
 
-def build_tokenizer(model_id: str):
+def build_tokenizer(model_id: str, *, revision: Optional[str]=None):
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    kwargs = {'trust_remote_code': True}
+    if revision is not None:
+        kwargs['revision'] = revision
+    tok = AutoTokenizer.from_pretrained(model_id, **kwargs)
     tok.padding_side = 'left'
     if tok.pad_token_id is None:
         tok.pad_token_id = 0
@@ -99,8 +109,22 @@ def status_path(output_dir: Path) -> Path:
 def save_status(output_dir: Path, **payload: Any) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    with open(status_path(out), 'w', encoding='utf-8') as f:
-        json.dump(payload, f, indent=2, sort_keys=True, default=str)
+    write_json_atomic(status_path(out), payload)
+
+
+def write_json_atomic(target: Path, payload: Any) -> None:
+    target = Path(target)
+    temporary = _new_atomic_temp_path(target)
+    try:
+        with open(temporary, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, sort_keys=True, default=str)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, target)
+        _fsync_directory(target.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def collect_runtime_metadata(root: Path) -> Dict[str, Any]:
@@ -146,7 +170,16 @@ def checkpoint_file(output_dir: Path) -> Path:
     return Path(output_dir) / '_resume_checkpoint.pt'
 
 def get_rng_state() -> Dict[str, Any]:
-    state = {'torch': torch.get_rng_state()}
+    state: Dict[str, Any] = {
+        'python': random.getstate(),
+        'torch': torch.get_rng_state(),
+    }
+    try:
+        import numpy as np
+    except ImportError:
+        pass
+    else:
+        state['numpy'] = np.random.get_state()
     if torch.cuda.is_available():
         state['cuda'] = torch.cuda.get_rng_state_all()
     return state
@@ -154,10 +187,53 @@ def get_rng_state() -> Dict[str, Any]:
 def set_rng_state(state: Optional[Dict[str, Any]]) -> None:
     if not state:
         return
+    if 'python' in state:
+        random.setstate(state['python'])
+    if 'numpy' in state:
+        try:
+            import numpy as np
+        except ImportError:
+            pass
+        else:
+            np.random.set_state(state['numpy'])
     if 'torch' in state:
         torch.set_rng_state(state['torch'])
     if torch.cuda.is_available() and 'cuda' in state:
         torch.cuda.set_rng_state_all(state['cuda'])
+
+
+def _new_atomic_temp_path(target: Path) -> Path:
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=f'.{target.name}.',
+        suffix='.tmp',
+        dir=str(target.parent),
+    )
+    os.close(fd)
+    return Path(name)
+
+
+def _fsync_file(path: Path) -> None:
+    with open(path, 'rb') as f:
+        os.fsync(f.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, 'O_DIRECTORY'):
+        flags |= os.O_DIRECTORY
+    try:
+        fd = os.open(str(path), flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        # Some filesystems do not support fsync on directory descriptors.
+        pass
+    finally:
+        os.close(fd)
 
 def trainable_state_dict_cpu(model) -> Dict[str, torch.Tensor]:
     model = unwrap_for_save(model)
@@ -195,14 +271,93 @@ def save_resume_checkpoint(output_dir: Path, model, optimizer, update_steps: int
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {'update_steps': int(update_steps), 'trainable_state': trainable_state_dict_cpu(model), 'optimizer_state': optimizer.state_dict() if optimizer is not None else None, 'rng_state': get_rng_state(), 'extra': extra or {}}
-    torch.save(payload, checkpoint_file(output_dir))
+    target = checkpoint_file(output_dir)
+    temporary = _new_atomic_temp_path(target)
+    try:
+        torch.save(payload, temporary)
+        _fsync_file(temporary)
+        os.replace(temporary, target)
+        _fsync_directory(target.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 def load_resume_checkpoint_if_available(output_dir: Path) -> Optional[Dict[str, Any]]:
     path = checkpoint_file(output_dir)
     if not path.exists():
         return None
     print(f'[resume] loading {path}')
-    return torch.load(path, map_location='cpu')
+    # Resume checkpoints are locally generated, trusted training artifacts. Passing
+    # weights_only=False explicitly is required for optimizer states on Torch 2.6+.
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False)
+    except TypeError as exc:
+        if 'weights_only' not in str(exc):
+            raise
+        # Compatibility with Torch releases predating the weights_only argument.
+        return torch.load(path, map_location='cpu')
+
+
+def truncate_jsonl_to_step(path: Path, step: int, *, step_key: str='step') -> int:
+    """Atomically retain JSONL records whose integer ``step_key`` is at most ``step``.
+
+    The helper is intended to run before opening an append-mode logger during
+    checkpoint recovery. A malformed final line is treated as an interrupted
+    write and removed; malformed non-final content raises instead of silently
+    discarding an already-corrupt log. The return value is the number of lines
+    removed. A missing file is a no-op.
+    """
+    path = Path(path)
+    if not path.exists():
+        return 0
+    if not step_key:
+        raise ValueError('step_key must be non-empty')
+    max_step = int(step)
+    if isinstance(step, float) and not step.is_integer():
+        raise ValueError('step must be an integer')
+
+    lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+    retained: List[str] = []
+    removed = 0
+    for index, line in enumerate(lines):
+        if not line.strip():
+            removed += 1
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            has_later_content = any(later.strip() for later in lines[index + 1:])
+            if has_later_content:
+                raise ValueError(f'Malformed JSONL record at {path}:{index + 1}') from exc
+            removed += 1
+            break
+        if not isinstance(record, dict) or step_key not in record:
+            raise ValueError(f'JSONL record at {path}:{index + 1} has no {step_key!r} field')
+        try:
+            record_step = int(record[step_key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f'JSONL record at {path}:{index + 1} has a non-integer {step_key!r}'
+            ) from exc
+        if isinstance(record[step_key], float) and not record[step_key].is_integer():
+            raise ValueError(
+                f'JSONL record at {path}:{index + 1} has a non-integer {step_key!r}'
+            )
+        if record_step <= max_step:
+            retained.append(line if line.endswith('\n') else line + '\n')
+        else:
+            removed += 1
+
+    temporary = _new_atomic_temp_path(path)
+    try:
+        with open(temporary, 'w', encoding='utf-8') as f:
+            f.writelines(retained)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return removed
 
 class JsonlLogger:
 

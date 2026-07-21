@@ -1,14 +1,7 @@
-torch
-transformers
-peft
-opacus
-datasets
-evaluate
-accelerate
-pandas
-tqdm
-scikit-learn
-scipy
-sentencepiece
-safetensors
-fire
+-r requirements-core.txt
+
+# Install a build compatible with the target cluster's NVIDIA driver. The
+# bounded range prevents an unreviewed future major/minor release from being
+# selected while still allowing a site-provided CUDA wheel.
+torch>=2.5,<2.11
+opacus>=1.5,<1.7

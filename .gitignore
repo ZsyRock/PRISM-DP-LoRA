@@ -5,6 +5,9 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+.env
+.env.*
+!.env.example
 
 # Model, evaluation, and telemetry artifacts
 LLM-Adapters/trained_models/
@@ -13,6 +16,8 @@ outputs/
 runs/
 wandb/
 checkpoints/
+slurm-*.out
+slurm-*.err
 *.pt
 *.pth
 *.ckpt

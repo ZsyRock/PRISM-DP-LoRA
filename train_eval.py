@@ -1,12 +1,14 @@
 from __future__ import annotations
 import argparse
 import sys
+from dataclasses import fields
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / 'src'
 sys.path.insert(0, str(SRC))
 from prism_cli.eval_glue import evaluate_glue8
 from prism_cli.eval_math import evaluate_math10k
+from prism_cli.experiment_identity import load_json_object
 from prism_cli.trainers import RunConfig, train
 
 def parse_bool(x):
@@ -19,15 +21,28 @@ def parse_bool(x):
         return False
     raise argparse.ArgumentTypeError(f'Expected boolean, got {x!r}')
 
-def main():
+CONFIG_KEY_ALIASES = {
+    'epsilon': 'dp_epsilon',
+    'delta': 'dp_delta',
+    'steps': 'total_update_steps',
+    'lr': 'learning_rate',
+    'initial_clip_threshold': 'dp_max_grad_norm',
+}
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description='Train and evaluate PRISM LoRA adapters on Math-10K or GLUE8.')
-    p.add_argument('--dataset', choices=['math10k', 'math', 'glue8', 'glue'], required=True)
+    p.add_argument('--config', type=Path, default=None, help='JSON defaults; explicitly supplied CLI options take precedence.')
+    p.add_argument('--dataset', choices=['math10k', 'math', 'glue8', 'glue'], default=None)
     p.add_argument('--method', choices=['baseline', 'slaclip'], default='baseline', help='Fixed-threshold PRISM baseline or SlaClip+PRISM baseline.')
     p.add_argument('--privacy', choices=['dp', 'nondp', 'non-dp'], default='dp')
-    p.add_argument('--epsilon', type=float, default=6.0)
-    p.add_argument('--delta', type=float, default=1e-05)
+    p.add_argument('--epsilon', dest='dp_epsilon', type=float, default=6.0)
+    p.add_argument('--delta', dest='dp_delta', type=float, default=1e-05)
     p.add_argument('--base_model', default='google/gemma-3-4b-pt')
+    p.add_argument('--model_revision', default='main', help='Hugging Face model revision; pin a commit for formal runs.')
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--run_name', default=None, help='Human-readable label; a config hash is always appended.')
+    p.add_argument('--repeat_id', type=int, default=None)
     p.add_argument('--data_path', type=Path, default=None)
     p.add_argument('--output_dir', type=Path, default=None)
     p.add_argument('--result_dir', type=Path, default=None)
@@ -35,17 +50,26 @@ def main():
     p.add_argument('--lora_alpha', type=int, default=16)
     p.add_argument('--lora_dropout', type=float, default=0.05)
     p.add_argument('--target_modules', default='q_proj,k_proj,v_proj,up_proj,down_proj')
-    p.add_argument('--steps', type=int, default=None)
+    p.add_argument('--steps', dest='total_update_steps', type=int, default=None)
     p.add_argument('--batch_size', type=int, default=64)
     p.add_argument('--micro_batch_size', type=int, default=4)
-    p.add_argument('--lr', type=float, default=None)
+    p.add_argument('--lr', dest='learning_rate', type=float, default=None)
     p.add_argument('--cutoff_len', type=int, default=None)
     p.add_argument('--train_on_inputs', type=parse_bool, default=None)
-    p.add_argument('--dp_max_grad_norm', type=float, default=1.0)
+    p.add_argument(
+        '--initial_clip_threshold',
+        '--dp_max_grad_norm',
+        dest='dp_max_grad_norm',
+        type=float,
+        default=1.0,
+        help='Fixed C for baseline; initial C0 for full SlaClip. --dp_max_grad_norm is a legacy alias.',
+    )
     p.add_argument('--dp_grad_sample_mode', default='functorch')
-    p.add_argument('--dp_accountant', choices=['rdp', 'prv', 'gdp'], default='rdp')
+    p.add_argument('--dp_accountant', choices=['rdp', 'prv', 'gdp'], default='prv')
+    p.add_argument('--dp_secure_mode', action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument('--require_cuda', action=argparse.BooleanOptionalAction, default=False)
     p.add_argument('--telemetry_mode', choices=['dp_safe', 'research_raw'], default='dp_safe')
-    p.add_argument('--allow_non_private_telemetry', action='store_true', help='Required acknowledgement for exact, non-DP research diagnostics.')
+    p.add_argument('--allow_non_private_telemetry', action=argparse.BooleanOptionalAction, default=False, help='Required acknowledgement for exact, non-DP research diagnostics.')
     p.add_argument('--raw_hist_bins', type=int, default=32)
     p.add_argument('--raw_hist_max', type=float, default=0.0, help='Fixed norm histogram upper edge; 0 uses 4 * initial C.')
     p.add_argument('--slaclip_num_slots', type=int, default=0, help='Slack dimension K; 0 selects the paper bound automatically.')
@@ -55,62 +79,70 @@ def main():
     p.add_argument('--slaclip_c_max', type=float, default=50.0)
     p.add_argument('--run_train', type=parse_bool, default=True)
     p.add_argument('--run_eval', type=parse_bool, default=True)
-    p.add_argument('--force_train', action='store_true')
-    p.add_argument('--force_eval', action='store_true')
-    p.add_argument('--no_resume', action='store_true')
+    p.add_argument('--force_train', action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument('--force_eval', action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument('--resume', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--no_resume', dest='resume', action='store_false', help=argparse.SUPPRESS)
     p.add_argument('--checkpoint_every', type=int, default=25)
-    p.add_argument('--repeat_id', type=int, default=None)
     p.add_argument('--eval_batch_size', type=int, default=None)
     p.add_argument('--num_beams', type=int, default=None)
     p.add_argument('--max_new_tokens', type=int, default=None)
     p.add_argument('--max_input_length', type=int, default=None)
     p.add_argument('--fast_dev_run', type=int, default=0)
-    args = p.parse_args()
-    cfg = RunConfig(
-        dataset=args.dataset,
-        method=args.method,
-        privacy=args.privacy,
-        root=ROOT,
-        base_model=args.base_model,
-        seed=args.seed,
-        data_path=args.data_path,
-        output_dir=args.output_dir,
-        result_dir=args.result_dir,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=[x.strip() for x in args.target_modules.split(',') if x.strip()],
-        total_update_steps=args.steps,
-        batch_size=args.batch_size,
-        micro_batch_size=args.micro_batch_size,
-        learning_rate=args.lr,
-        cutoff_len=args.cutoff_len,
-        train_on_inputs=args.train_on_inputs,
-        dp_epsilon=args.epsilon,
-        dp_delta=args.delta,
-        dp_max_grad_norm=args.dp_max_grad_norm,
-        dp_grad_sample_mode=args.dp_grad_sample_mode,
-        dp_accountant=args.dp_accountant,
-        telemetry_mode=args.telemetry_mode,
-        allow_non_private_telemetry=args.allow_non_private_telemetry,
-        raw_hist_bins=args.raw_hist_bins,
-        raw_hist_max=args.raw_hist_max,
-        slaclip_num_slots=args.slaclip_num_slots,
-        slaclip_eta=args.slaclip_eta,
-        slaclip_beta=args.slaclip_beta,
-        slaclip_c_min=args.slaclip_c_min,
-        slaclip_c_max=args.slaclip_c_max,
-        force_train=args.force_train,
-        force_eval=args.force_eval,
-        resume=not args.no_resume,
-        checkpoint_every=args.checkpoint_every,
-        run_train=args.run_train,
-        run_eval=args.run_eval,
-    ).finalize()
-    if args.repeat_id is not None and args.output_dir is None:
-        cfg.output_dir = Path(str(cfg.output_dir) + f'_repeat{args.repeat_id}')
-    if args.repeat_id is not None and args.result_dir is None:
-        cfg.result_dir = Path(str(cfg.result_dir) + f'_repeat{args.repeat_id}')
+    return p
+
+
+def _json_defaults(config_path: Path, parser: argparse.ArgumentParser) -> dict:
+    payload = load_json_object(config_path)
+    schema_version = payload.pop('schema_version', 1)
+    if schema_version != 1:
+        parser.error(f'Unsupported config schema_version={schema_version!r}; expected 1')
+    valid_destinations = {action.dest for action in parser._actions}
+    valid_destinations.update(item.name for item in fields(RunConfig) if item.init and item.name != 'root')
+    defaults = {}
+    sources = {}
+    for key, value in payload.items():
+        destination = CONFIG_KEY_ALIASES.get(key, key)
+        if destination not in valid_destinations or destination in {'help', 'config'}:
+            parser.error(f'Unknown JSON config field: {key}')
+        if destination in defaults and defaults[destination] != value:
+            parser.error(
+                f'Conflicting JSON config fields {sources[destination]!r} and {key!r} '
+                f'both map to {destination!r}'
+            )
+        defaults[destination] = value
+        sources[destination] = key
+    return defaults
+
+
+def parse_cli_args(argv=None) -> argparse.Namespace:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument('--config', type=Path, default=None)
+    preliminary, _ = pre_parser.parse_known_args(argv)
+    parser = build_parser()
+    if preliminary.config is not None:
+        parser.set_defaults(**_json_defaults(preliminary.config, parser))
+    args = parser.parse_args(argv)
+    if args.dataset is None:
+        parser.error('--dataset is required either on the CLI or in --config')
+    for name in ('data_path', 'output_dir', 'result_dir'):
+        value = getattr(args, name)
+        if value is not None and not isinstance(value, Path):
+            setattr(args, name, Path(value))
+    if isinstance(args.target_modules, str):
+        args.target_modules = [x.strip() for x in args.target_modules.split(',') if x.strip()]
+    elif isinstance(args.target_modules, list) and all(isinstance(x, str) for x in args.target_modules):
+        args.target_modules = [x.strip() for x in args.target_modules if x.strip()]
+    else:
+        parser.error('target_modules must be a comma-separated string or a JSON list of strings')
+    return args
+
+
+def main(argv=None):
+    args = parse_cli_args(argv)
+    run_fields = {item.name for item in fields(RunConfig) if item.init and item.name != 'root'}
+    cfg_values = {name: getattr(args, name) for name in run_fields if hasattr(args, name)}
+    cfg = RunConfig(root=ROOT, **cfg_values).finalize()
     if cfg.run_train:
         train(cfg)
     else:

@@ -8,8 +8,10 @@ try:
     import torch
 except Exception:
     torch = None
-from .trainers import RunConfig
-from .utils import adapter_is_complete, build_prompt, cleanup_cuda
+from .trainers import RunConfig, completed_adapter_status
+from .evaluation_identity import prepare_evaluation_cache
+from .modeling import load_base_model
+from .utils import build_prompt, build_tokenizer, cleanup_cuda, write_json_atomic
 GLUE_TASKS = ['cola', 'sst2', 'mrpc', 'stsb', 'qqp', 'mnli', 'qnli', 'rte']
 
 def glue_to_instruction_input(task: str, ex: dict):
@@ -119,17 +121,39 @@ def _dtype():
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     return torch.float32
 
-def load_eval_model(base_model_id: str, adapter_dir: Path, num_beams: int):
+def load_eval_model(base_model_id: str, adapter_dir: Path, num_beams: int, revision=None):
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+    from transformers import GenerationConfig
     dtype = _dtype()
-    tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
+    tokenizer = build_tokenizer(base_model_id, revision=revision)
     tokenizer.padding_side = 'left'
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = 0
-    model = AutoModelForCausalLM.from_pretrained(base_model_id, torch_dtype=dtype, device_map='auto', trust_remote_code=True)
+    model = load_base_model(
+        base_model_id,
+        revision=revision,
+        torch_dtype=dtype,
+        device_map='auto',
+        trust_remote_code=True,
+    )
     model.config.use_cache = False
-    model = PeftModel.from_pretrained(model, str(adapter_dir), torch_dtype=dtype, device_map='auto')
+    try:
+        model = PeftModel.from_pretrained(
+            model,
+            str(adapter_dir),
+            torch_dtype=dtype,
+            device_map='auto',
+        )
+    except TypeError as exc:
+        try:
+            model = PeftModel.from_pretrained(
+                model,
+                str(adapter_dir),
+                dtype=dtype,
+                device_map='auto',
+            )
+        except TypeError:
+            raise exc
     gen_cfg = GenerationConfig(do_sample=False, num_beams=max(1, int(num_beams)), pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
     if hasattr(gen_cfg, 'remove_invalid_values'):
         gen_cfg.remove_invalid_values = True
@@ -221,20 +245,47 @@ def eval_mnli(model, tokenizer, gen_cfg, batch_size: int, max_input_length: int,
 def evaluate_glue8(cfg: RunConfig, batch_size: int=128, num_beams: int=1, max_new_tokens: int=8, max_input_length: int=384, fast_dev_run: int=0) -> Tuple[pd.DataFrame, pd.DataFrame]:
     cfg.finalize()
     adapter_dir = Path(cfg.output_dir)
-    if not adapter_is_complete(adapter_dir):
+    adapter_status = completed_adapter_status(cfg)
+    if adapter_status is None:
         raise RuntimeError(f'Adapter is not complete: {adapter_dir}')
+    evaluation_revision = (
+        adapter_status.get('resolved_model_revision') or cfg.model_revision
+    )
     result_dir = Path(cfg.result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
+    prepare_evaluation_cache(
+        result_dir,
+        {
+            'config_fingerprint': cfg.config_fingerprint,
+            'dataset': cfg.dataset,
+            'base_model': cfg.base_model,
+            'requested_model_revision': cfg.model_revision,
+            'resolved_model_revision': evaluation_revision,
+            'tasks': GLUE_TASKS,
+            'batch_size': int(batch_size),
+            'num_beams': int(num_beams),
+            'max_new_tokens': int(max_new_tokens),
+            'max_input_length': int(max_input_length),
+            'fast_dev_run': int(fast_dev_run),
+        },
+        artifact_names=[f'{task}.json' for task in GLUE_TASKS],
+        force=bool(cfg.force_eval),
+    )
     cached, tasks_to_run = ({}, [])
     for task in GLUE_TASKS:
         p = result_dir / f'{task}.json'
-        if p.exists() and (not cfg.force_eval):
+        if p.exists():
             cached[task] = json.load(open(p, 'r', encoding='utf-8'))
         else:
             tasks_to_run.append(task)
     model = tokenizer = gen_cfg = None
     if tasks_to_run:
-        model, tokenizer, gen_cfg = load_eval_model(cfg.base_model, adapter_dir, num_beams)
+        model, tokenizer, gen_cfg = load_eval_model(
+            cfg.base_model,
+            adapter_dir,
+            num_beams,
+            revision=evaluation_revision,
+        )
     task_rows = []
     for task in GLUE_TASKS:
         p = result_dir / f'{task}.json'
@@ -243,8 +294,7 @@ def evaluate_glue8(cfg: RunConfig, batch_size: int=128, num_beams: int=1, max_ne
             print(f'[eval cache] {task}: {p}')
         else:
             rec = eval_mnli(model, tokenizer, gen_cfg, batch_size, max_input_length, max_new_tokens, fast_dev_run) if task == 'mnli' else eval_task(model, tokenizer, gen_cfg, task, batch_size, max_input_length, max_new_tokens, fast_dev_run)
-            with open(p, 'w', encoding='utf-8') as f:
-                json.dump(rec, f, indent=2, ensure_ascii=False)
+            write_json_atomic(p, rec)
         task_rows.append(rec)
     if model is not None:
         del model, tokenizer, gen_cfg

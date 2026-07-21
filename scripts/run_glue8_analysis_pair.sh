@@ -13,5 +13,5 @@ for arg in "$@"; do
 done
 
 PRISM_PYTHON="${PRISM_PYTHON:-python}"
-"$PRISM_PYTHON" train_eval.py --config configs/math10k_paper.json --method baseline "$@"
-"$PRISM_PYTHON" train_eval.py --config configs/math10k_paper.json --method slaclip "$@"
+"$PRISM_PYTHON" train_eval.py --config configs/glue8_paper.json --method baseline "$@" --telemetry_mode research_raw --allow_non_private_telemetry
+"$PRISM_PYTHON" train_eval.py --config configs/glue8_paper.json --method slaclip "$@" --telemetry_mode research_raw --allow_non_private_telemetry

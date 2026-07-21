@@ -215,6 +215,24 @@ def _z_fro_norm_sq(A: Tensor, B: Tensor) -> Tensor:
     N = B.T @ B
     return torch.sum(M * N)
 
+
+def _factorized_delta_fro_norm_sq(
+    A_new: Tensor,
+    B_new: Tensor,
+    A_old: Tensor,
+    B_old: Tensor,
+) -> Tensor:
+    """Return ``||A_new B_new^T - A_old B_old^T||_F^2`` without densifying.
+
+    LoRA matrices can be very wide, so materializing the full weight update just
+    for telemetry would be prohibitively expensive.  Writing the difference as
+    ``U V^T`` with at most ``2r`` columns keeps this calculation rank-sized.
+    """
+
+    U = torch.cat((A_new.float(), A_old.float()), dim=1)
+    V = torch.cat((B_new.float(), -B_old.float()), dim=1)
+    return torch.sum((U.T @ U) * (V.T @ V))
+
 def _psd_inv_from_invsqrt(M_invsqrt: Tensor) -> Tensor:
     return _sym(M_invsqrt @ M_invsqrt)
 
@@ -336,6 +354,8 @@ class PRISM(torch.optim.Optimizer):
         self._helper = _LoraShapeHelper()
         self._dp_state: Optional[_DPAccumState] = None
         self._state_initialized = False
+        self._dp_noise_generator: Optional[torch.Generator] = None
+        self._dp_secure_mode = False
         self.last_log: Dict[str, Any] = {}
         self.last_raw_log: Dict[str, Any] = {}
 
@@ -351,6 +371,11 @@ class PRISM(torch.optim.Optimizer):
             'clipping_method': self.clipping_method,
             'current_clip': self.current_clip,
             'slaclip_num_slots': self.slaclip_num_slots,
+            'slaclip_eta': self.slaclip_eta,
+            'slaclip_beta': self.slaclip_beta,
+            'slaclip_c_min': self.slaclip_c_min,
+            'slaclip_c_max': self.slaclip_c_max,
+            'telemetry_mode': self.telemetry_mode,
             'raw_hist_max': self.raw_hist_max,
         }
         return state
@@ -359,17 +384,112 @@ class PRISM(torch.optim.Optimizer):
         state_copy = dict(state_dict)
         runtime = state_copy.pop('_prism_runtime', None)
         result = super().load_state_dict(state_copy)
+        # A valid step-zero checkpoint can precede the first dp_begin(), in
+        # which case torch's optimizer state is empty. Recreate only missing
+        # PRISM slots after loading while preserving any restored moments.
+        self._state_initialized = False
+        self._ensure_state()
         if isinstance(runtime, dict):
             saved_method = runtime.get('clipping_method')
             if saved_method is not None and saved_method != self.clipping_method:
                 raise ValueError(
                     f"checkpoint clipping_method={saved_method!r} does not match current method={self.clipping_method!r}"
                 )
+            for key, current in (
+                ('slaclip_eta', self.slaclip_eta),
+                ('slaclip_beta', self.slaclip_beta),
+                ('slaclip_c_min', self.slaclip_c_min),
+                ('slaclip_c_max', self.slaclip_c_max),
+            ):
+                saved = runtime.get(key)
+                if saved is not None and not math.isclose(
+                    float(saved), float(current), rel_tol=1e-12, abs_tol=1e-12
+                ):
+                    raise ValueError(
+                        f'checkpoint {key}={saved!r} does not match current value={current!r}'
+                    )
+            saved_telemetry = runtime.get('telemetry_mode')
+            if saved_telemetry is not None and saved_telemetry != self.telemetry_mode:
+                raise ValueError(
+                    f'checkpoint telemetry_mode={saved_telemetry!r} does not match '
+                    f'current mode={self.telemetry_mode!r}'
+                )
             saved_clip = runtime.get('current_clip')
             self.current_clip = None if saved_clip is None else float(saved_clip)
-            self.slaclip_num_slots = int(runtime.get('slaclip_num_slots', self.slaclip_num_slots))
+            saved_slots = int(runtime.get('slaclip_num_slots', self.slaclip_num_slots))
+            if self.slaclip_num_slots not in {0, saved_slots}:
+                raise ValueError(
+                    f'checkpoint slaclip_num_slots={saved_slots} does not match '
+                    f'current value={self.slaclip_num_slots}'
+                )
+            self.slaclip_num_slots = saved_slots
             self.raw_hist_max = float(runtime.get('raw_hist_max', self.raw_hist_max))
+        # torch.optim recursively moves tensors in dictionaries/lists, but not
+        # tensors stored in SimpleNamespace.  Checkpoints are taken between
+        # logical steps, so only persistent moments should be populated here.
+        for _, pA, _ in self._pair_iter():
+            st = self.state.get(pA, {}).get('prism')
+            if st is None:
+                continue
+            for name in ('mA', 'mB', 'vA', 'vB'):
+                value = getattr(st, name, None)
+                if isinstance(value, Tensor):
+                    setattr(st, name, value.to(device=pA.device))
+            for transient in ('dp_accum_A', 'dp_accum_B', 'dp_raw_accum_A', 'dp_raw_accum_B'):
+                value = getattr(st, transient, None)
+                if value is not None:
+                    raise ValueError(
+                        f'checkpoint unexpectedly contains in-progress state {transient}; '
+                        'only logical-step checkpoints are supported'
+                    )
         return result
+
+    def configure_dp_noise(self, *, generator=None, secure_mode: bool = False) -> None:
+        """Use the same noise source configured by Opacus's PrivacyEngine."""
+
+        self._dp_noise_generator = generator
+        self._dp_secure_mode = bool(secure_mode)
+
+    def get_dp_noise_generator_state(self) -> Optional[Tensor]:
+        generator = self._dp_noise_generator
+        if generator is None or not hasattr(generator, 'get_state'):
+            return None
+        return generator.get_state().detach().cpu()
+
+    def set_dp_noise_generator_state(self, state: Optional[Tensor]) -> None:
+        if state is None:
+            return
+        generator = self._dp_noise_generator
+        if generator is None or not hasattr(generator, 'set_state'):
+            raise RuntimeError('checkpoint contains a DP noise RNG state, but no compatible generator is configured')
+        generator.set_state(state)
+
+    def _generate_dp_noise(self, reference: Tensor, std: float) -> Tensor:
+        if float(std) == 0.0:
+            return torch.zeros_like(reference)
+        try:
+            # Reuse Opacus's hardened four-sample construction when secure mode
+            # is enabled; in ordinary research mode this also preserves the
+            # PrivacyEngine generator semantics.
+            from opacus.optimizers.optimizer import _generate_noise
+
+            return _generate_noise(
+                std=float(std),
+                reference=reference,
+                generator=self._dp_noise_generator,
+                secure_mode=self._dp_secure_mode,
+            )
+        except ImportError:
+            if self._dp_secure_mode:
+                raise RuntimeError('secure DP noise requires an Opacus version exposing _generate_noise')
+            return torch.normal(
+                mean=0.0,
+                std=float(std),
+                size=tuple(reference.shape),
+                generator=self._dp_noise_generator,
+                device=reference.device,
+                dtype=reference.dtype,
+            )
 
     def _get_factors(self, pA: torch.nn.Parameter, pB: torch.nn.Parameter) -> Tuple[Tensor, Tensor]:
         B, _ = self._helper.move_lora_dim_to_last(pA.data, self.lora_l_dim)
@@ -384,9 +504,11 @@ class PRISM(torch.optim.Optimizer):
         if self._state_initialized:
             return
         for _, pA, pB in self._pair_iter():
+            if self.state[pA].get('prism') is not None:
+                continue
             A, B = self._get_factors(pA, pB)
             r = A.shape[1]
-            self.state[pA]['prism'] = types.SimpleNamespace(step=0, mA=torch.zeros_like(A, dtype=torch.float32), mB=torch.zeros_like(B, dtype=torch.float32), vA=torch.zeros((r, r), device=A.device, dtype=torch.float32), vB=torch.zeros((r, r), device=B.device, dtype=torch.float32), dp_accum_A=None, dp_accum_B=None, dp_cache=None, last_spec_A={}, last_spec_B={})
+            self.state[pA]['prism'] = types.SimpleNamespace(step=0, mA=torch.zeros_like(A, dtype=torch.float32), mB=torch.zeros_like(B, dtype=torch.float32), vA=torch.zeros((r, r), device=A.device, dtype=torch.float32), vB=torch.zeros((r, r), device=B.device, dtype=torch.float32), dp_accum_A=None, dp_accum_B=None, dp_raw_accum_A=None, dp_raw_accum_B=None, dp_cache=None, last_spec_A={}, last_spec_B={})
         self._state_initialized = True
 
     def _compute_tangent_grad(self, A: Tensor, B: Tensor, gA: Tensor, gB: Tensor, M_pinv: Optional[Tensor]=None, N_pinv: Optional[Tensor]=None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -526,13 +648,20 @@ class PRISM(torch.optim.Optimizer):
             # Freeze one absolute range for the whole run so histograms remain comparable.
             self.raw_hist_max = 4.0 * float(max_grad_norm)
         clip_threshold = float(self.current_clip if self.clipping_method == 'slaclip' else max_grad_norm)
-        if self.slaclip_num_slots == 0:
+        if self.clipping_method == 'slaclip' and self.slaclip_num_slots == 0:
             self.slaclip_num_slots = automatic_num_slots(expected_batch_size, noise_multiplier)
         self._dp_state = _DPAccumState(
             max_grad_norm=clip_threshold,
             expected_batch_size=float(expected_batch_size),
             noise_multiplier=float(noise_multiplier),
         )
+        if self.clipping_method == 'slaclip':
+            # Lambda is defined by C and K, not by the realized batch.  Set it
+            # before accumulation so an empty Poisson batch still performs the
+            # noisy Slack-Indicator release and controller update.
+            self._dp_state.slack_lambda = clip_threshold / math.sqrt(
+                int(self.slaclip_num_slots)
+            )
         self.last_log = {}
         self.last_raw_log = {}
         for _, pA, pB in self._pair_iter():
@@ -551,6 +680,18 @@ class PRISM(torch.optim.Optimizer):
             st.dp_cache = {'A': A32, 'B': B32, 'QA': QA, 'QB': QB, 'M': M, 'N': N, 'M_pinv': M_pinv, 'N_pinv': N_pinv, 'M_invsqrt': M_invsqrt, 'N_invsqrt': N_invsqrt}
             st.dp_accum_A = torch.zeros_like(A32)
             st.dp_accum_B = torch.zeros_like(B32)
+            if self.clipping_method == 'slaclip' and self._dp_state.slack_sum is None:
+                self._dp_state.slack_sum = torch.zeros(
+                    int(self.slaclip_num_slots),
+                    device=A32.device,
+                    dtype=torch.float32,
+                )
+            if self.telemetry_mode == 'research_raw':
+                st.dp_raw_accum_A = torch.zeros_like(A32)
+                st.dp_raw_accum_B = torch.zeros_like(B32)
+            else:
+                st.dp_raw_accum_A = None
+                st.dp_raw_accum_B = None
 
     @torch.no_grad()
     def dp_accumulate(self) -> int:
@@ -566,12 +707,24 @@ class PRISM(torch.optim.Optimizer):
                 raise RuntimeError('dp_cache missing; did you call dp_begin()?')
             gsA_raw = self._helper.get_grad_sample_tensor(pB)
             gsB_raw = self._helper.get_grad_sample_tensor(pA)
-            if gsA_raw is None or gsB_raw is None:
+            if (gsA_raw is None) != (gsB_raw is None):
+                raise RuntimeError('paired LoRA factors must either both have grad_sample or both be unused')
+            if gsA_raw is None:
                 continue
             gA = self._helper.move_lora_dim_to_last_grad_sample(gsA_raw, self.lora_r_dim).float()
             gB = self._helper.move_lora_dim_to_last_grad_sample(gsB_raw, self.lora_l_dim).float()
             bs = int(gA.shape[0])
-            total_in_micro = bs if total_in_micro is None else min(total_in_micro, bs)
+            if int(gB.shape[0]) != bs:
+                raise RuntimeError(
+                    f'paired LoRA grad_sample batch mismatch: A={bs}, B={int(gB.shape[0])}'
+                )
+            if total_in_micro is None:
+                total_in_micro = bs
+            elif total_in_micro != bs:
+                raise RuntimeError(
+                    f'inconsistent grad_sample batch dimension across LoRA modules: '
+                    f'expected {total_in_micro}, got {bs}'
+                )
             A = cache['A']
             B = cache['B']
             M_pinv = cache['M_pinv']
@@ -588,11 +741,9 @@ class PRISM(torch.optim.Optimizer):
             if global_norm_sq is None:
                 global_norm_sq = n2
             else:
-                assert total_in_micro is not None
-                global_norm_sq = global_norm_sq[:total_in_micro] + n2[:total_in_micro]
+                global_norm_sq = global_norm_sq + n2
         if total_in_micro is None or global_norm_sq is None:
             return 0
-        global_norm_sq = global_norm_sq[:total_in_micro]
         global_norm = torch.sqrt(torch.clamp(global_norm_sq, min=0.0) + 1e-12)
         coef = (max_norm / global_norm).clamp(max=1.0)
         clipped_frac = float((coef < 1.0).float().mean().item())
@@ -603,15 +754,25 @@ class PRISM(torch.optim.Optimizer):
         self._dp_state.coef_sum += float(coef.sum().item())
         self._dp_state.coef_min = min(self._dp_state.coef_min, coef_min)
         self._dp_state.last_micro_stats = {'micro_clipped_frac': clipped_frac, 'micro_coef_mean': coef_mean, 'micro_coef_min': coef_min, 'micro_global_norm_mean': float(global_norm.mean().item()), 'micro_global_norm_p95': float(torch.quantile(global_norm, 0.95).item())}
-        slack_vectors, lambda_t = build_slack_vectors(global_norm, max_norm, self.slaclip_num_slots)
-        if self._dp_state.slack_lambda and not math.isclose(self._dp_state.slack_lambda, lambda_t, rel_tol=1e-12):
-            raise RuntimeError('SlaClip threshold changed inside one logical batch')
-        self._dp_state.slack_lambda = float(lambda_t)
-        slack_sum = slack_vectors.sum(dim=0)
-        if self._dp_state.slack_sum is None:
-            self._dp_state.slack_sum = slack_sum
-        else:
-            self._dp_state.slack_sum.add_(slack_sum.to(self._dp_state.slack_sum.device))
+        if self.clipping_method == 'slaclip':
+            slack_vectors, lambda_t = build_slack_vectors(
+                global_norm,
+                max_norm,
+                self.slaclip_num_slots,
+            )
+            if not math.isclose(
+                self._dp_state.slack_lambda,
+                lambda_t,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise RuntimeError('SlaClip threshold changed inside one logical batch')
+            slack_sum = slack_vectors.sum(dim=0)
+            if self._dp_state.slack_sum is None:
+                raise RuntimeError('SlaClip slack accumulator is missing')
+            self._dp_state.slack_sum.add_(
+                slack_sum.to(self._dp_state.slack_sum.device)
+            )
         if self.telemetry_mode == 'research_raw':
             self._dp_state.raw_norms.append(global_norm.detach().to('cpu', dtype=torch.float32))
         coef_view = coef.view(-1, 1, 1)
@@ -622,14 +783,16 @@ class PRISM(torch.optim.Optimizer):
                 raise RuntimeError('dp_cache missing; did you call dp_begin()?')
             gsA_raw = self._helper.get_grad_sample_tensor(pB)
             gsB_raw = self._helper.get_grad_sample_tensor(pA)
-            if gsA_raw is None or gsB_raw is None:
+            if (gsA_raw is None) != (gsB_raw is None):
+                raise RuntimeError('paired LoRA factors must either both have grad_sample or both be unused')
+            if gsA_raw is None:
                 continue
             gA = self._helper.move_lora_dim_to_last_grad_sample(gsA_raw, self.lora_r_dim).float()
             gB = self._helper.move_lora_dim_to_last_grad_sample(gsB_raw, self.lora_l_dim).float()
-            if int(gA.shape[0]) != total_in_micro:
-                gA = gA[:total_in_micro]
-            if int(gB.shape[0]) != total_in_micro:
-                gB = gB[:total_in_micro]
+            if int(gA.shape[0]) != total_in_micro or int(gB.shape[0]) != total_in_micro:
+                raise RuntimeError(
+                    'grad_sample batch dimension changed between norm computation and accumulation'
+                )
             A = cache['A']
             B = cache['B']
             M_pinv = cache['M_pinv']
@@ -642,6 +805,9 @@ class PRISM(torch.optim.Optimizer):
             YB = torch.matmul(gB, M_pinv)
             projYB = _apply_projector_Q(QB, YB)
             dB = YB - 0.5 * projYB
+            if self.telemetry_mode == 'research_raw':
+                st.dp_raw_accum_A.add_(dA.sum(dim=0))
+                st.dp_raw_accum_B.add_(dB.sum(dim=0))
             st.dp_accum_A.add_((dA * coef_view).sum(dim=0))
             st.dp_accum_B.add_((dB * coef_view).sum(dim=0))
             self._helper.clear_grad_sample(pA)
@@ -654,9 +820,6 @@ class PRISM(torch.optim.Optimizer):
         if self._dp_state is None:
             raise RuntimeError('dp_begin() must be called before dp_finalize().')
         total = int(self._dp_state.total_samples)
-        if total <= 0:
-            self._dp_state = None
-            return 0
         C = float(self._dp_state.max_grad_norm)
         sigma = float(noise_multiplier)
         if not math.isclose(sigma, float(self._dp_state.noise_multiplier), rel_tol=1e-12):
@@ -665,12 +828,16 @@ class PRISM(torch.optim.Optimizer):
         std = sigma * C / release_denom
         slack_indicator: Optional[Tensor] = None
         if self._dp_state.slack_sum is not None and self._dp_state.slack_lambda > 0:
-            slack_noise = torch.randn_like(self._dp_state.slack_sum) * (sigma * C)
+            slack_noise = self._generate_dp_noise(self._dp_state.slack_sum, sigma * C)
             slack_indicator = (
                 self._dp_state.slack_sum + slack_noise
             ) / (float(self._dp_state.slack_lambda) * release_denom)
         signal_norm_sq = 0.0
+        raw_unclipped_norm_sq = 0.0
+        clipping_bias_norm_sq = 0.0
         noise_norm_sq = 0.0
+        noisy_gradient_norm_sq = 0.0
+        effective_update_norm_sq = 0.0
         update_clip_coef_min = 1.0
         trust_ratio_min = float('inf')
         trust_ratio_max = 0.0
@@ -700,8 +867,8 @@ class PRISM(torch.optim.Optimizer):
             gradA = st.dp_accum_A / release_denom
             gradB = st.dp_accum_B / release_denom
             if std > 0:
-                U = torch.randn_like(A)
-                V = torch.randn_like(B)
+                U = self._generate_dp_noise(A, 1.0)
+                V = self._generate_dp_noise(B, 1.0)
                 projU = _apply_projector_Q(QA, U)
                 U_perp = U - projU
                 noise_A = U_perp @ N_invsqrt * std
@@ -711,12 +878,27 @@ class PRISM(torch.optim.Optimizer):
                 noise_B = torch.zeros_like(B)
             gradA_noisy = gradA + noise_A
             gradB_noisy = gradB + noise_B
+            noisy_n2 = _tangent_fro_norm_sq(gradA_noisy, gradB_noisy, A, B)
+            noisy_gradient_norm_sq += float(noisy_n2.item())
             if self.lift_gauge_fix in {'pre_moment', 'both'}:
                 gradA_noisy, gradB_noisy = _horizontalize_lift(gradA_noisy, gradB_noisy, A, B, eps=self.gauge_fix_eps)
             noi_n2 = _tangent_fro_norm_sq(noise_A, noise_B, A, B)
             if self.telemetry_mode == 'research_raw':
                 sig_n2 = _tangent_fro_norm_sq(gradA, gradB, A, B)
                 signal_norm_sq += float(sig_n2.item())
+                if st.dp_raw_accum_A is None or st.dp_raw_accum_B is None:
+                    raise RuntimeError('raw telemetry accumulator is missing')
+                raw_gradA = st.dp_raw_accum_A / release_denom
+                raw_gradB = st.dp_raw_accum_B / release_denom
+                raw_n2 = _tangent_fro_norm_sq(raw_gradA, raw_gradB, A, B)
+                bias_n2 = _tangent_fro_norm_sq(
+                    raw_gradA - gradA,
+                    raw_gradB - gradB,
+                    A,
+                    B,
+                )
+                raw_unclipped_norm_sq += float(raw_n2.item())
+                clipping_bias_norm_sq += float(bias_n2.item())
             noise_norm_sq += float(noi_n2.item())
             base_floor = float(self.dp_precond_floor_factor) * float(std * std)
             if self.dp_floor_mode == 'none':
@@ -766,14 +948,20 @@ class PRISM(torch.optim.Optimizer):
             update_clip_coef_min = min(update_clip_coef_min, float(upd_coef))
             r = A.shape[1]
             A_new, B_new = _retract_rank_r(A, B, dA_dir, dB_dir, eta=lr, r=r, align_to=(A, B))
+            upd_n2 = _factorized_delta_fro_norm_sq(A_new, B_new, A, B)
+            effective_update_norm_sq += float(upd_n2.item())
             self._set_factors(pA, pB, A_new.to(pB.data.dtype), B_new.to(pA.data.dtype))
             st.dp_cache = None
             st.dp_accum_A = None
             st.dp_accum_B = None
+            st.dp_raw_accum_A = None
+            st.dp_raw_accum_B = None
         clip_frac = float(self._dp_state.clipped_samples) / max(1, total)
         coef_mean = float(self._dp_state.coef_sum) / max(1, total)
         coef_min = float(self._dp_state.coef_min)
         noi = math.sqrt(max(noise_norm_sq, 0.0))
+        noisy_grad_norm = math.sqrt(max(noisy_gradient_norm_sq, 0.0))
+        effective_update_norm = math.sqrt(max(effective_update_norm_sq, 0.0))
         c_next = C
         gamma_t: Optional[float] = None
         if self.clipping_method == 'slaclip' and slack_indicator is not None:
@@ -791,13 +979,15 @@ class PRISM(torch.optim.Optimizer):
 
         self.last_log = {
             'telemetry_mode': self.telemetry_mode,
-            'dp_realized_batch_size': int(total),
             'dp_expected_batch_size': float(release_denom),
             'dp_noise_multiplier': float(noise_multiplier),
             'dp_clip_threshold': float(C),
             'dp_next_clip_threshold': float(c_next),
             'dp_std_per_factor': float(std),
-            'dp_noise_norm': float(noi),
+            # Both are post-processing of the DP release/model update.  The
+            # realized noise itself is intentionally kept out of this log.
+            'dp_noisy_tangent_gradient_norm': float(noisy_grad_norm),
+            'dp_factor_product_update_norm': float(effective_update_norm),
             'dp_floor_mode_id': float({'none': 0, 'scalar': 1, 'geometry': 2}.get(self.dp_floor_mode, -1)),
             'dp_precond_update_mode_id': float({'current': 0, 'delayed': 1}.get(self.precond_update_mode, -1)),
             'dp_lift_gauge_fix_id': float({'none': 0, 'pre_moment': 1, 'pre_retract': 2, 'both': 3}.get(self.lift_gauge_fix, -1)),
@@ -812,10 +1002,10 @@ class PRISM(torch.optim.Optimizer):
             'dp_precond_eigA_max': float(precond_eigA_max),
             'dp_precond_eigB_min': float(0.0 if precond_eigB_min == float('inf') else precond_eigB_min),
             'dp_precond_eigB_max': float(precond_eigB_max),
-            'slaclip_num_slots': int(self.slaclip_num_slots),
         }
         if slack_indicator is not None:
             slack_cpu = slack_indicator.detach().to('cpu', dtype=torch.float32)
+            self.last_log['slaclip_num_slots'] = int(self.slaclip_num_slots)
             self.last_log['slack_indicator'] = [float(x) for x in slack_cpu.tolist()]
             self.last_log['slack_unclipped_proxy'] = float(slack_cpu[0].item())
             self.last_log['slack_clipped_proxy'] = float(1.0 - slack_cpu[0].item())
@@ -826,12 +1016,18 @@ class PRISM(torch.optim.Optimizer):
 
         if self.telemetry_mode == 'research_raw':
             sig = math.sqrt(max(signal_norm_sq, 0.0))
+            raw_unclipped = math.sqrt(max(raw_unclipped_norm_sq, 0.0))
+            clipping_bias = math.sqrt(max(clipping_bias_norm_sq, 0.0))
             raw: Dict[str, Any] = {
                 'NON_PRIVATE_TELEMETRY': True,
+                'raw_realized_batch_size': int(total),
                 'raw_clip_fraction': float(clip_frac),
                 'raw_clip_coefficient_mean': float(coef_mean),
                 'raw_clip_coefficient_min': float(coef_min),
                 'raw_clipped_signal_norm': float(sig),
+                'raw_unclipped_signal_norm': float(raw_unclipped),
+                'raw_clipping_bias_norm': float(clipping_bias),
+                'raw_realized_noise_norm': float(noi),
                 'raw_signal_to_noise_ratio': float(sig / (noi + 1e-12)),
             }
             if self._dp_state.raw_norms:
@@ -898,6 +1094,11 @@ def balanced_full_rank_lora_init_peft_model(model: torch.nn.Module, *, adapter_n
         lora_B = mod.lora_B[adapter_name]
         if not (hasattr(lora_A, 'weight') and hasattr(lora_B, 'weight')):
             continue
+        # Multimodal backbones such as Gemma 3 may receive suffix-matched LoRA
+        # modules inside their frozen vision tower.  PRISM is text-only here;
+        # never alter a frozen base weight during spectral residual init.
+        if not (lora_A.weight.requires_grad and lora_B.weight.requires_grad):
+            continue
         r = int(lora_A.weight.shape[0])
         in_features = int(lora_A.weight.shape[1])
         out_features = int(lora_B.weight.shape[0])
@@ -955,6 +1156,11 @@ def spectral_init_peft_model(model: torch.nn.Module, *, adapter_name: str='defau
         lora_A = mod.lora_A[adapter_name]
         lora_B = mod.lora_B[adapter_name]
         if not (hasattr(lora_A, 'weight') and hasattr(lora_B, 'weight')):
+            continue
+        # Suffix matching can inject adapters into a multimodal vision tower.
+        # Frozen adapters are outside the text-only mechanism and their base
+        # weights must not be rewritten by the residual initialization.
+        if not (lora_A.weight.requires_grad and lora_B.weight.requires_grad):
             continue
         r = int(lora_A.weight.shape[0])
         if svd_rank is not None:

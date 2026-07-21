@@ -1,15 +1,27 @@
-# PRISM-DP-LoRA with SlaClip
+# PRISM-DP-LoRA with full SlaClip
 
-Research code for **PRISM: Gauge-Invariant Tangent-Space Differentially Private LoRA**, with a controlled comparison between:
+This repository provides a reproducible comparison between exactly two methods:
 
-- `baseline`: PRISM with a fixed clipping threshold;
-- `slaclip`: the full SlaClip controller applied to the same PRISM tangent-space update.
+- `baseline`: PRISM with a fixed clipping threshold `C`;
+- `slaclip`: the full SlaClip controller applied to the same PRISM mechanism, with an initial threshold `C_0` that is adapted from the jointly noised Slack Indicator.
 
-SlaClip-Q is intentionally not part of this repository's experiment interface. The two supported methods use the same model, data order, Poisson sampling, optimizer, privacy accountant, noise multiplier, update count, and evaluation settings. Their intended algorithmic difference is whether the clipping threshold remains fixed or is updated from the DP Slack Indicator.
+SlaClip-Q and fixed-`gamma` variants are intentionally outside the experiment interface. A paired comparison is designed to keep the model, data order, Poisson sampling, optimizer, privacy target, accountant, noise multiplier, update count, LoRA setup, and evaluation settings identical. The intended method difference is fixed versus adaptive clipping.
 
-## Setup
+## What is ready, and what still needs HPC validation
 
-Python 3.11 is recommended. Create and activate an isolated environment, then install:
+The repository-level unit suite and the synthetic Opacus/PRISM DP smoke path have been exercised on Ubuntu/CPU. They cover the fixed and adaptive threshold paths, per-sample gradients, DP noise and accounting, privacy-separated telemetry, stable experiment identities, atomic checkpoints, and checkpoint/resume equivalence.
+
+That does **not** prove that the full gated `google/gemma-3-4b-pt` checkpoint fits a particular GPU, that the cluster's CUDA/PyTorch binaries are compatible, or that every Gemma 3 module works in that environment. Before a formal run, the HPC still needs:
+
+1. the environment/data preflight;
+2. the synthetic CUDA smoke test;
+3. a two-step, one-GPU Gemma smoke run for both methods.
+
+These are hardware and environment validation steps, not unfinished experiment interfaces. If they expose a cluster-specific incompatibility, the code can still be revised after migration; HPC is not an artificial boundary on future changes. See [the HPC runbook](docs/hpc_runbook.md) for the exact sequence.
+
+## Environment
+
+Python 3.11 is recommended. For a local installation:
 
 ```bash
 python -m pip install -r requirements.txt
@@ -20,95 +32,154 @@ Development checks additionally require:
 ```bash
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
+python scripts/smoke_dp_path.py --device cpu --steps 2
 ```
 
-Gemma models may require accepting the model license and authenticating with Hugging Face. Formal training requires a CUDA GPU with sufficient memory; the unit tests are CPU-only.
+The dependency files are layered as follows:
 
-## Fair baseline/SlaClip runs
+- `requirements-core.txt`: Transformers, PEFT, datasets, evaluation, and I/O;
+- `requirements.txt`: runtime stack including bounded PyTorch and Opacus families;
+- `requirements-dev.txt`: runtime stack plus test dependencies;
+- `environment.yml`: reference Python 3.11 Conda environment.
 
-Fixed-threshold baseline:
+Gemma 3 4B is a gated, multimodal checkpoint even when this project fine-tunes it on text. Accept the model terms, authenticate with Hugging Face, and pin a reviewed model commit for formal experiments. The loader selects a compatible multimodal/conditional-generation class and freezes the vision tower during text-only LoRA training. Transformers 4.50 or later is required for this architecture.
+
+## Paper/default configurations
+
+The tracked JSON configurations make the reproduction defaults explicit:
+
+| Setting | Math-10K | GLUE8 |
+|---|---:|---:|
+| Config | `configs/math10k_paper.json` | `configs/glue8_paper.json` |
+| Updates | 300 | 500 |
+| Learning rate | `3e-4` | `2e-4` |
+| Cutoff length | 256 | 384 |
+| Train on inputs | yes | no |
+| Expected batch / physical microbatch | 64 / 4 | 64 / 4 |
+| LoRA rank / alpha / dropout | 16 / 16 / 0.05 | 16 / 16 / 0.05 |
+| Initial or fixed threshold | 1.0 | 1.0 |
+
+Both configs use `google/gemma-3-4b-pt`, target `q_proj,k_proj,v_proj,up_proj,down_proj`, request `epsilon=6` and `delta=1e-5`, and use the PRV accountant. `prv` is also the CLI default.
+
+For a formal run, override the moving `main` model revision with an immutable Hugging Face commit or a pinned local snapshot:
+
+```bash
+MODEL_REVISION="REPLACE_WITH_REVIEWED_HF_COMMIT_SHA"
+
+bash scripts/run_math10k_pair.sh \
+  --model_revision "$MODEL_REVISION" \
+  --run_eval false
+```
+
+The pair script launches `baseline` and then `slaclip` from one shared argument list. The GLUE equivalent is `scripts/run_glue8_pair.sh`. Training-only jobs should use `--run_eval false` and perform generation/classification evaluation in a separate job.
+
+To run either method directly:
 
 ```bash
 python train_eval.py \
-  --dataset math10k \
+  --config configs/math10k_paper.json \
   --method baseline \
-  --privacy dp \
-  --epsilon 6 \
-  --delta 1e-5 \
-  --dp_max_grad_norm 1.0 \
-  --batch_size 64 \
-  --micro_batch_size 4 \
-  --seed 42 \
-  --telemetry_mode dp_safe
+  --model_revision "$MODEL_REVISION" \
+  --initial_clip_threshold 1.0
+
+python train_eval.py \
+  --config configs/math10k_paper.json \
+  --method slaclip \
+  --model_revision "$MODEL_REVISION" \
+  --initial_clip_threshold 1.0
 ```
 
-SlaClip plus the same baseline:
+`--initial_clip_threshold` means fixed `C` for `baseline` and initial `C_0` for full `slaclip`. `--dp_max_grad_norm` remains only as a legacy alias. A custom target experiment can therefore use, for example:
 
 ```bash
-python train_eval.py \
-  --dataset math10k \
-  --method slaclip \
-  --privacy dp \
-  --epsilon 6 \
-  --delta 1e-5 \
-  --dp_max_grad_norm 1.0 \
-  --batch_size 64 \
-  --micro_batch_size 4 \
-  --seed 42 \
-  --telemetry_mode dp_safe
+bash scripts/run_math10k_pair.sh \
+  --model_revision "$MODEL_REVISION" \
+  --initial_clip_threshold 2.0 \
+  --run_eval false
 ```
 
-`scripts/run_math10k_pair.sh` runs this pair from one shared argument list. `--slaclip_num_slots 0` (the default) selects `K` from the SlaClip paper's bound using expected batch size and noise multiplier. `--slaclip_eta`, `--slaclip_beta`, `--slaclip_c_min`, and `--slaclip_c_max` configure the full SlaClip controller.
+For SlaClip, `--slaclip_eta`, `--slaclip_beta`, `--slaclip_c_min`, and `--slaclip_c_max` configure the full controller. `--slaclip_num_slots 0` selects `K` automatically from the paper bound using expected batch size and noise multiplier. `beta` is the controller's slack target; it is not a fixed clipping threshold and does not turn this into SlaClip-Q.
 
-The privacy noise multiplier is calibrated for the exact requested update count. A Poisson batch is normalized by Opacus's fixed expected batch size, not by its randomly realized size.
+The noise multiplier is calibrated for the requested update count. Each Poisson batch is normalized by Opacus's fixed expected batch size, not by the randomly realized batch size. Dynamic clipping changes the absolute noise scale with `C_t`, while the matched noise multiplier and accountant determine the same privacy schedule.
 
-## Telemetry and the privacy boundary
+## Training loss and microbatch invariance
 
-`--telemetry_mode dp_safe` is the default. Its main log contains configuration, privacy accounting, the jointly noised Slack Indicator, threshold updates, and quantities obtained by post-processing DP releases. Exact training loss, exact clipping fraction, and raw gradient-norm statistics are excluded.
+Training uses one causal-LM loss per record:
 
-For trusted internal analysis only, an explicit research switch enables the requested “god-view” diagnostics:
+1. shift logits and labels by one token;
+2. average cross-entropy over the non-ignored target tokens **within each record**;
+3. average those per-record values across the physical batch.
+
+In short: token mean within a record, then record mean across the batch. This matches Opacus's record-level `loss_reduction='mean'` contract, so per-record gradients and clipping decisions do not change merely because a logical batch is split into different physical microbatches. The definition is recorded in logs, statuses, and checkpoints and is checked on resume.
+
+## DP-safe telemetry and research “god view”
+
+`--telemetry_mode dp_safe` is the default. Its main log contains run identity, privacy accounting, clipping thresholds, values obtained by post-processing the DP release/model update, and—for the SlaClip arm only—the jointly noised Slack Indicator and controller updates. The baseline arm does not compute or release SlaClip slack coordinates. The log deliberately excludes exact DP-training loss, exact clipping fractions, raw norm distributions, the realized noise norm, and other decompositions that would reveal non-released training behavior.
+
+For access-controlled training-dynamics research, the requested exact observer is enabled only with both flags:
 
 ```bash
-python train_eval.py \
-  --dataset math10k \
-  --method slaclip \
-  --privacy dp \
-  --telemetry_mode research_raw \
-  --allow_non_private_telemetry
+bash scripts/run_math10k_analysis_pair.sh \
+  --model_revision "$MODEL_REVISION" \
+  --initial_clip_threshold 1.0 \
+  --run_eval false
 ```
 
-This mode records exact per-step tangent-gradient norm histograms, quantiles, clipping fraction, clipping coefficients, raw clipped-signal norm, signal-to-noise ratio, token count, and training loss under:
+The analysis scripts are equivalent to passing:
 
 ```text
-LLM-Adapters/experiment/<run>/research_raw/NON_PRIVATE_train_log.jsonl
+--telemetry_mode research_raw --allow_non_private_telemetry
 ```
 
-The model update still executes the configured DP mechanism. However, the `research_raw` files themselves are direct functions of private examples and are **not differentially private releases**. Publishing them, or treating the entire model-plus-logs bundle as DP, would invalidate that end-to-end claim. The directory is separately marked and ignored by Git.
+The GLUE equivalent is `scripts/run_glue8_analysis_pair.sh`. Raw records are written to:
 
-The raw histogram resolution (`--raw_hist_bins`) is independent of SlaClip's slack dimension `K`. By default, histogram edges use a fixed range from zero to four times the initial clipping threshold, plus an overflow count, so distributions remain comparable across steps.
+```text
+<result_dir>/research_raw/NON_PRIVATE_train_log.jsonl
+```
 
-## Outputs
+They include exact record-mean training loss and supervised-token count, per-record tangent-gradient norm summaries/histograms, clipping fraction and coefficients, clipped and unclipped signal norms, clipping-bias norm, realized noise norm, and signal-to-noise ratio. The file is self-contained and marked `NON_PRIVATE_TELEMETRY`.
+
+To turn one raw trajectory into a step-wise CSV plus a compact JSON summary:
+
+```bash
+python scripts/summarize_telemetry.py \
+  <result_dir>/research_raw/NON_PRIVATE_train_log.jsonl \
+  --safe-log <output_dir>/train_log.jsonl
+```
+
+The generated files remain explicitly marked non-private and belong under the same access controls as the source log.
+
+The optimizer and released adapter still follow the configured DP training mechanism while this observer is active. The observer file itself, however, is a direct function of private examples and is **not a DP release**. Keep it access-controlled, do not publish it, and do not claim that the model-plus-raw-log bundle is DP. If raw telemetry is used to choose a checkpoint, hyperparameter, seed, or model for release, that selection also needs a privacy analysis; “internal only” does not make data-dependent selection free.
+
+See [the telemetry schema](docs/telemetry_schema.md) for field-level meanings and [the experiment protocol](docs/experiment_protocol.md) for the release boundary.
+
+## Run identity, outputs, and exact resume
+
+Every experiment receives a content-derived configuration fingerprint and a readable run ID containing the clipping threshold plus a short hash. The fingerprint covers the Git implementation commit plus a content hash when the worktree is dirty, dataset content hash, requested model revision, method, privacy parameters, optimizer/LoRA configuration, training schedule, and telemetry mode. Existing output directories with a different or unverifiable fingerprint are rejected instead of silently mixed. Formal runs should still start from a clean commit so another machine can reproduce the implementation directly.
+
+Default artifacts are placed under:
 
 ```text
 LLM-Adapters/
-  ft-training_set/       # supplied training data
-  trained_models/        # adapters, DP-safe log, status/config snapshot
-  experiment/            # evaluation outputs and optional research_raw logs
+  ft-training_set/       # tracked training assets
+  trained_models/<run>/  # adapter, DP-safe JSONL, status/config snapshot
+  experiment/<run>/      # evaluation output and optional research_raw directory
 ```
 
-The saved adapter rank can be twice the training rank because spectral residual rebasing is required to restore the original base model while preserving the learned low-rank update. `run_status.json` records both `training_lora_r` and `saved_adapter_r`.
+Checkpoints are written atomically at step zero and after completed logical steps. A valid resume restores and validates trainable weights, PRISM optimizer and SlaClip state, current `C_t`, Poisson sampler state, data-loader generator, serializable DP-noise generator state, privacy accountant, global Python/NumPy/PyTorch RNG state, completed update count, loss definition, model revision, and configuration fingerprint. Logs are truncated back to the checkpoint step before appending, preventing duplicate future records. Bitwise resume equivalence is covered by a synthetic Opacus/PRISM test in the default reproducible research mode (`dp_secure_mode=false`). A secure CSPRNG may intentionally resume from fresh entropy when its generator is not serializable; the mechanism remains valid but the continuation is not expected to match an uninterrupted run bit for bit.
 
-GLUE evaluation retains each task's standard metrics: Matthews correlation for CoLA; accuracy for SST-2, QNLI, and RTE; accuracy/F1 for MRPC and QQP; Pearson/Spearman for STS-B; and matched/mismatched accuracy for MNLI. Math evaluation reports exact-answer accuracy.
+Use the same run identity and unchanged configuration to resume. `--force_train` intentionally restarts the exact configuration and clears both that run's model and result directories so stale evaluation or telemetry cannot survive; it should not be used to overwrite an unrelated run directory.
 
-## Reproducibility notes
+The saved adapter rank can be twice the training rank because spectral residual rebasing restores the original base model while preserving the learned low-rank update. `run_status.json` records `training_lora_r`, `saved_adapter_r`, the resolved model revision, privacy accounting, runtime metadata, and completion state. Evaluation accepts only a completed adapter whose fingerprint matches the requested experiment.
 
-- Checkpoints store unwrapped PEFT parameter names and accept the older Opacus `_module.` prefix when resuming.
-- SlaClip controller state, current threshold, selected `K`, optimizer moments, RNG state, and completed update count are checkpointed.
-- Training logs and status snapshots record the complete run configuration.
-- Use at least three seeds for reported results. Compare both the paper/default fixed threshold and a validation-budget-matched fixed-threshold grid before making claims about adaptive clipping.
+## Evaluation and reporting
 
-See [docs/experiment_protocol.md](docs/experiment_protocol.md) for the comparison and release checklist.
+Math evaluation reports exact-answer accuracy. GLUE evaluation retains the standard task metrics: Matthews correlation for CoLA; accuracy for SST-2, QNLI, and RTE; accuracy/F1 for MRPC and QQP; Pearson/Spearman for STS-B; and matched/mismatched accuracy for MNLI.
+
+Evaluation reloads the resolved base-model revision recorded by training, even if the original request used a moving label such as `main`. Cached predictions are bound to an `evaluation_config.json` containing that resolved revision, the adapter fingerprint, task list, decoding parameters, and (for GLUE) `fast_dev_run`. Math predictions are written directly to each run's result directory, so concurrent baseline/SlaClip evaluations cannot collide. A mismatched or legacy cache is rejected; use `--force_eval` to rebuild it explicitly.
+
+For claims about adaptive clipping, use at least three predeclared seeds and report mean and standard deviation. Keep all paired fields matched, use the same `C` as baseline's fixed threshold and SlaClip's `C_0`, and do not select settings from the test set. The detailed comparison and artifact checklist is in [docs/experiment_protocol.md](docs/experiment_protocol.md).
 
 ## Acknowledgements
 
-This repository builds on code from the PRISM authors and the [LLM-Adapters](https://github.com/AGI-Edgerunners/LLM-Adapters) pipeline. Portions adapted from LLM-Adapters are distributed under the Apache-2.0 license; see `licenses/Apache-2.0.txt`.
+This repository builds on the [PRISM paper](https://arxiv.org/abs/2606.00944), the full [SlaClip implementation](https://github.com/ZsyRock/SlaClip), and the [LLM-Adapters](https://github.com/AGI-Edgerunners/LLM-Adapters) pipeline. Portions adapted from LLM-Adapters are distributed under the Apache-2.0 license; see `licenses/Apache-2.0.txt`.
