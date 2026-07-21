@@ -22,6 +22,7 @@ def parse_bool(x):
 def main():
     p = argparse.ArgumentParser(description='Train and evaluate PRISM LoRA adapters on Math-10K or GLUE8.')
     p.add_argument('--dataset', choices=['math10k', 'math', 'glue8', 'glue'], required=True)
+    p.add_argument('--method', choices=['baseline', 'slaclip'], default='baseline', help='Fixed-threshold PRISM baseline or SlaClip+PRISM baseline.')
     p.add_argument('--privacy', choices=['dp', 'nondp', 'non-dp'], default='dp')
     p.add_argument('--epsilon', type=float, default=6.0)
     p.add_argument('--delta', type=float, default=1e-05)
@@ -42,6 +43,16 @@ def main():
     p.add_argument('--train_on_inputs', type=parse_bool, default=None)
     p.add_argument('--dp_max_grad_norm', type=float, default=1.0)
     p.add_argument('--dp_grad_sample_mode', default='functorch')
+    p.add_argument('--dp_accountant', choices=['rdp', 'prv', 'gdp'], default='rdp')
+    p.add_argument('--telemetry_mode', choices=['dp_safe', 'research_raw'], default='dp_safe')
+    p.add_argument('--allow_non_private_telemetry', action='store_true', help='Required acknowledgement for exact, non-DP research diagnostics.')
+    p.add_argument('--raw_hist_bins', type=int, default=32)
+    p.add_argument('--raw_hist_max', type=float, default=0.0, help='Fixed norm histogram upper edge; 0 uses 4 * initial C.')
+    p.add_argument('--slaclip_num_slots', type=int, default=0, help='Slack dimension K; 0 selects the paper bound automatically.')
+    p.add_argument('--slaclip_eta', type=float, default=0.5)
+    p.add_argument('--slaclip_beta', type=float, default=0.5)
+    p.add_argument('--slaclip_c_min', type=float, default=0.1)
+    p.add_argument('--slaclip_c_max', type=float, default=50.0)
     p.add_argument('--run_train', type=parse_bool, default=True)
     p.add_argument('--run_eval', type=parse_bool, default=True)
     p.add_argument('--force_train', action='store_true')
@@ -55,7 +66,47 @@ def main():
     p.add_argument('--max_input_length', type=int, default=None)
     p.add_argument('--fast_dev_run', type=int, default=0)
     args = p.parse_args()
-    cfg = RunConfig(dataset=args.dataset, method='prism', privacy=args.privacy, root=ROOT, base_model=args.base_model, seed=args.seed, data_path=args.data_path, output_dir=args.output_dir, result_dir=args.result_dir, lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, target_modules=[x.strip() for x in args.target_modules.split(',') if x.strip()], total_update_steps=args.steps, batch_size=args.batch_size, micro_batch_size=args.micro_batch_size, learning_rate=args.lr, cutoff_len=args.cutoff_len, train_on_inputs=args.train_on_inputs, dp_epsilon=args.epsilon, dp_delta=args.delta, dp_max_grad_norm=args.dp_max_grad_norm, dp_grad_sample_mode=args.dp_grad_sample_mode, force_train=args.force_train, force_eval=args.force_eval, resume=not args.no_resume, checkpoint_every=args.checkpoint_every, run_train=args.run_train, run_eval=args.run_eval).finalize()
+    cfg = RunConfig(
+        dataset=args.dataset,
+        method=args.method,
+        privacy=args.privacy,
+        root=ROOT,
+        base_model=args.base_model,
+        seed=args.seed,
+        data_path=args.data_path,
+        output_dir=args.output_dir,
+        result_dir=args.result_dir,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=[x.strip() for x in args.target_modules.split(',') if x.strip()],
+        total_update_steps=args.steps,
+        batch_size=args.batch_size,
+        micro_batch_size=args.micro_batch_size,
+        learning_rate=args.lr,
+        cutoff_len=args.cutoff_len,
+        train_on_inputs=args.train_on_inputs,
+        dp_epsilon=args.epsilon,
+        dp_delta=args.delta,
+        dp_max_grad_norm=args.dp_max_grad_norm,
+        dp_grad_sample_mode=args.dp_grad_sample_mode,
+        dp_accountant=args.dp_accountant,
+        telemetry_mode=args.telemetry_mode,
+        allow_non_private_telemetry=args.allow_non_private_telemetry,
+        raw_hist_bins=args.raw_hist_bins,
+        raw_hist_max=args.raw_hist_max,
+        slaclip_num_slots=args.slaclip_num_slots,
+        slaclip_eta=args.slaclip_eta,
+        slaclip_beta=args.slaclip_beta,
+        slaclip_c_min=args.slaclip_c_min,
+        slaclip_c_max=args.slaclip_c_max,
+        force_train=args.force_train,
+        force_eval=args.force_eval,
+        resume=not args.no_resume,
+        checkpoint_every=args.checkpoint_every,
+        run_train=args.run_train,
+        run_eval=args.run_eval,
+    ).finalize()
     if args.repeat_id is not None and args.output_dir is None:
         cfg.output_dir = Path(str(cfg.output_dir) + f'_repeat{args.repeat_id}')
     if args.repeat_id is not None and args.result_dir is None:

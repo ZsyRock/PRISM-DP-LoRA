@@ -1,12 +1,11 @@
 from __future__ import annotations
-import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import torch
 from tqdm.auto import tqdm
-from .utils import JsonlLogger, adapter_is_complete, build_tokenizer, checkpoint_file, clean_output_dir, cleanup_cuda, freeze_vision_tower_params, generate_prompt, iter_microbatches, llm_adapters_dir, load_resume_checkpoint_if_available, load_trainable_state_dict, save_resume_checkpoint, save_status, set_rng_state, set_seed, tag_text, tokenize_prompt, unwrap_for_save
+from .utils import JsonlLogger, adapter_is_complete, build_tokenizer, checkpoint_file, clean_output_dir, cleanup_cuda, collect_runtime_metadata, freeze_vision_tower_params, generate_prompt, iter_microbatches, llm_adapters_dir, load_resume_checkpoint_if_available, load_trainable_state_dict, save_resume_checkpoint, save_status, set_rng_state, set_seed, tag_text, tokenize_prompt, unwrap_for_save
 
 @dataclass
 class RunConfig:
@@ -36,6 +35,16 @@ class RunConfig:
     dp_delta: float = 1e-05
     dp_max_grad_norm: float = 1.0
     dp_grad_sample_mode: str = 'functorch'
+    dp_accountant: str = 'rdp'
+    telemetry_mode: str = 'dp_safe'
+    allow_non_private_telemetry: bool = False
+    raw_hist_bins: int = 32
+    raw_hist_max: float = 0.0
+    slaclip_num_slots: int = 0
+    slaclip_eta: float = 0.5
+    slaclip_beta: float = 0.5
+    slaclip_c_min: float = 0.1
+    slaclip_c_max: float = 50.0
     force_train: bool = False
     force_eval: bool = False
     resume: bool = True
@@ -61,12 +70,39 @@ class RunConfig:
             self.dataset = 'glue8'
         else:
             raise ValueError('dataset must be one of: math10k, glue8')
-        self.method = 'prism'
+        method = self.method.lower().replace('-', '_')
+        if method in {'baseline', 'prism', 'fixed', 'fixed_prism'}:
+            self.method = 'baseline'
+        elif method in {'slaclip', 'slaclip_prism'}:
+            self.method = 'slaclip'
+        else:
+            raise ValueError('method must be baseline or slaclip')
         self.privacy = self.privacy.lower().replace('_', '-')
         if self.privacy in {'non-dp', 'nondp', 'none'}:
             self.privacy = 'nondp'
         if self.privacy not in {'dp', 'nondp'}:
             raise ValueError('privacy must be dp or nondp')
+        if self.method == 'slaclip' and self.privacy != 'dp':
+            raise ValueError('SlaClip is a DP clipping controller; use --privacy dp')
+        self.telemetry_mode = self.telemetry_mode.lower().replace('-', '_')
+        if self.telemetry_mode not in {'dp_safe', 'research_raw'}:
+            raise ValueError('telemetry_mode must be dp_safe or research_raw')
+        if self.telemetry_mode == 'research_raw' and not self.allow_non_private_telemetry:
+            raise ValueError(
+                'research_raw exposes private training statistics. Re-run with '
+                '--allow_non_private_telemetry only for trusted research analysis.'
+            )
+        if self.telemetry_mode == 'research_raw' and self.privacy != 'dp':
+            raise ValueError('research_raw is intended for observing DP training; use --privacy dp')
+        self.dp_accountant = self.dp_accountant.lower()
+        if self.dp_accountant not in {'rdp', 'prv', 'gdp'}:
+            raise ValueError('dp_accountant must be one of: rdp, prv, gdp')
+        if self.batch_size <= 0 or self.micro_batch_size <= 0:
+            raise ValueError('batch_size and micro_batch_size must be positive')
+        if self.dp_max_grad_norm <= 0:
+            raise ValueError('dp_max_grad_norm must be positive')
+        if self.raw_hist_bins <= 0:
+            raise ValueError('raw_hist_bins must be positive')
         adapters = llm_adapters_dir(self.root)
         if self.dataset == 'math10k':
             self.total_update_steps = self.total_update_steps or 300
@@ -99,6 +135,10 @@ class RunConfig:
     def log_jsonl(self) -> Path:
         return Path(self.output_dir) / 'train_log.jsonl'
 
+    @property
+    def raw_log_jsonl(self) -> Path:
+        return Path(self.result_dir) / 'research_raw' / 'NON_PRIVATE_train_log.jsonl'
+
 def _preimport_prism_training_stack() -> None:
     import datasets
     import opacus
@@ -121,17 +161,46 @@ def _device_and_dtype() -> Tuple[torch.device, torch.dtype, dict]:
         return (torch.device(f'cuda:{local_rank}'), dtype, {'': local_rank})
     return (torch.device('cpu'), torch.float32, {'': 'cpu'})
 
-def _make_private(privacy_engine, model, optimizer, train_loader, cfg: RunConfig, epochs_est: int):
+def _calibrate_noise_multiplier(cfg: RunConfig, sample_rate: float) -> float:
+    from opacus.accountants.utils import get_noise_multiplier
+    kwargs = dict(
+        target_epsilon=float(cfg.dp_epsilon),
+        target_delta=float(cfg.dp_delta),
+        sample_rate=float(sample_rate),
+        accountant=cfg.dp_accountant,
+    )
     try:
-        out = privacy_engine.make_private_with_epsilon(module=model, optimizer=optimizer, data_loader=train_loader, target_epsilon=cfg.dp_epsilon, target_delta=cfg.dp_delta, epochs=epochs_est, max_grad_norm=cfg.dp_max_grad_norm, grad_sample_mode=cfg.dp_grad_sample_mode)
-        return (out, cfg.dp_grad_sample_mode)
+        return float(get_noise_multiplier(**kwargs, steps=int(cfg.total_update_steps)))
     except TypeError:
-        out = privacy_engine.make_private_with_epsilon(module=model, optimizer=optimizer, data_loader=train_loader, target_epsilon=cfg.dp_epsilon, target_delta=cfg.dp_delta, epochs=epochs_est, max_grad_norm=cfg.dp_max_grad_norm)
-        return (out, 'default')
+        # Older Opacus versions expose epochs rather than exact steps.
+        return float(
+            get_noise_multiplier(
+                **kwargs,
+                epochs=float(cfg.total_update_steps) * float(sample_rate),
+            )
+        )
+
+
+def _make_private(privacy_engine, model, optimizer, train_loader, cfg: RunConfig):
+    sample_rate = 1.0 / float(len(train_loader))
+    noise_multiplier = _calibrate_noise_multiplier(cfg, sample_rate)
+    common = dict(
+        module=model,
+        optimizer=optimizer,
+        data_loader=train_loader,
+        noise_multiplier=noise_multiplier,
+        max_grad_norm=cfg.dp_max_grad_norm,
+    )
+    try:
+        out = privacy_engine.make_private(**common, grad_sample_mode=cfg.dp_grad_sample_mode)
+        return (out, cfg.dp_grad_sample_mode, noise_multiplier, sample_rate)
+    except TypeError:
+        out = privacy_engine.make_private(**common)
+        return (out, 'default', noise_multiplier, sample_rate)
     except Exception as e:
-        print(f'[warn] make_private_with_epsilon failed for grad_sample_mode={cfg.dp_grad_sample_mode}: {e!r}')
-        out = privacy_engine.make_private_with_epsilon(module=model, optimizer=optimizer, data_loader=train_loader, target_epsilon=cfg.dp_epsilon, target_delta=cfg.dp_delta, epochs=epochs_est, max_grad_norm=cfg.dp_max_grad_norm, grad_sample_mode='hooks')
-        return (out, 'hooks')
+        print(f'[warn] make_private failed for grad_sample_mode={cfg.dp_grad_sample_mode}: {e!r}')
+        out = privacy_engine.make_private(**common, grad_sample_mode='hooks')
+        return (out, 'hooks', noise_multiplier, sample_rate)
 
 def _step_accountant(privacy_engine, noise_multiplier: float, sample_rate: float) -> None:
     try:
@@ -151,11 +220,10 @@ def _make_loader(cfg: RunConfig, tokenizer):
     train_ds = train_ds.map(map_fn, remove_columns=train_ds.column_names, desc='Tokenizing')
     collator = transformers.DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8, return_tensors='pt', padding=True)
     loader_kwargs = dict(dataset=train_ds, batch_size=int(cfg.batch_size), shuffle=True, drop_last=False, collate_fn=collator)
-    if not (cfg.dataset == 'math10k' and cfg.method == 'prism'):
-        generator = torch.Generator()
-        generator.manual_seed(cfg.seed)
-        loader_kwargs['generator'] = generator
-        loader_kwargs['num_workers'] = 0
+    generator = torch.Generator()
+    generator.manual_seed(cfg.seed)
+    loader_kwargs['generator'] = generator
+    loader_kwargs['num_workers'] = 0
     loader = DataLoader(**loader_kwargs)
     return (loader, train_ds)
 
@@ -180,14 +248,40 @@ def _build_prism_optimizer(cfg: RunConfig, model):
     from .optim.prism import PRISM, get_paired_lora_parameters
     params = get_paired_lora_parameters(model)
     print(f'[optimizer] paired LoRA tensors = {len(params)} / modules = {len(params) // 2}')
-    return PRISM(params, lr=float(cfg.learning_rate), betas=(0.9, 0.999), eps=1e-08, weight_decay=0.0, use_adaptive=True, dp_precond_floor_factor=float(cfg.prism_floor_factor), dp_floor_mode=cfg.prism_floor_mode, precond_cond_max=float(cfg.prism_cond_max), precond_cond_strategy=cfg.prism_cond_strategy, precond_update_mode='current', lift_gauge_fix=cfg.prism_lift_fix, gauge_fix_eps=1e-12, max_update_norm=float(cfg.max_update_norm), dp_debias_second_moment=bool(cfg.prism_debias_second_moment))
+    return PRISM(
+        params,
+        lr=float(cfg.learning_rate),
+        betas=(0.9, 0.999),
+        eps=1e-08,
+        weight_decay=0.0,
+        use_adaptive=True,
+        dp_precond_floor_factor=float(cfg.prism_floor_factor),
+        dp_floor_mode=cfg.prism_floor_mode,
+        precond_cond_max=float(cfg.prism_cond_max),
+        precond_cond_strategy=cfg.prism_cond_strategy,
+        precond_update_mode='current',
+        lift_gauge_fix=cfg.prism_lift_fix,
+        gauge_fix_eps=1e-12,
+        max_update_norm=float(cfg.max_update_norm),
+        dp_debias_second_moment=bool(cfg.prism_debias_second_moment),
+        clipping_method=cfg.method,
+        slaclip_num_slots=int(cfg.slaclip_num_slots),
+        slaclip_eta=float(cfg.slaclip_eta),
+        slaclip_beta=float(cfg.slaclip_beta),
+        slaclip_c_min=float(cfg.slaclip_c_min),
+        slaclip_c_max=float(cfg.slaclip_c_max),
+        telemetry_mode=cfg.telemetry_mode,
+        raw_hist_bins=int(cfg.raw_hist_bins),
+        raw_hist_max=float(cfg.raw_hist_max),
+    )
 
-def _rebase_prism_for_save(model) -> None:
+def _rebase_prism_for_save(model) -> Dict[str, float]:
     from .optim.prism import spectral_rebase_adapter_inplace
     try:
-        spectral_rebase_adapter_inplace(model, adapter_name='default', verbose=True)
+        return spectral_rebase_adapter_inplace(model, adapter_name='default', verbose=True)
     except Exception as e:
         print('[warn] spectral rebase for saving failed:', repr(e))
+        return {'spectral_rebase_modules': 0.0, 'spectral_rebase_new_rank': 0.0}
 
 def _restore_if_possible(cfg: RunConfig, model, optimizer) -> int:
     if not cfg.resume or cfg.force_train:
@@ -202,7 +296,7 @@ def _restore_if_possible(cfg: RunConfig, model, optimizer) -> int:
                 optimizer._ensure_state()
             optimizer.load_state_dict(ckpt['optimizer_state'])
         except Exception as e:
-            print('[resume] optimizer state not restored:', repr(e))
+            raise RuntimeError(f'optimizer state could not be restored: {e!r}') from e
     set_rng_state(ckpt.get('rng_state'))
     step = int(ckpt.get('update_steps', 0))
     print(f'[resume] starting at update step {step}')
@@ -230,20 +324,62 @@ def train_prism_manual(cfg: RunConfig) -> Path:
     privacy_engine = None
     noise_multiplier = None
     sample_rate = None
+    expected_batch_size = None
     if cfg.privacy == 'dp':
         from opacus import PrivacyEngine
-        epochs_est = max(1, math.ceil(int(cfg.total_update_steps) / max(1, len(train_loader))))
-        privacy_engine = PrivacyEngine()
-        (model, dp_opt, train_loader), used_mode = _make_private(privacy_engine, model, optimizer, train_loader, cfg, epochs_est)
-        noise_multiplier = float(getattr(dp_opt, 'noise_multiplier', None))
-        sample_rate = getattr(dp_opt, 'sample_rate', None) or float(cfg.batch_size) / float(len(train_ds))
+        privacy_engine = PrivacyEngine(accountant=cfg.dp_accountant)
+        (model, dp_opt, train_loader), used_mode, calibrated_noise, calibrated_sample_rate = _make_private(
+            privacy_engine, model, optimizer, train_loader, cfg
+        )
+        noise_multiplier = float(getattr(dp_opt, 'noise_multiplier', calibrated_noise))
+        sample_rate = float(calibrated_sample_rate)
+        expected_batch_size = float(
+            getattr(dp_opt, 'expected_batch_size', float(len(train_ds)) * sample_rate)
+        )
         base_opt = getattr(dp_opt, 'original_optimizer', optimizer)
         optimizer = base_opt
         for _ in range(start_step):
             _step_accountant(privacy_engine, noise_multiplier, float(sample_rate))
-        print(f'[DP] grad_sample_mode={used_mode} noise_multiplier={noise_multiplier} sample_rate≈{float(sample_rate):.6g}')
+        print(
+            f'[DP] accountant={cfg.dp_accountant} grad_sample_mode={used_mode} '
+            f'noise_multiplier={noise_multiplier:.8g} sample_rate={sample_rate:.8g} '
+            f'expected_batch_size={expected_batch_size:.8g}'
+        )
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
     logger = JsonlLogger(cfg.log_jsonl)
+    raw_logger = None
+    if cfg.telemetry_mode == 'research_raw':
+        if cfg.force_train and cfg.raw_log_jsonl.exists():
+            cfg.raw_log_jsonl.unlink()
+        raw_logger = JsonlLogger(cfg.raw_log_jsonl)
+        warning_path = cfg.raw_log_jsonl.parent / 'README_NON_PRIVATE.txt'
+        warning_path.write_text(
+            'NON-PRIVATE RESEARCH TELEMETRY\n\n'
+            'Files in this directory contain exact statistics derived from private '
+            'training examples. The model update still uses the configured DP mechanism, '
+            'but these telemetry files are not a DP release and must not be published.\n',
+            encoding='utf-8',
+        )
+        print(f'[privacy warning] research_raw telemetry enabled: {cfg.raw_log_jsonl}')
+    save_status(
+        Path(cfg.output_dir),
+        state='running',
+        method=cfg.method,
+        privacy=cfg.privacy,
+        telemetry_mode=cfg.telemetry_mode,
+        non_private_telemetry=cfg.telemetry_mode == 'research_raw',
+        config=cfg.__dict__,
+        privacy_accounting={
+            'accountant': cfg.dp_accountant,
+            'target_epsilon': cfg.dp_epsilon,
+            'target_delta': cfg.dp_delta,
+            'noise_multiplier': noise_multiplier,
+            'sample_rate': sample_rate,
+            'expected_batch_size': expected_batch_size,
+            'planned_update_steps': cfg.total_update_steps,
+        },
+        runtime=collect_runtime_metadata(cfg.root),
+    )
     model.train()
     update_steps = int(start_step)
     pbar = tqdm(total=int(cfg.total_update_steps), initial=update_steps, desc=f'{cfg.method}/{cfg.privacy} updates')
@@ -256,7 +392,13 @@ def train_prism_manual(cfg: RunConfig) -> Path:
             token_sum = 0
             seen = 0
             if cfg.privacy == 'dp':
-                optimizer.dp_begin(max_grad_norm=float(cfg.dp_max_grad_norm))
+                assert expected_batch_size is not None
+                assert noise_multiplier is not None
+                optimizer.dp_begin(
+                    max_grad_norm=float(cfg.dp_max_grad_norm),
+                    expected_batch_size=float(expected_batch_size),
+                    noise_multiplier=float(noise_multiplier),
+                )
                 for micro in iter_microbatches(batch, int(cfg.micro_batch_size)):
                     optimizer.zero_grad(set_to_none=True)
                     out = model(**micro)
@@ -265,7 +407,9 @@ def train_prism_manual(cfg: RunConfig) -> Path:
                     loss_sum += float(loss.detach().cpu().item()) * micro_bs
                     seen += micro_bs
                     token_sum += int(micro.get('attention_mask', torch.ones_like(micro['input_ids'])).detach().sum().item())
-                    (loss * micro_bs).backward()
+                    # Opacus reconstructs per-example gradients under mean reduction.
+                    # Multiplying by micro_bs here would change clipping with microbatch size.
+                    loss.backward()
                     optimizer.dp_accumulate()
                 total_seen = optimizer.dp_finalize(noise_multiplier=float(noise_multiplier))
                 _step_accountant(privacy_engine, noise_multiplier=float(noise_multiplier), sample_rate=float(sample_rate))
@@ -273,7 +417,7 @@ def train_prism_manual(cfg: RunConfig) -> Path:
             else:
                 optimizer.zero_grad(set_to_none=True)
                 micros = list(iter_microbatches(batch, int(cfg.micro_batch_size)))
-                grad_accum = max(1, len(micros))
+                logical_batch_size = int(batch['input_ids'].shape[0])
                 for micro in micros:
                     out = model(**micro)
                     loss = out.loss if hasattr(out, 'loss') else out[0]
@@ -281,11 +425,13 @@ def train_prism_manual(cfg: RunConfig) -> Path:
                     loss_sum += float(loss.detach().cpu().item()) * micro_bs
                     seen += micro_bs
                     token_sum += int(micro.get('attention_mask', torch.ones_like(micro['input_ids'])).detach().sum().item())
-                    (loss / float(grad_accum)).backward()
+                    (loss * (float(micro_bs) / max(1, logical_batch_size))).backward()
                 optimizer.step()
             update_steps += 1
             pbar.update(1)
-            rec = {'method': cfg.method, 'privacy': cfg.privacy, 'step': update_steps, 'loss_mean': loss_sum / max(1, seen), 'tokens': token_sum, 'batch_n': seen, 'base_model': cfg.base_model, 'dataset': cfg.dataset, 'lora_r': int(cfg.lora_r), 'lr': float(cfg.learning_rate), 'spectral_oversample': int(cfg.spectral_oversample), 'spectral_n_iter': int(cfg.spectral_n_iter), 'lift_gauge_fix': cfg.prism_lift_fix, 'prism_floor_factor': float(cfg.prism_floor_factor), 'prism_floor_mode': cfg.prism_floor_mode, 'prism_debias_second_moment': bool(cfg.prism_debias_second_moment)}
+            rec = {'method': cfg.method, 'privacy': cfg.privacy, 'telemetry_mode': cfg.telemetry_mode, 'step': update_steps, 'base_model': cfg.base_model, 'dataset': cfg.dataset, 'lora_r': int(cfg.lora_r), 'lr': float(cfg.learning_rate), 'spectral_oversample': int(cfg.spectral_oversample), 'spectral_n_iter': int(cfg.spectral_n_iter), 'lift_gauge_fix': cfg.prism_lift_fix, 'prism_floor_factor': float(cfg.prism_floor_factor), 'prism_floor_mode': cfg.prism_floor_mode, 'prism_debias_second_moment': bool(cfg.prism_debias_second_moment)}
+            if cfg.privacy != 'dp':
+                rec.update({'loss_mean': loss_sum / max(1, seen), 'tokens': token_sum, 'batch_n': seen})
             rec.update(getattr(optimizer, 'last_log', {}) or {})
             if privacy_engine is not None:
                 try:
@@ -293,8 +439,24 @@ def train_prism_manual(cfg: RunConfig) -> Path:
                 except Exception:
                     pass
             logger.log(rec)
+            if raw_logger is not None:
+                raw_rec = {
+                    'NON_PRIVATE_TELEMETRY': True,
+                    'method': cfg.method,
+                    'privacy': cfg.privacy,
+                    'step': update_steps,
+                    'loss_mean': loss_sum / max(1, seen),
+                    'tokens': token_sum,
+                    'batch_n': seen,
+                }
+                raw_rec.update(getattr(optimizer, 'last_raw_log', {}) or {})
+                raw_logger.log(raw_rec)
             if update_steps % 10 == 0 or update_steps == int(cfg.total_update_steps):
-                msg = f"[{cfg.method}/{cfg.privacy}] step={update_steps} loss={rec['loss_mean']:.4f}"
+                msg = f"[{cfg.method}/{cfg.privacy}] step={update_steps}"
+                if cfg.privacy != 'dp' or cfg.telemetry_mode == 'research_raw':
+                    msg += f" loss={loss_sum / max(1, seen):.4f}"
+                if 'dp_clip_threshold' in rec:
+                    msg += f" C={rec['dp_clip_threshold']:.5g}"
                 if 'eps_spent' in rec:
                     msg += f" eps≈{rec['eps_spent']:.3f}"
                 print(msg)
@@ -302,12 +464,18 @@ def train_prism_manual(cfg: RunConfig) -> Path:
                 save_resume_checkpoint(Path(cfg.output_dir), model, optimizer, update_steps)
     pbar.close()
     logger.close()
+    if raw_logger is not None:
+        raw_logger.close()
     to_save = unwrap_for_save(model)
-    _rebase_prism_for_save(to_save)
+    rebase_stats = _rebase_prism_for_save(to_save)
     to_save.save_pretrained(str(cfg.output_dir))
     if checkpoint_file(Path(cfg.output_dir)).exists():
         checkpoint_file(Path(cfg.output_dir)).unlink()
-    save_status(Path(cfg.output_dir), state='completed', method=cfg.method, privacy=cfg.privacy, update_steps=update_steps, dataset=cfg.dataset, base_model=cfg.base_model, lora_r=int(cfg.lora_r))
+    epsilon_spent = None
+    if privacy_engine is not None:
+        epsilon_spent = float(privacy_engine.get_epsilon(float(cfg.dp_delta)))
+    saved_rank = int(rebase_stats.get('spectral_rebase_new_rank') or cfg.lora_r)
+    save_status(Path(cfg.output_dir), state='completed', method=cfg.method, privacy=cfg.privacy, telemetry_mode=cfg.telemetry_mode, non_private_telemetry=cfg.telemetry_mode == 'research_raw', update_steps=update_steps, dataset=cfg.dataset, base_model=cfg.base_model, training_lora_r=int(cfg.lora_r), saved_adapter_r=saved_rank, spectral_rebase=rebase_stats, config=cfg.__dict__, privacy_accounting={'accountant': cfg.dp_accountant, 'target_epsilon': cfg.dp_epsilon, 'target_delta': cfg.dp_delta, 'epsilon_spent': epsilon_spent, 'noise_multiplier': noise_multiplier, 'sample_rate': sample_rate, 'expected_batch_size': expected_batch_size, 'completed_update_steps': update_steps}, runtime=collect_runtime_metadata(cfg.root))
     cleanup_cuda()
     print('Saved adapter to:', cfg.output_dir)
     return Path(cfg.output_dir)

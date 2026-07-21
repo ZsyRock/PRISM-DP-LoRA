@@ -2,9 +2,11 @@ from __future__ import annotations
 import math
 import types
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import Tensor
+
+from ..slaclip import automatic_num_slots, build_slack_vectors, update_slaclip_threshold
 
 class _LoraShapeHelper:
 
@@ -241,16 +243,21 @@ def _horizontalize_lift(dA: Tensor, dB: Tensor, A: Tensor, B: Tensor, eps: float
 @dataclass
 class _DPAccumState:
     max_grad_norm: float
+    expected_batch_size: float
+    noise_multiplier: float
     total_samples: int = 0
     microbatches: int = 0
-    clipped_frac_sum: float = 0.0
-    coef_mean_sum: float = 0.0
-    coef_min_sum: float = 0.0
+    clipped_samples: int = 0
+    coef_sum: float = 0.0
+    coef_min: float = 1.0
+    slack_sum: Optional[Tensor] = None
+    slack_lambda: float = 0.0
+    raw_norms: List[Tensor] = field(default_factory=list)
     last_micro_stats: Dict[str, float] = field(default_factory=dict)
 
 class PRISM(torch.optim.Optimizer):
 
-    def __init__(self, params: Iterable[torch.nn.Parameter], lr: float=0.0003, betas: Tuple[float, float]=(0.9, 0.999), eps: float=1e-08, weight_decay: float=0.0, rcond: float=1e-06, lora_l_dim: int=0, lora_r_dim: int=-1, use_adaptive: bool=True, dp_precond_floor_factor: float=1.0, dp_floor_mode: str='geometry', precond_cond_max: Optional[float]=10000.0, precond_cond_strategy: str='raise_small', precond_update_mode: str='current', lift_gauge_fix: str='none', gauge_fix_eps: float=1e-12, max_update_norm: float=0.0, use_trust_ratio: bool=False, trust_clip: Tuple[float, float]=(0.0, 10.0), trust_eps: float=1e-12, dp_debias_second_moment: bool=True, log_every: int=1):
+    def __init__(self, params: Iterable[torch.nn.Parameter], lr: float=0.0003, betas: Tuple[float, float]=(0.9, 0.999), eps: float=1e-08, weight_decay: float=0.0, rcond: float=1e-06, lora_l_dim: int=0, lora_r_dim: int=-1, use_adaptive: bool=True, dp_precond_floor_factor: float=1.0, dp_floor_mode: str='geometry', precond_cond_max: Optional[float]=10000.0, precond_cond_strategy: str='raise_small', precond_update_mode: str='current', lift_gauge_fix: str='none', gauge_fix_eps: float=1e-12, max_update_norm: float=0.0, use_trust_ratio: bool=False, trust_clip: Tuple[float, float]=(0.0, 10.0), trust_eps: float=1e-12, dp_debias_second_moment: bool=True, log_every: int=1, clipping_method: str='baseline', slaclip_num_slots: int=0, slaclip_eta: float=0.5, slaclip_beta: float=0.5, slaclip_c_min: float=0.1, slaclip_c_max: float=50.0, telemetry_mode: str='dp_safe', raw_hist_bins: int=32, raw_hist_max: float=0.0):
         if lr <= 0:
             raise ValueError('lr must be positive')
         beta1, beta2 = betas
@@ -277,6 +284,22 @@ class PRISM(torch.optim.Optimizer):
             raise ValueError(f'lift_gauge_fix must be one of {sorted(valid_gauge_fix_modes)}, got {lift_gauge_fix!r}')
         if gauge_fix_eps <= 0:
             raise ValueError('gauge_fix_eps must be positive')
+        clipping_method = str(clipping_method).lower()
+        if clipping_method not in {'baseline', 'slaclip'}:
+            raise ValueError("clipping_method must be 'baseline' or 'slaclip'")
+        telemetry_mode = str(telemetry_mode).lower()
+        if telemetry_mode not in {'dp_safe', 'research_raw'}:
+            raise ValueError("telemetry_mode must be 'dp_safe' or 'research_raw'")
+        if int(slaclip_num_slots) < 0:
+            raise ValueError('slaclip_num_slots must be >= 0 (0 selects it automatically)')
+        if float(slaclip_eta) < 0:
+            raise ValueError('slaclip_eta must be non-negative')
+        if not 0.0 <= float(slaclip_beta) <= 1.0:
+            raise ValueError('slaclip_beta must be in [0, 1]')
+        if float(slaclip_c_min) <= 0 or float(slaclip_c_max) < float(slaclip_c_min):
+            raise ValueError('require 0 < slaclip_c_min <= slaclip_c_max')
+        if int(raw_hist_bins) <= 0:
+            raise ValueError('raw_hist_bins must be positive')
         defaults = dict(lr=lr)
         super().__init__(params, defaults)
         self.beta1 = float(beta1)
@@ -300,16 +323,53 @@ class PRISM(torch.optim.Optimizer):
         self.trust_clip = (float(trust_clip[0]), float(trust_clip[1]))
         self.trust_eps = float(trust_eps)
         self.dp_debias_second_moment = bool(dp_debias_second_moment)
+        self.clipping_method = clipping_method
+        self.slaclip_num_slots = int(slaclip_num_slots)
+        self.slaclip_eta = float(slaclip_eta)
+        self.slaclip_beta = float(slaclip_beta)
+        self.slaclip_c_min = float(slaclip_c_min)
+        self.slaclip_c_max = float(slaclip_c_max)
+        self.telemetry_mode = telemetry_mode
+        self.raw_hist_bins = int(raw_hist_bins)
+        self.raw_hist_max = float(raw_hist_max)
+        self.current_clip: Optional[float] = None
         self._helper = _LoraShapeHelper()
         self._dp_state: Optional[_DPAccumState] = None
         self._state_initialized = False
-        self.last_log: Dict[str, float] = {}
+        self.last_log: Dict[str, Any] = {}
+        self.last_raw_log: Dict[str, Any] = {}
 
     def _pair_iter(self):
         for group in self.param_groups:
             params = group['params']
             for p1, p2 in list(zip(params, params[1:]))[::2]:
                 yield (group, p1, p2)
+
+    def state_dict(self):
+        state = super().state_dict()
+        state['_prism_runtime'] = {
+            'clipping_method': self.clipping_method,
+            'current_clip': self.current_clip,
+            'slaclip_num_slots': self.slaclip_num_slots,
+            'raw_hist_max': self.raw_hist_max,
+        }
+        return state
+
+    def load_state_dict(self, state_dict):
+        state_copy = dict(state_dict)
+        runtime = state_copy.pop('_prism_runtime', None)
+        result = super().load_state_dict(state_copy)
+        if isinstance(runtime, dict):
+            saved_method = runtime.get('clipping_method')
+            if saved_method is not None and saved_method != self.clipping_method:
+                raise ValueError(
+                    f"checkpoint clipping_method={saved_method!r} does not match current method={self.clipping_method!r}"
+                )
+            saved_clip = runtime.get('current_clip')
+            self.current_clip = None if saved_clip is None else float(saved_clip)
+            self.slaclip_num_slots = int(runtime.get('slaclip_num_slots', self.slaclip_num_slots))
+            self.raw_hist_max = float(runtime.get('raw_hist_max', self.raw_hist_max))
+        return result
 
     def _get_factors(self, pA: torch.nn.Parameter, pB: torch.nn.Parameter) -> Tuple[Tensor, Tensor]:
         B, _ = self._helper.move_lora_dim_to_last(pA.data, self.lora_l_dim)
@@ -452,11 +512,29 @@ class PRISM(torch.optim.Optimizer):
         return loss
 
     @torch.no_grad()
-    def dp_begin(self, max_grad_norm: float) -> None:
+    def dp_begin(self, max_grad_norm: float, *, expected_batch_size: float, noise_multiplier: float) -> None:
         if max_grad_norm <= 0:
             raise ValueError('max_grad_norm must be positive')
+        if expected_batch_size <= 0:
+            raise ValueError('expected_batch_size must be positive')
+        if noise_multiplier <= 0:
+            raise ValueError('noise_multiplier must be positive')
         self._ensure_state()
-        self._dp_state = _DPAccumState(max_grad_norm=float(max_grad_norm), total_samples=0)
+        if self.current_clip is None:
+            self.current_clip = float(max_grad_norm)
+        if self.raw_hist_max <= 0:
+            # Freeze one absolute range for the whole run so histograms remain comparable.
+            self.raw_hist_max = 4.0 * float(max_grad_norm)
+        clip_threshold = float(self.current_clip if self.clipping_method == 'slaclip' else max_grad_norm)
+        if self.slaclip_num_slots == 0:
+            self.slaclip_num_slots = automatic_num_slots(expected_batch_size, noise_multiplier)
+        self._dp_state = _DPAccumState(
+            max_grad_norm=clip_threshold,
+            expected_batch_size=float(expected_batch_size),
+            noise_multiplier=float(noise_multiplier),
+        )
+        self.last_log = {}
+        self.last_raw_log = {}
         for _, pA, pB in self._pair_iter():
             st = self.state[pA]['prism']
             A, B = self._get_factors(pA, pB)
@@ -521,10 +599,21 @@ class PRISM(torch.optim.Optimizer):
         coef_mean = float(coef.mean().item())
         coef_min = float(coef.min().item())
         self._dp_state.microbatches += 1
-        self._dp_state.clipped_frac_sum += clipped_frac
-        self._dp_state.coef_mean_sum += coef_mean
-        self._dp_state.coef_min_sum += coef_min
+        self._dp_state.clipped_samples += int((coef < 1.0).sum().item())
+        self._dp_state.coef_sum += float(coef.sum().item())
+        self._dp_state.coef_min = min(self._dp_state.coef_min, coef_min)
         self._dp_state.last_micro_stats = {'micro_clipped_frac': clipped_frac, 'micro_coef_mean': coef_mean, 'micro_coef_min': coef_min, 'micro_global_norm_mean': float(global_norm.mean().item()), 'micro_global_norm_p95': float(torch.quantile(global_norm, 0.95).item())}
+        slack_vectors, lambda_t = build_slack_vectors(global_norm, max_norm, self.slaclip_num_slots)
+        if self._dp_state.slack_lambda and not math.isclose(self._dp_state.slack_lambda, lambda_t, rel_tol=1e-12):
+            raise RuntimeError('SlaClip threshold changed inside one logical batch')
+        self._dp_state.slack_lambda = float(lambda_t)
+        slack_sum = slack_vectors.sum(dim=0)
+        if self._dp_state.slack_sum is None:
+            self._dp_state.slack_sum = slack_sum
+        else:
+            self._dp_state.slack_sum.add_(slack_sum.to(self._dp_state.slack_sum.device))
+        if self.telemetry_mode == 'research_raw':
+            self._dp_state.raw_norms.append(global_norm.detach().to('cpu', dtype=torch.float32))
         coef_view = coef.view(-1, 1, 1)
         for _, pA, pB in self._pair_iter():
             st = self.state[pA]['prism']
@@ -570,7 +659,16 @@ class PRISM(torch.optim.Optimizer):
             return 0
         C = float(self._dp_state.max_grad_norm)
         sigma = float(noise_multiplier)
-        std = sigma * C / float(total)
+        if not math.isclose(sigma, float(self._dp_state.noise_multiplier), rel_tol=1e-12):
+            raise ValueError('noise_multiplier changed inside one logical batch')
+        release_denom = float(self._dp_state.expected_batch_size)
+        std = sigma * C / release_denom
+        slack_indicator: Optional[Tensor] = None
+        if self._dp_state.slack_sum is not None and self._dp_state.slack_lambda > 0:
+            slack_noise = torch.randn_like(self._dp_state.slack_sum) * (sigma * C)
+            slack_indicator = (
+                self._dp_state.slack_sum + slack_noise
+            ) / (float(self._dp_state.slack_lambda) * release_denom)
         signal_norm_sq = 0.0
         noise_norm_sq = 0.0
         update_clip_coef_min = 1.0
@@ -599,8 +697,8 @@ class PRISM(torch.optim.Optimizer):
             QA = cache.get('QA')
             if QA is None:
                 QA, _ = torch.linalg.qr(A, mode='reduced')
-            gradA = st.dp_accum_A / float(total)
-            gradB = st.dp_accum_B / float(total)
+            gradA = st.dp_accum_A / release_denom
+            gradB = st.dp_accum_B / release_denom
             if std > 0:
                 U = torch.randn_like(A)
                 V = torch.randn_like(B)
@@ -615,9 +713,10 @@ class PRISM(torch.optim.Optimizer):
             gradB_noisy = gradB + noise_B
             if self.lift_gauge_fix in {'pre_moment', 'both'}:
                 gradA_noisy, gradB_noisy = _horizontalize_lift(gradA_noisy, gradB_noisy, A, B, eps=self.gauge_fix_eps)
-            sig_n2 = _tangent_fro_norm_sq(gradA, gradB, A, B)
             noi_n2 = _tangent_fro_norm_sq(noise_A, noise_B, A, B)
-            signal_norm_sq += float(sig_n2.item())
+            if self.telemetry_mode == 'research_raw':
+                sig_n2 = _tangent_fro_norm_sq(gradA, gradB, A, B)
+                signal_norm_sq += float(sig_n2.item())
             noise_norm_sq += float(noi_n2.item())
             base_floor = float(self.dp_precond_floor_factor) * float(std * std)
             if self.dp_floor_mode == 'none':
@@ -671,14 +770,90 @@ class PRISM(torch.optim.Optimizer):
             st.dp_cache = None
             st.dp_accum_A = None
             st.dp_accum_B = None
-        mb = max(1, int(self._dp_state.microbatches))
-        clip_frac = self._dp_state.clipped_frac_sum / mb
-        coef_mean = self._dp_state.coef_mean_sum / mb
-        coef_min = self._dp_state.coef_min_sum / mb
-        sig = math.sqrt(max(signal_norm_sq, 0.0))
+        clip_frac = float(self._dp_state.clipped_samples) / max(1, total)
+        coef_mean = float(self._dp_state.coef_sum) / max(1, total)
+        coef_min = float(self._dp_state.coef_min)
         noi = math.sqrt(max(noise_norm_sq, 0.0))
-        snr = float(sig / (noi + 1e-12))
-        self.last_log = {'dp_total_samples': float(total), 'dp_noise_multiplier': float(noise_multiplier), 'dp_std_per_factor': float(std), 'dp_floor_mode_id': float({'none': 0, 'scalar': 1, 'geometry': 2}.get(self.dp_floor_mode, -1)), 'dp_precond_update_mode_id': float({'current': 0, 'delayed': 1}.get(self.precond_update_mode, -1)), 'dp_lift_gauge_fix_id': float({'none': 0, 'pre_moment': 1, 'pre_retract': 2, 'both': 3}.get(self.lift_gauge_fix, -1)), 'dp_floorA_min': float(0.0 if floorA_min == float('inf') else floorA_min), 'dp_floorA_max': float(floorA_max), 'dp_floorB_min': float(0.0 if floorB_min == float('inf') else floorB_min), 'dp_floorB_max': float(floorB_max), 'dp_clip_frac': float(clip_frac), 'dp_coef_mean': float(coef_mean), 'dp_coef_min': float(coef_min), 'dp_signal_norm': float(sig), 'dp_noise_norm': float(noi), 'dp_snr': float(snr), 'dp_update_clip_coef_min': float(update_clip_coef_min), 'dp_trust_ratio_min': float(0.0 if trust_ratio_min == float('inf') else trust_ratio_min), 'dp_trust_ratio_max': float(trust_ratio_max), 'dp_precond_eigA_min': float(0.0 if precond_eigA_min == float('inf') else precond_eigA_min), 'dp_precond_eigA_max': float(precond_eigA_max), 'dp_precond_eigB_min': float(0.0 if precond_eigB_min == float('inf') else precond_eigB_min), 'dp_precond_eigB_max': float(precond_eigB_max)}
+        c_next = C
+        gamma_t: Optional[float] = None
+        if self.clipping_method == 'slaclip' and slack_indicator is not None:
+            c_next, gamma_t = update_slaclip_threshold(
+                C,
+                slack_indicator,
+                eta=self.slaclip_eta,
+                beta=self.slaclip_beta,
+                c_min=self.slaclip_c_min,
+                c_max=self.slaclip_c_max,
+            )
+            self.current_clip = float(c_next)
+        elif self.clipping_method == 'baseline':
+            self.current_clip = C
+
+        self.last_log = {
+            'telemetry_mode': self.telemetry_mode,
+            'dp_realized_batch_size': int(total),
+            'dp_expected_batch_size': float(release_denom),
+            'dp_noise_multiplier': float(noise_multiplier),
+            'dp_clip_threshold': float(C),
+            'dp_next_clip_threshold': float(c_next),
+            'dp_std_per_factor': float(std),
+            'dp_noise_norm': float(noi),
+            'dp_floor_mode_id': float({'none': 0, 'scalar': 1, 'geometry': 2}.get(self.dp_floor_mode, -1)),
+            'dp_precond_update_mode_id': float({'current': 0, 'delayed': 1}.get(self.precond_update_mode, -1)),
+            'dp_lift_gauge_fix_id': float({'none': 0, 'pre_moment': 1, 'pre_retract': 2, 'both': 3}.get(self.lift_gauge_fix, -1)),
+            'dp_floorA_min': float(0.0 if floorA_min == float('inf') else floorA_min),
+            'dp_floorA_max': float(floorA_max),
+            'dp_floorB_min': float(0.0 if floorB_min == float('inf') else floorB_min),
+            'dp_floorB_max': float(floorB_max),
+            'dp_update_clip_coef_min': float(update_clip_coef_min),
+            'dp_trust_ratio_min': float(0.0 if trust_ratio_min == float('inf') else trust_ratio_min),
+            'dp_trust_ratio_max': float(trust_ratio_max),
+            'dp_precond_eigA_min': float(0.0 if precond_eigA_min == float('inf') else precond_eigA_min),
+            'dp_precond_eigA_max': float(precond_eigA_max),
+            'dp_precond_eigB_min': float(0.0 if precond_eigB_min == float('inf') else precond_eigB_min),
+            'dp_precond_eigB_max': float(precond_eigB_max),
+            'slaclip_num_slots': int(self.slaclip_num_slots),
+        }
+        if slack_indicator is not None:
+            slack_cpu = slack_indicator.detach().to('cpu', dtype=torch.float32)
+            self.last_log['slack_indicator'] = [float(x) for x in slack_cpu.tolist()]
+            self.last_log['slack_unclipped_proxy'] = float(slack_cpu[0].item())
+            self.last_log['slack_clipped_proxy'] = float(1.0 - slack_cpu[0].item())
+        if gamma_t is not None:
+            self.last_log['slaclip_gamma_t'] = float(gamma_t)
+            self.last_log['slaclip_eta'] = float(self.slaclip_eta)
+            self.last_log['slaclip_beta'] = float(self.slaclip_beta)
+
+        if self.telemetry_mode == 'research_raw':
+            sig = math.sqrt(max(signal_norm_sq, 0.0))
+            raw: Dict[str, Any] = {
+                'NON_PRIVATE_TELEMETRY': True,
+                'raw_clip_fraction': float(clip_frac),
+                'raw_clip_coefficient_mean': float(coef_mean),
+                'raw_clip_coefficient_min': float(coef_min),
+                'raw_clipped_signal_norm': float(sig),
+                'raw_signal_to_noise_ratio': float(sig / (noi + 1e-12)),
+            }
+            if self._dp_state.raw_norms:
+                norms = torch.cat(self._dp_state.raw_norms).float()
+                hist_max = float(self.raw_hist_max if self.raw_hist_max > 0 else 4.0 * C)
+                in_range = norms[norms <= hist_max]
+                counts = torch.histc(in_range, bins=self.raw_hist_bins, min=0.0, max=hist_max)
+                edges = torch.linspace(0.0, hist_max, self.raw_hist_bins + 1)
+                raw.update({
+                    'raw_global_norm_mean': float(norms.mean().item()),
+                    'raw_global_norm_std': float(norms.std(unbiased=False).item()),
+                    'raw_global_norm_min': float(norms.min().item()),
+                    'raw_global_norm_max': float(norms.max().item()),
+                    'raw_global_norm_quantiles': {
+                        str(q): float(torch.quantile(norms, q).item())
+                        for q in (0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99)
+                    },
+                    'raw_global_norm_hist_counts': [int(x) for x in counts.tolist()],
+                    'raw_global_norm_hist_edges': [float(x) for x in edges.tolist()],
+                    'raw_global_norm_hist_overflow': int((norms > hist_max).sum().item()),
+                })
+            self.last_raw_log = raw
         self._dp_state = None
         return total
 

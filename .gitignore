@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Model, evaluation, and telemetry artifacts
+LLM-Adapters/trained_models/
+LLM-Adapters/experiment/
+outputs/
+runs/
+wandb/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Exact research telemetry is never a publishable DP artifact.
+**/research_raw/
+**/NON_PRIVATE_*.jsonl

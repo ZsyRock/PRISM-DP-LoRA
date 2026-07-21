@@ -1,9 +1,13 @@
 from __future__ import annotations
 import gc
+import importlib.metadata
 import json
 import os
+import platform
 import random
 import shutil
+import subprocess
+import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -98,6 +102,46 @@ def save_status(output_dir: Path, **payload: Any) -> None:
     with open(status_path(out), 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2, sort_keys=True, default=str)
 
+
+def collect_runtime_metadata(root: Path) -> Dict[str, Any]:
+    def git_value(*args: str) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ['git', *args],
+                cwd=str(root),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout.strip()
+        except Exception:
+            return None
+
+    packages: Dict[str, Optional[str]] = {}
+    for name in ('torch', 'transformers', 'peft', 'opacus', 'datasets', 'evaluate', 'accelerate'):
+        try:
+            packages[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            packages[name] = None
+    cuda = {
+        'available': bool(torch.cuda.is_available()),
+        'torch_cuda': getattr(torch.version, 'cuda', None),
+        'device_count': int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+        'devices': [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+        if torch.cuda.is_available()
+        else [],
+    }
+    dirty = git_value('status', '--porcelain')
+    return {
+        'python': sys.version,
+        'platform': platform.platform(),
+        'packages': packages,
+        'cuda': cuda,
+        'git_sha': git_value('rev-parse', 'HEAD'),
+        'git_branch': git_value('branch', '--show-current'),
+        'git_dirty': bool(dirty) if dirty is not None else None,
+    }
+
 def checkpoint_file(output_dir: Path) -> Path:
     return Path(output_dir) / '_resume_checkpoint.pt'
 
@@ -116,14 +160,36 @@ def set_rng_state(state: Optional[Dict[str, Any]]) -> None:
         torch.cuda.set_rng_state_all(state['cuda'])
 
 def trainable_state_dict_cpu(model) -> Dict[str, torch.Tensor]:
+    model = unwrap_for_save(model)
     return {n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad}
 
-def load_trainable_state_dict(model, state: Dict[str, torch.Tensor]) -> None:
+def _canonical_parameter_name(name: str) -> str:
+    while name.startswith('_module.'):
+        name = name[len('_module.'):]
+    return name
+
+
+def load_trainable_state_dict(model, state: Dict[str, torch.Tensor]) -> int:
     named = dict(model.named_parameters())
+    canonical_named = {_canonical_parameter_name(n): p for n, p in named.items()}
+    loaded = 0
+    missing: List[str] = []
     with torch.no_grad():
         for n, v in state.items():
-            if n in named:
-                named[n].copy_(v.to(device=named[n].device, dtype=named[n].dtype))
+            p = canonical_named.get(_canonical_parameter_name(n))
+            if p is None:
+                missing.append(n)
+                continue
+            if tuple(p.shape) != tuple(v.shape):
+                raise ValueError(f'Checkpoint shape mismatch for {n}: saved={tuple(v.shape)} current={tuple(p.shape)}')
+            p.copy_(v.to(device=p.device, dtype=p.dtype))
+            loaded += 1
+    if state and loaded == 0:
+        raise ValueError('Checkpoint contained trainable parameters, but none matched the current model')
+    if missing:
+        print(f'[resume] warning: skipped {len(missing)} unmatched trainable tensors')
+    print(f'[resume] restored {loaded} trainable tensors')
+    return loaded
 
 def save_resume_checkpoint(output_dir: Path, model, optimizer, update_steps: int, extra: Optional[Dict[str, Any]]=None) -> None:
     output_dir = Path(output_dir)
