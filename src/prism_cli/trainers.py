@@ -10,11 +10,12 @@ from tqdm.auto import tqdm
 from .experiment_identity import FINGERPRINT_SCHEMA_VERSION, config_fingerprint, content_sha256, extract_status_fingerprint, git_worktree_identity, make_run_id
 from .losses import forward_causal_lm_per_example_loss
 from .modeling import (
+    is_multimodal_causal_lm_config,
     load_base_model,
     resolve_text_lora_target_modules,
     resolved_model_revision,
 )
-from .utils import JsonlLogger, adapter_is_complete, build_tokenizer, checkpoint_file, clean_output_dir, cleanup_cuda, collect_runtime_metadata, freeze_vision_tower_params, generate_prompt, iter_microbatches, llm_adapters_dir, load_resume_checkpoint_if_available, load_trainable_state_dict, save_resume_checkpoint, save_status, set_rng_state, set_seed, tokenize_prompt, truncate_jsonl_to_step, unwrap_for_save
+from .utils import JsonlLogger, adapter_is_complete, build_tokenizer, checkpoint_file, clean_output_dir, cleanup_cuda, collect_runtime_metadata, ensure_text_only_token_type_ids, freeze_vision_tower_params, generate_prompt, iter_microbatches, llm_adapters_dir, load_resume_checkpoint_if_available, load_trainable_state_dict, save_resume_checkpoint, save_status, set_rng_state, set_seed, tokenize_prompt, truncate_jsonl_to_step, unwrap_for_save
 
 
 CHECKPOINT_SCHEMA_VERSION = 2
@@ -776,6 +777,7 @@ def train_prism_manual(cfg: RunConfig) -> Path:
         _initialize_prism_factors(cfg, model)
         optimizer = _build_prism_optimizer(cfg, model)
         train_loader, train_ds = _make_loader(cfg, tokenizer)
+    needs_text_token_type_ids = is_multimodal_causal_lm_config(model.config)
     checkpoint = _restore_if_possible(cfg, model, optimizer)
     privacy_engine = None
     noise_multiplier = None
@@ -881,6 +883,10 @@ def train_prism_manual(cfg: RunConfig) -> Path:
             if update_steps >= int(cfg.total_update_steps):
                 break
             batch = {k: v.to(device) for k, v in batch.items()}
+            batch = ensure_text_only_token_type_ids(
+                batch,
+                required=needs_text_token_type_ids,
+            )
             loss_sum = 0.0
             token_sum = 0
             seen = 0

@@ -94,6 +94,26 @@ def iter_microbatches(batch_dict: Dict[str, torch.Tensor], micro_bs: int):
         end = min(bs, start + micro_bs)
         yield {k: v[start:end] for k, v in batch_dict.items()}
 
+def ensure_text_only_token_type_ids(
+    batch: Dict[str, torch.Tensor], *, required: bool
+) -> Dict[str, torch.Tensor]:
+    """Add the Gemma 3 text-only segment IDs required during training.
+
+    Gemma 3's processor represents ordinary text tokens with segment ID zero
+    and image tokens with segment ID one.  The repository tokenizes text
+    directly, so no image tokens are present and an all-zero tensor is the
+    exact processor-equivalent input.  Existing IDs are always preserved.
+    """
+
+    if not required or 'token_type_ids' in batch:
+        return batch
+    input_ids = batch.get('input_ids')
+    if not isinstance(input_ids, torch.Tensor):
+        raise KeyError('input_ids tensor is required to create token_type_ids')
+    prepared = dict(batch)
+    prepared['token_type_ids'] = torch.zeros_like(input_ids)
+    return prepared
+
 def unwrap_for_save(model):
     return getattr(model, '_module', model)
 
