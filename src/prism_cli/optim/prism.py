@@ -6,7 +6,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import Tensor
 
-from ..slaclip import automatic_num_slots, build_slack_vectors, update_slaclip_threshold
+from ..slaclip import (
+    automatic_num_slots,
+    build_slack_vectors,
+    full_slaclip_threshold_update,
+    slaclip_q_threshold_update,
+    slack_indicator_noise_std,
+)
 
 class _LoraShapeHelper:
 
@@ -101,12 +107,160 @@ def _psd_pinv(M: Tensor, rcond: float=1e-06) -> Tensor:
     out = v * inv.unsqueeze(0) @ v.T
     return _sym(out)
 
-def _psd_invsqrt_damped(M: Tensor, eps: float=1e-08) -> Tensor:
-    w, v = _psd_eigh(M)
-    w = w + float(eps)
-    invsqrt = 1.0 / torch.sqrt(w)
-    out = v * invsqrt.unsqueeze(0) @ v.T
-    return _sym(out)
+def _full_column_rank_qr(
+    X: Tensor,
+    *,
+    gram_rcond: float,
+    factor_name: str,
+) -> Tuple[Tensor, Tensor, Dict[str, float]]:
+    """Return a thin QR factorization after a fail-closed rank check.
+
+    PRISM's rank-``r`` tangent mechanism assumes that both LoRA factors have
+    full column rank.  Silently damping or truncating a singular Gram matrix
+    changes the covariance of the Gaussian mechanism while leaving the
+    accountant unchanged.  We instead check the same *relative Gram
+    eigenvalue* criterion historically controlled by ``rcond`` and refuse to
+    make a release outside the paper's smooth rank-``r`` manifold.
+    """
+
+    if X.ndim != 2:
+        raise RuntimeError(f'{factor_name} must be a matrix, got {X.ndim}D')
+    rows, rank = X.shape
+    if rows < rank:
+        raise RuntimeError(
+            f'{factor_name} cannot have full column rank: shape={tuple(X.shape)}'
+        )
+    Xf = X.float()
+    if not bool(torch.isfinite(Xf).all().item()):
+        raise RuntimeError(f'{factor_name} contains non-finite values')
+    Q, R = torch.linalg.qr(Xf, mode='reduced')
+    # R has the same singular values as X, while its r-by-r SVD is far
+    # cheaper than a second decomposition of a tall LoRA factor each step.
+    try:
+        singular_values = torch.linalg.svdvals(R)
+    except Exception:
+        singular_values = torch.linalg.svdvals(R.double().cpu()).to(
+            device=Xf.device,
+            dtype=Xf.dtype,
+        )
+    s_max = float(torch.max(singular_values).item()) if rank else 0.0
+    s_min = float(torch.min(singular_values).item()) if rank else 0.0
+    relative_gram_eigenvalue = 0.0 if s_max <= 0.0 else (s_min / s_max) ** 2
+    if s_max <= 0.0 or relative_gram_eigenvalue <= float(gram_rcond):
+        raise RuntimeError(
+            'PRISM DP tangent release requires numerically full-column-rank '
+            f'LoRA factors; {factor_name} has shape={tuple(X.shape)}, '
+            f's_min={s_min:.6g}, s_max={s_max:.6g}, '
+            f'(s_min/s_max)^2={relative_gram_eigenvalue:.6g} <= '
+            f'rcond={float(gram_rcond):.6g}. The rank-r manifold and its '
+            'isotropic tangent Gaussian are undefined at a rank-deficient '
+            'factor, so the release is aborted before privacy accounting.'
+        )
+    return (
+        Q,
+        R,
+        {
+            's_min': s_min,
+            's_max': s_max,
+            'relative_gram_eigenvalue': relative_gram_eigenvalue,
+        },
+    )
+
+
+def _gram_inverse_from_qr(R: Tensor) -> Tensor:
+    """Compute ``(X.T @ X)^-1`` from ``X = Q @ R`` without a Gram EVD."""
+
+    if R.ndim != 2 or R.shape[0] != R.shape[1]:
+        raise ValueError(f'R must be square, got shape={tuple(R.shape)}')
+    eye = torch.eye(R.shape[0], device=R.device, dtype=R.dtype)
+    R_inv = torch.linalg.solve_triangular(R, eye, upper=True)
+    gram_inv = _sym(R_inv @ R_inv.T)
+    if not bool(torch.isfinite(gram_inv).all().item()):
+        raise RuntimeError(
+            'PRISM full-rank Gram inverse is non-finite; aborting before '
+            'per-record gradient accumulation and privacy accounting'
+        )
+    return gram_inv
+
+
+def _right_solve_transpose(X: Tensor, R: Tensor) -> Tensor:
+    """Return ``X @ R^-T`` using a triangular solve."""
+
+    Xt = X.transpose(-2, -1)
+    return torch.linalg.solve_triangular(R, Xt, upper=True).transpose(-2, -1)
+
+
+def _right_solve_gram(X: Tensor, R: Tensor) -> Tensor:
+    """Return ``X @ (R.T @ R)^-1`` for a 2D or batched 3D ``X``.
+
+    Keeping both solves triangular avoids explicitly multiplying a possibly
+    ill-conditioned Gram inverse into the private per-record query.
+    """
+
+    if X.ndim not in {2, 3}:
+        raise ValueError(f'X must be 2D or 3D, got {X.ndim}D')
+    Xt = X.transpose(-2, -1)
+    # first = X @ R^-1, obtained from R.T @ first.T = X.T
+    first = torch.linalg.solve_triangular(
+        R.T,
+        Xt,
+        upper=False,
+    ).transpose(-2, -1)
+    # result = first @ R^-T, obtained from R @ result.T = first.T
+    return _right_solve_transpose(first, R)
+
+
+def _dp_isometric_chart_lift(
+    gA: Tensor,
+    gB: Tensor,
+    QA: Tensor,
+    RA: Tensor,
+    RB: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """Lift a factor-gradient query into the same chart as PRISM noise.
+
+    The paper's intrinsic tangent projection has many equivalent factor
+    lifts.  For a rigorous factor-wise implementation of the Gaussian release
+    and its adaptive post-processing, the private query and Eq. (19) noise must
+    inhabit the same linear chart.  We use the unique representative satisfying
+    ``QA.T @ dA = 0``:
+
+    ``dA = (I-QA QA.T) gA (B.T B)^-1`` and
+    ``dB = gB (A.T A)^-1``.
+
+    Its induced matrix is the same intrinsic projected tangent as the
+    symmetric half lift when the factor gradients obey the LoRA chain rule.
+    """
+
+    YA = _right_solve_gram(gA, RB)
+    dA = YA - _apply_projector_Q(QA, YA)
+    dB = _right_solve_gram(gB, RA)
+    return dA, dB
+
+
+def _factorized_isotropic_tangent_noise(
+    U: Tensor,
+    V: Tensor,
+    QA: Tensor,
+    RA: Tensor,
+    RB: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """Sample-factor map whose induced tangent noise is exactly isotropic.
+
+    With ``A = QA @ RA`` and ``B = QB @ RB``, these lifts induce
+
+    ``(I-QA QA.T) U QB.T + QA V.T``.
+
+    Thus i.i.d. standard-normal ``U,V`` yield the orthogonal projection of a
+    dense standard Gaussian onto the rank-``r`` tangent space.  In particular,
+    no ``eps`` damping is permitted here: it would reduce covariance in some
+    intrinsic directions below the scale assumed by the Gaussian accountant.
+    """
+
+    U_perp = U - _apply_projector_Q(QA, U)
+    noise_A = _right_solve_transpose(U_perp, RB)
+    noise_B = _right_solve_transpose(V, RA)
+    return noise_A, noise_B
 
 def _psd_invsqrt_clamped(M: Tensor, eps: float, floor: float, cond_max: Optional[float]=None, cond_strategy: str='raise_small') -> Tuple[Tensor, Dict[str, float]]:
     w, v = _psd_eigh(M)
@@ -233,9 +387,6 @@ def _factorized_delta_fro_norm_sq(
     V = torch.cat((B_new.float(), -B_old.float()), dim=1)
     return torch.sum((U.T @ U) * (V.T @ V))
 
-def _psd_inv_from_invsqrt(M_invsqrt: Tensor) -> Tensor:
-    return _sym(M_invsqrt @ M_invsqrt)
-
 def _sylvester_symmetric_solve(M: Tensor, N: Tensor, C: Tensor, eps: float=1e-12) -> Tensor:
     Mf = _sym(M.float())
     Nf = _sym(N.float())
@@ -275,7 +426,7 @@ class _DPAccumState:
 
 class PRISM(torch.optim.Optimizer):
 
-    def __init__(self, params: Iterable[torch.nn.Parameter], lr: float=0.0003, betas: Tuple[float, float]=(0.9, 0.999), eps: float=1e-08, weight_decay: float=0.0, rcond: float=1e-06, lora_l_dim: int=0, lora_r_dim: int=-1, use_adaptive: bool=True, dp_precond_floor_factor: float=1.0, dp_floor_mode: str='geometry', precond_cond_max: Optional[float]=10000.0, precond_cond_strategy: str='raise_small', precond_update_mode: str='current', lift_gauge_fix: str='none', gauge_fix_eps: float=1e-12, max_update_norm: float=0.0, use_trust_ratio: bool=False, trust_clip: Tuple[float, float]=(0.0, 10.0), trust_eps: float=1e-12, dp_debias_second_moment: bool=True, log_every: int=1, clipping_method: str='baseline', slaclip_num_slots: int=0, slaclip_eta: float=0.5, slaclip_beta: float=0.5, slaclip_c_min: float=0.1, slaclip_c_max: float=50.0, telemetry_mode: str='dp_safe', raw_hist_bins: int=32, raw_hist_max: float=0.0):
+    def __init__(self, params: Iterable[torch.nn.Parameter], lr: float=0.0003, betas: Tuple[float, float]=(0.9, 0.999), eps: float=1e-08, weight_decay: float=0.0, rcond: float=1e-06, lora_l_dim: int=0, lora_r_dim: int=-1, use_adaptive: bool=True, dp_precond_floor_factor: float=1.0, dp_floor_mode: str='geometry', precond_cond_max: Optional[float]=10000.0, precond_cond_strategy: str='raise_small', precond_update_mode: str='current', lift_gauge_fix: str='none', gauge_fix_eps: float=1e-12, max_update_norm: float=0.0, use_trust_ratio: bool=False, trust_clip: Tuple[float, float]=(0.0, 10.0), trust_eps: float=1e-12, dp_debias_second_moment: bool=True, log_every: int=1, clipping_method: str='baseline', slaclip_num_slots: int=0, slaclip_eta: float=0.5, slaclip_beta: float=0.5, slaclip_target_clip_fraction: float=0.99, slaclip_c_min: float=0.1, slaclip_c_max: float=50.0, telemetry_mode: str='dp_safe', raw_hist_bins: int=32, raw_hist_max: float=0.0):
         if lr <= 0:
             raise ValueError('lr must be positive')
         beta1, beta2 = betas
@@ -283,6 +434,8 @@ class PRISM(torch.optim.Optimizer):
             raise ValueError('betas must be in [0,1)')
         if eps <= 0:
             raise ValueError('eps must be positive')
+        if not 0.0 <= float(rcond) < 1.0:
+            raise ValueError('rcond must be in [0, 1)')
         if weight_decay < 0:
             raise ValueError('weight_decay must be >= 0')
         if trust_eps <= 0:
@@ -303,8 +456,8 @@ class PRISM(torch.optim.Optimizer):
         if gauge_fix_eps <= 0:
             raise ValueError('gauge_fix_eps must be positive')
         clipping_method = str(clipping_method).lower()
-        if clipping_method not in {'baseline', 'slaclip'}:
-            raise ValueError("clipping_method must be 'baseline' or 'slaclip'")
+        if clipping_method not in {'baseline', 'slaclip', 'slaclip_q'}:
+            raise ValueError("clipping_method must be 'baseline', 'slaclip', or 'slaclip_q'")
         telemetry_mode = str(telemetry_mode).lower()
         if telemetry_mode not in {'dp_safe', 'research_raw'}:
             raise ValueError("telemetry_mode must be 'dp_safe' or 'research_raw'")
@@ -314,6 +467,8 @@ class PRISM(torch.optim.Optimizer):
             raise ValueError('slaclip_eta must be non-negative')
         if not 0.0 <= float(slaclip_beta) <= 1.0:
             raise ValueError('slaclip_beta must be in [0, 1]')
+        if not 0.0 <= float(slaclip_target_clip_fraction) <= 1.0:
+            raise ValueError('slaclip_target_clip_fraction must be in [0, 1]')
         if float(slaclip_c_min) <= 0 or float(slaclip_c_max) < float(slaclip_c_min):
             raise ValueError('require 0 < slaclip_c_min <= slaclip_c_max')
         if int(raw_hist_bins) <= 0:
@@ -345,6 +500,7 @@ class PRISM(torch.optim.Optimizer):
         self.slaclip_num_slots = int(slaclip_num_slots)
         self.slaclip_eta = float(slaclip_eta)
         self.slaclip_beta = float(slaclip_beta)
+        self.slaclip_target_clip_fraction = float(slaclip_target_clip_fraction)
         self.slaclip_c_min = float(slaclip_c_min)
         self.slaclip_c_max = float(slaclip_c_max)
         self.telemetry_mode = telemetry_mode
@@ -373,6 +529,7 @@ class PRISM(torch.optim.Optimizer):
             'slaclip_num_slots': self.slaclip_num_slots,
             'slaclip_eta': self.slaclip_eta,
             'slaclip_beta': self.slaclip_beta,
+            'slaclip_target_clip_fraction': self.slaclip_target_clip_fraction,
             'slaclip_c_min': self.slaclip_c_min,
             'slaclip_c_max': self.slaclip_c_max,
             'telemetry_mode': self.telemetry_mode,
@@ -398,6 +555,7 @@ class PRISM(torch.optim.Optimizer):
             for key, current in (
                 ('slaclip_eta', self.slaclip_eta),
                 ('slaclip_beta', self.slaclip_beta),
+                ('slaclip_target_clip_fraction', self.slaclip_target_clip_fraction),
                 ('slaclip_c_min', self.slaclip_c_min),
                 ('slaclip_c_max', self.slaclip_c_max),
             ):
@@ -647,15 +805,16 @@ class PRISM(torch.optim.Optimizer):
         if self.raw_hist_max <= 0:
             # Freeze one absolute range for the whole run so histograms remain comparable.
             self.raw_hist_max = 4.0 * float(max_grad_norm)
-        clip_threshold = float(self.current_clip if self.clipping_method == 'slaclip' else max_grad_norm)
-        if self.clipping_method == 'slaclip' and self.slaclip_num_slots == 0:
+        uses_slack = self.clipping_method in {'slaclip', 'slaclip_q'}
+        clip_threshold = float(self.current_clip if uses_slack else max_grad_norm)
+        if uses_slack and self.slaclip_num_slots == 0:
             self.slaclip_num_slots = automatic_num_slots(expected_batch_size, noise_multiplier)
         self._dp_state = _DPAccumState(
             max_grad_norm=clip_threshold,
             expected_batch_size=float(expected_batch_size),
             noise_multiplier=float(noise_multiplier),
         )
-        if self.clipping_method == 'slaclip':
+        if uses_slack:
             # Lambda is defined by C and K, not by the realized batch.  Set it
             # before accumulation so an empty Poisson batch still performs the
             # noisy Slack-Indicator release and controller update.
@@ -669,18 +828,40 @@ class PRISM(torch.optim.Optimizer):
             A, B = self._get_factors(pA, pB)
             A32 = A.float()
             B32 = B.float()
-            QA, _ = torch.linalg.qr(A32, mode='reduced')
-            QB, _ = torch.linalg.qr(B32, mode='reduced')
+            # The exact rank-r mechanism lives on the smooth fixed-rank
+            # manifold.  Check this before accumulating any per-record
+            # gradient or making/accounting a release, and cache a stable QR
+            # chart used by both the query and the Gaussian sampler.
+            QA, RA, rank_stats_A = _full_column_rank_qr(
+                A32,
+                gram_rcond=self.rcond,
+                factor_name='LoRA factor A',
+            )
+            _QB, RB, rank_stats_B = _full_column_rank_qr(
+                B32,
+                gram_rcond=self.rcond,
+                factor_name='LoRA factor B',
+            )
             M = A32.T @ A32
             N = B32.T @ B32
-            M_pinv = _psd_pinv(M, rcond=self.rcond)
-            N_pinv = _psd_pinv(N, rcond=self.rcond)
-            M_invsqrt = _psd_invsqrt_damped(M, eps=self.eps)
-            N_invsqrt = _psd_invsqrt_damped(N, eps=self.eps)
-            st.dp_cache = {'A': A32, 'B': B32, 'QA': QA, 'QB': QB, 'M': M, 'N': N, 'M_pinv': M_pinv, 'N_pinv': N_pinv, 'M_invsqrt': M_invsqrt, 'N_invsqrt': N_invsqrt}
+            M_inv = _gram_inverse_from_qr(RA)
+            N_inv = _gram_inverse_from_qr(RB)
+            st.dp_cache = {
+                'A': A32,
+                'B': B32,
+                'QA': QA,
+                'RA': RA,
+                'RB': RB,
+                'M': M,
+                'N': N,
+                'M_inv': M_inv,
+                'N_inv': N_inv,
+                'rank_stats_A': rank_stats_A,
+                'rank_stats_B': rank_stats_B,
+            }
             st.dp_accum_A = torch.zeros_like(A32)
             st.dp_accum_B = torch.zeros_like(B32)
-            if self.clipping_method == 'slaclip' and self._dp_state.slack_sum is None:
+            if uses_slack and self._dp_state.slack_sum is None:
                 self._dp_state.slack_sum = torch.zeros(
                     int(self.slaclip_num_slots),
                     device=A32.device,
@@ -727,16 +908,10 @@ class PRISM(torch.optim.Optimizer):
                 )
             A = cache['A']
             B = cache['B']
-            M_pinv = cache['M_pinv']
-            N_pinv = cache['N_pinv']
+            RA = cache['RA']
+            RB = cache['RB']
             QA = cache['QA']
-            QB = cache['QB']
-            YA = torch.matmul(gA, N_pinv)
-            projYA = _apply_projector_Q(QA, YA)
-            dA = YA - 0.5 * projYA
-            YB = torch.matmul(gB, M_pinv)
-            projYB = _apply_projector_Q(QB, YB)
-            dB = YB - 0.5 * projYB
+            dA, dB = _dp_isometric_chart_lift(gA, gB, QA, RA, RB)
             n2 = _tangent_fro_norm_sq(dA, dB, A, B)
             if global_norm_sq is None:
                 global_norm_sq = n2
@@ -754,7 +929,7 @@ class PRISM(torch.optim.Optimizer):
         self._dp_state.coef_sum += float(coef.sum().item())
         self._dp_state.coef_min = min(self._dp_state.coef_min, coef_min)
         self._dp_state.last_micro_stats = {'micro_clipped_frac': clipped_frac, 'micro_coef_mean': coef_mean, 'micro_coef_min': coef_min, 'micro_global_norm_mean': float(global_norm.mean().item()), 'micro_global_norm_p95': float(torch.quantile(global_norm, 0.95).item())}
-        if self.clipping_method == 'slaclip':
+        if self.clipping_method in {'slaclip', 'slaclip_q'}:
             slack_vectors, lambda_t = build_slack_vectors(
                 global_norm,
                 max_norm,
@@ -795,16 +970,10 @@ class PRISM(torch.optim.Optimizer):
                 )
             A = cache['A']
             B = cache['B']
-            M_pinv = cache['M_pinv']
-            N_pinv = cache['N_pinv']
+            RA = cache['RA']
+            RB = cache['RB']
             QA = cache['QA']
-            QB = cache['QB']
-            YA = torch.matmul(gA, N_pinv)
-            projYA = _apply_projector_Q(QA, YA)
-            dA = YA - 0.5 * projYA
-            YB = torch.matmul(gB, M_pinv)
-            projYB = _apply_projector_Q(QB, YB)
-            dB = YB - 0.5 * projYB
+            dA, dB = _dp_isometric_chart_lift(gA, gB, QA, RA, RB)
             if self.telemetry_mode == 'research_raw':
                 st.dp_raw_accum_A.add_(dA.sum(dim=0))
                 st.dp_raw_accum_B.add_(dB.sum(dim=0))
@@ -849,6 +1018,7 @@ class PRISM(torch.optim.Optimizer):
         floorA_max = 0.0
         floorB_min = float('inf')
         floorB_max = 0.0
+        factor_relative_gram_eigenvalue_min = float('inf')
         for group, pA, pB in self._pair_iter():
             lr: float = float(group['lr'])
             st = self.state[pA]['prism']
@@ -857,22 +1027,32 @@ class PRISM(torch.optim.Optimizer):
                 continue
             A = cache['A']
             B = cache['B']
-            M_pinv = cache['M_pinv']
-            N_pinv = cache['N_pinv']
-            M_invsqrt = cache['M_invsqrt']
-            N_invsqrt = cache['N_invsqrt']
+            M_inv = cache['M_inv']
+            N_inv = cache['N_inv']
+            RA = cache['RA']
+            RB = cache['RB']
             QA = cache.get('QA')
-            if QA is None:
-                QA, _ = torch.linalg.qr(A, mode='reduced')
+            if QA is None or RA is None or RB is None:
+                raise RuntimeError('exact full-rank QR cache missing during PRISM DP release')
+            factor_relative_gram_eigenvalue_min = min(
+                factor_relative_gram_eigenvalue_min,
+                float(cache['rank_stats_A']['relative_gram_eigenvalue']),
+                float(cache['rank_stats_B']['relative_gram_eigenvalue']),
+            )
             gradA = st.dp_accum_A / release_denom
             gradB = st.dp_accum_B / release_denom
             if std > 0:
                 U = self._generate_dp_noise(A, 1.0)
                 V = self._generate_dp_noise(B, 1.0)
-                projU = _apply_projector_Q(QA, U)
-                U_perp = U - projU
-                noise_A = U_perp @ N_invsqrt * std
-                noise_B = V @ M_invsqrt * std
+                unit_noise_A, unit_noise_B = _factorized_isotropic_tangent_noise(
+                    U,
+                    V,
+                    QA,
+                    RA,
+                    RB,
+                )
+                noise_A = unit_noise_A * std
+                noise_B = unit_noise_B * std
             else:
                 noise_A = torch.zeros_like(A)
                 noise_B = torch.zeros_like(B)
@@ -913,8 +1093,6 @@ class PRISM(torch.optim.Optimizer):
                 m_dim = float(A.shape[0])
                 r_dim = float(A.shape[1])
                 coefA = max(m_dim - r_dim, 0.0) / max(m_dim, 1.0)
-                N_inv = _psd_inv_from_invsqrt(N_invsqrt)
-                M_inv = _psd_inv_from_invsqrt(M_invsqrt)
                 if self.dp_floor_mode == 'geometry':
                     trN_inv = float(torch.trace(N_inv).item()) / max(r_dim, 1.0)
                     trM_inv = float(torch.trace(M_inv).item()) / max(r_dim, 1.0)
@@ -963,9 +1141,9 @@ class PRISM(torch.optim.Optimizer):
         noisy_grad_norm = math.sqrt(max(noisy_gradient_norm_sq, 0.0))
         effective_update_norm = math.sqrt(max(effective_update_norm_sq, 0.0))
         c_next = C
-        gamma_t: Optional[float] = None
+        threshold_update = None
         if self.clipping_method == 'slaclip' and slack_indicator is not None:
-            c_next, gamma_t = update_slaclip_threshold(
+            threshold_update = full_slaclip_threshold_update(
                 C,
                 slack_indicator,
                 eta=self.slaclip_eta,
@@ -973,6 +1151,18 @@ class PRISM(torch.optim.Optimizer):
                 c_min=self.slaclip_c_min,
                 c_max=self.slaclip_c_max,
             )
+            c_next = threshold_update.next_clip
+            self.current_clip = float(c_next)
+        elif self.clipping_method == 'slaclip_q' and slack_indicator is not None:
+            threshold_update = slaclip_q_threshold_update(
+                C,
+                slack_indicator,
+                eta=self.slaclip_eta,
+                target_clip_fraction=self.slaclip_target_clip_fraction,
+                c_min=self.slaclip_c_min,
+                c_max=self.slaclip_c_max,
+            )
+            c_next = threshold_update.next_clip
             self.current_clip = float(c_next)
         elif self.clipping_method == 'baseline':
             self.current_clip = C
@@ -984,6 +1174,14 @@ class PRISM(torch.optim.Optimizer):
             'dp_clip_threshold': float(C),
             'dp_next_clip_threshold': float(c_next),
             'dp_std_per_factor': float(std),
+            'dp_tangent_noise_sampler': 'qr_exact_full_rank',
+            'dp_tangent_query_chart': 'qr_asymmetric_isometric',
+            'dp_factor_rank_rcond': float(self.rcond),
+            'dp_factor_relative_gram_eigenvalue_min': float(
+                0.0
+                if factor_relative_gram_eigenvalue_min == float('inf')
+                else factor_relative_gram_eigenvalue_min
+            ),
             # Both are post-processing of the DP release/model update.  The
             # realized noise itself is intentionally kept out of this log.
             'dp_noisy_tangent_gradient_norm': float(noisy_grad_norm),
@@ -1006,13 +1204,42 @@ class PRISM(torch.optim.Optimizer):
         if slack_indicator is not None:
             slack_cpu = slack_indicator.detach().to('cpu', dtype=torch.float32)
             self.last_log['slaclip_num_slots'] = int(self.slaclip_num_slots)
+            self.last_log['slaclip_controller'] = str(self.clipping_method)
             self.last_log['slack_indicator'] = [float(x) for x in slack_cpu.tolist()]
             self.last_log['slack_unclipped_proxy'] = float(slack_cpu[0].item())
             self.last_log['slack_clipped_proxy'] = float(1.0 - slack_cpu[0].item())
-        if gamma_t is not None:
-            self.last_log['slaclip_gamma_t'] = float(gamma_t)
+            self.last_log['slack_indicator_noise_std'] = slack_indicator_noise_std(
+                sigma,
+                self.slaclip_num_slots,
+                release_denom,
+            )
+        if threshold_update is not None:
+            self.last_log['slaclip_target_unclipped_proxy'] = float(
+                threshold_update.target_unclipped_proxy
+            )
+            self.last_log['slaclip_target_clipped_proxy'] = float(
+                1.0 - threshold_update.target_unclipped_proxy
+            )
+            self.last_log['slaclip_c_next_unbounded'] = float(
+                threshold_update.unbounded_next_clip
+            )
+            self.last_log['slaclip_c_hit_min'] = bool(threshold_update.hit_lower_bound)
+            self.last_log['slaclip_c_hit_max'] = bool(threshold_update.hit_upper_bound)
             self.last_log['slaclip_eta'] = float(self.slaclip_eta)
-            self.last_log['slaclip_beta'] = float(self.slaclip_beta)
+            self.last_log['slaclip_c_min'] = float(self.slaclip_c_min)
+            self.last_log['slaclip_c_max'] = float(self.slaclip_c_max)
+            if self.clipping_method == 'slaclip':
+                # Retain the historical name for compatibility with existing
+                # telemetry summaries; it is the dynamic target, not a fixed
+                # clipping fraction.
+                self.last_log['slaclip_gamma_t'] = float(
+                    threshold_update.target_unclipped_proxy
+                )
+                self.last_log['slaclip_beta'] = float(self.slaclip_beta)
+            else:
+                self.last_log['slaclip_target_clip_fraction'] = float(
+                    self.slaclip_target_clip_fraction
+                )
 
         if self.telemetry_mode == 'research_raw':
             sig = math.sqrt(max(signal_norm_sq, 0.0))

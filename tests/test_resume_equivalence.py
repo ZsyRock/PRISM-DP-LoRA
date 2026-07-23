@@ -45,12 +45,13 @@ class _Run:
     step: int
 
 
-def _config(tmp_path: Path) -> RunConfig:
+def _config(tmp_path: Path, *, method: str = 'slaclip') -> RunConfig:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     data_path = tmp_path / 'data.json'
     data_path.write_text('[{"instruction":"x","input":"","output":"y"}]\n', encoding='utf-8')
     return RunConfig(
         dataset='math10k',
-        method='slaclip',
+        method=method,
         privacy='dp',
         root=tmp_path,
         data_path=data_path,
@@ -63,6 +64,9 @@ def _config(tmp_path: Path) -> RunConfig:
         telemetry_mode='research_raw',
         allow_non_private_telemetry=True,
         slaclip_num_slots=3,
+        slaclip_target_clip_fraction=0.99,
+        slaclip_c_min=0.1,
+        slaclip_c_max=15.0 if method == 'slaclip_q' else 50.0,
     ).finalize()
 
 
@@ -83,8 +87,11 @@ def _build(cfg: RunConfig, *, resume: bool) -> _Run:
     optimizer = PRISM(
         [model.lora_A.weight, model.lora_B.weight],
         lr=1e-2,
-        clipping_method='slaclip',
+        clipping_method=cfg.method,
         slaclip_num_slots=3,
+        slaclip_target_clip_fraction=cfg.slaclip_target_clip_fraction,
+        slaclip_c_min=cfg.slaclip_c_min,
+        slaclip_c_max=cfg.slaclip_c_max,
         telemetry_mode='research_raw',
         raw_hist_bins=4,
     )
@@ -157,8 +164,12 @@ def _trainable_parameters(run: _Run):
     }
 
 
-def test_checkpoint_resume_matches_uninterrupted_sampling_noise_and_accounting(tmp_path: Path) -> None:
-    cfg = _config(tmp_path)
+@pytest.mark.parametrize('method', ['slaclip', 'slaclip_q'])
+def test_checkpoint_resume_matches_uninterrupted_sampling_noise_and_accounting(
+    tmp_path: Path,
+    method: str,
+) -> None:
+    cfg = _config(tmp_path / method, method=method)
     uninterrupted = _build(cfg, resume=False)
     _one_step(uninterrupted)
     save_resume_checkpoint(

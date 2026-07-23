@@ -69,6 +69,11 @@ def run_method(
     clip_norm: float,
     noise_multiplier: float,
     slaclip_beta: float,
+    slaclip_target_clip_fraction: float,
+    slaclip_eta: float,
+    slaclip_num_slots: int,
+    slaclip_c_min: float,
+    slaclip_c_max: float,
 ) -> dict:
     torch.manual_seed(seed)
     if device.type == "cuda":
@@ -82,11 +87,12 @@ def run_method(
         lr=1e-2,
         use_adaptive=False,
         clipping_method=method,
-        slaclip_num_slots=3,
-        slaclip_eta=0.2,
+        slaclip_num_slots=slaclip_num_slots,
+        slaclip_eta=slaclip_eta,
         slaclip_beta=slaclip_beta,
-        slaclip_c_min=0.05,
-        slaclip_c_max=5.0,
+        slaclip_target_clip_fraction=slaclip_target_clip_fraction,
+        slaclip_c_min=slaclip_c_min,
+        slaclip_c_max=slaclip_c_max,
         telemetry_mode="research_raw",
         raw_hist_bins=8,
     )
@@ -128,7 +134,7 @@ def run_method(
         safe_log = dict(base_optimizer.last_log)
         raw_log = dict(base_optimizer.last_raw_log)
         required_safe = {"dp_clip_threshold", "dp_next_clip_threshold"}
-        if method == "slaclip":
+        if method in {"slaclip", "slaclip_q"}:
             required_safe.add("slack_indicator")
         required_raw = {
             "NON_PRIVATE_TELEMETRY",
@@ -162,15 +168,28 @@ def run_method(
                 "clip_fraction": float(raw_log["raw_clip_fraction"]),
                 "snr": float(raw_log["raw_signal_to_noise_ratio"]),
                 "batch_n": finalized,
+                "slack_proxy": safe_log.get("slack_unclipped_proxy"),
+                "target_unclipped_proxy": safe_log.get("slaclip_target_unclipped_proxy"),
+                "hit_min": safe_log.get("slaclip_c_hit_min"),
+                "hit_max": safe_log.get("slaclip_c_hit_max"),
             }
         )
     epsilon = float(engine.get_epsilon(delta=1e-5))
     if not math.isfinite(epsilon) or epsilon <= 0:
         raise RuntimeError(f"Invalid epsilon from smoke accountant: {epsilon}")
-    if method == "slaclip":
+    if method in {"slaclip", "slaclip_q"}:
         for record in trajectory:
-            if not 0.05 <= record["next_clip"] <= 5.0:
+            if not slaclip_c_min <= record["next_clip"] <= slaclip_c_max:
                 raise RuntimeError(f"SlaClip threshold escaped configured bounds: {record}")
+    if method == "slaclip_q":
+        for record in trajectory:
+            if not math.isclose(
+                float(record["target_unclipped_proxy"]),
+                1.0 - slaclip_target_clip_fraction,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise RuntimeError(f"SlaClip-Q target complement is incorrect: {record}")
     return {
         "method": method,
         "device": str(device),
@@ -189,7 +208,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clip-norm", type=float, default=1.0)
     parser.add_argument("--noise-multiplier", type=float, default=0.8)
     parser.add_argument("--slaclip-beta", type=float, default=0.5)
-    parser.add_argument("--method", choices=["baseline", "slaclip", "both"], default="both")
+    parser.add_argument("--slaclip-target-clip-fraction", type=float, default=0.99)
+    parser.add_argument("--slaclip-eta", type=float, default=0.2)
+    parser.add_argument("--slaclip-num-slots", type=int, default=3)
+    parser.add_argument("--slaclip-c-min", type=float, default=0.1)
+    parser.add_argument("--slaclip-c-max", type=float, default=15.0)
+    parser.add_argument(
+        "--method",
+        choices=["baseline", "slaclip", "slaclip_q", "both", "q99_pair", "all"],
+        default="both",
+    )
     return parser
 
 
@@ -201,8 +229,21 @@ def main() -> int:
         raise SystemExit("--clip-norm and --noise-multiplier must be positive")
     if not 0 <= args.slaclip_beta <= 1:
         raise SystemExit("--slaclip-beta must be in [0, 1]")
+    if not 0 <= args.slaclip_target_clip_fraction <= 1:
+        raise SystemExit("--slaclip-target-clip-fraction must be in [0, 1]")
+    if args.slaclip_eta < 0 or args.slaclip_num_slots < 0:
+        raise SystemExit("--slaclip-eta and --slaclip-num-slots must be non-negative")
+    if args.slaclip_c_min <= 0 or args.slaclip_c_max < args.slaclip_c_min:
+        raise SystemExit("require 0 < --slaclip-c-min <= --slaclip-c-max")
     device = select_device(args.device)
-    methods = ["baseline", "slaclip"] if args.method == "both" else [args.method]
+    if args.method == "both":
+        methods = ["baseline", "slaclip"]
+    elif args.method == "q99_pair":
+        methods = ["baseline", "slaclip_q"]
+    elif args.method == "all":
+        methods = ["baseline", "slaclip", "slaclip_q"]
+    else:
+        methods = [args.method]
     results = [
         run_method(
             method,
@@ -212,9 +253,17 @@ def main() -> int:
             clip_norm=args.clip_norm,
             noise_multiplier=args.noise_multiplier,
             slaclip_beta=args.slaclip_beta,
+            slaclip_target_clip_fraction=args.slaclip_target_clip_fraction,
+            slaclip_eta=args.slaclip_eta,
+            slaclip_num_slots=args.slaclip_num_slots,
+            slaclip_c_min=args.slaclip_c_min,
+            slaclip_c_max=args.slaclip_c_max,
         )
         for method in methods
     ]
+    epsilons = {round(float(item["epsilon_at_delta_1e-5"]), 12) for item in results}
+    if len(epsilons) != 1:
+        raise RuntimeError(f"Methods produced different accountant epsilon values: {results}")
     print(json.dumps({"status": "ok", "synthetic_only": True, "results": results}, indent=2))
     return 0
 

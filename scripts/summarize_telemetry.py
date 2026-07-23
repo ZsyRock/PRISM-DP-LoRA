@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 
-SUMMARY_SCHEMA_VERSION = 1
+SUMMARY_SCHEMA_VERSION = 2
 NON_PRIVATE_WARNING = (
     "Contains exact statistics derived from training examples; this summary is "
     "NON-PRIVATE and must not be treated as a DP release."
@@ -102,7 +102,18 @@ PREFERRED_COLUMNS = (
     "slaclip_gamma_t",
     "slaclip_eta",
     "slaclip_beta",
+    "slaclip_controller",
+    "slaclip_target_clip_fraction",
+    "slaclip_target_unclipped_proxy",
+    "slaclip_target_clipped_proxy",
+    "slaclip_controller_error",
+    "slaclip_c_next_unbounded",
+    "slaclip_c_min",
+    "slaclip_c_max",
+    "slaclip_c_hit_min",
+    "slaclip_c_hit_max",
     "slaclip_num_slots",
+    "slack_indicator_noise_std",
     "raw_global_norm_mean",
     "raw_global_norm_std",
     "raw_global_norm_min",
@@ -112,6 +123,7 @@ PREFERRED_COLUMNS = (
     "raw_global_norm_hist_edges_json",
     "raw_global_norm_hist_overflow",
     "raw_clip_fraction",
+    "raw_clip_fraction_error",
     "raw_clip_coefficient_mean",
     "raw_clip_coefficient_min",
     "raw_unclipped_signal_norm",
@@ -131,6 +143,11 @@ PREFERRED_COLUMNS = (
     "slack_indicator_json",
     "eps_spent",
     "epsilon_increment",
+)
+
+BOOLEAN_METRIC_COLUMNS = (
+    "slaclip_c_hit_min",
+    "slaclip_c_hit_max",
 )
 
 AGGREGATE_EXCLUSIONS = {
@@ -321,6 +338,14 @@ def add_derived_fields(rows: Sequence[Dict[str, Any]]) -> None:
         )
         if bias_ratio is not None:
             row["raw_clipping_bias_ratio"] = bias_ratio
+        proxy = _finite_number(row.get("slack_unclipped_proxy"))
+        target_proxy = _finite_number(row.get("slaclip_target_unclipped_proxy"))
+        if proxy is not None and target_proxy is not None:
+            row["slaclip_controller_error"] = target_proxy - proxy
+        raw_clip = _finite_number(row.get("raw_clip_fraction"))
+        requested_clip = _finite_number(row.get("slaclip_target_clip_fraction"))
+        if raw_clip is not None and requested_clip is not None:
+            row["raw_clip_fraction_error"] = raw_clip - requested_clip
         loss = _finite_number(row.get("loss_mean"))
         if loss is not None:
             if previous_loss is not None:
@@ -374,6 +399,25 @@ def numeric_summaries(rows: Sequence[Mapping[str, Any]], columns: Sequence[str])
             "max": max(values),
             "mean": math.fsum(values) / len(values),
             "change": values[-1] - values[0],
+        }
+    return summaries
+
+
+def boolean_summaries(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Summarize declared boolean diagnostics without coercing numbers."""
+    summaries: Dict[str, Any] = {}
+    total = len(rows)
+    for column in BOOLEAN_METRIC_COLUMNS:
+        values = [row.get(column) for row in rows if isinstance(row.get(column), bool)]
+        if not values:
+            continue
+        true_count = sum(values)
+        summaries[column] = {
+            "count": len(values),
+            "missing": total - len(values),
+            "true_count": true_count,
+            "false_count": len(values) - true_count,
+            "true_rate": true_count / len(values),
         }
     return summaries
 
@@ -433,6 +477,7 @@ def build_summary(
         "columns": list(columns),
         "field_coverage": coverage,
         "metrics": numeric_summaries(rows, columns),
+        "boolean_metrics": boolean_summaries(rows),
     }
     if csv_output is not None:
         result["csv_output"] = str(csv_output.resolve())

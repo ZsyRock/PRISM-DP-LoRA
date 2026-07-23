@@ -69,6 +69,27 @@ def test_legacy_clip_option_is_the_same_destination() -> None:
     assert args.dp_accountant == 'prv'
 
 
+def test_slaclip_q_cli_keeps_requested_clipped_fraction_unambiguous() -> None:
+    args = train_eval.parse_cli_args(
+        [
+            '--dataset',
+            'math10k',
+            '--method',
+            'slaclip_q',
+            '--slaclip_target_clip_fraction',
+            '0.99',
+            '--slaclip_c_min',
+            '0.1',
+            '--slaclip_c_max',
+            '15',
+        ]
+    )
+    assert args.method == 'slaclip_q'
+    assert args.slaclip_target_clip_fraction == pytest.approx(0.99)
+    assert args.slaclip_c_min == pytest.approx(0.1)
+    assert args.slaclip_c_max == pytest.approx(15.0)
+
+
 def test_unknown_json_field_is_rejected(tmp_path: Path) -> None:
     config_file = tmp_path / 'bad.json'
     config_file.write_text(json.dumps({'dataset': 'math10k', 'surprise': 1}), encoding='utf-8')
@@ -116,8 +137,11 @@ def test_training_changes_get_distinct_hashed_directories(tmp_path: Path) -> Non
     first = _config(tmp_path, dp_max_grad_norm=0.5)
     second = _config(tmp_path, dp_max_grad_norm=2.0)
     third = _config(tmp_path, dp_max_grad_norm=2.0, slaclip_eta=0.2)
+    fourth = _config(tmp_path, method='slaclip_q', slaclip_target_clip_fraction=0.99)
+    fifth = _config(tmp_path, method='slaclip_q', slaclip_target_clip_fraction=0.98)
     assert first.config_fingerprint != second.config_fingerprint
     assert second.config_fingerprint != third.config_fingerprint
+    assert fourth.config_fingerprint != fifth.config_fingerprint
     assert first.output_dir != second.output_dir
     assert '_C0p5_' in first.run_id
     assert '_C2_' in second.run_id
@@ -130,6 +154,7 @@ def test_training_changes_get_distinct_hashed_directories(tmp_path: Path) -> Non
         ({'slaclip_num_slots': -1}, 'slaclip_num_slots'),
         ({'slaclip_eta': -0.1}, 'slaclip_eta'),
         ({'slaclip_beta': 1.1}, 'slaclip_beta'),
+        ({'slaclip_target_clip_fraction': 1.1}, 'slaclip_target_clip_fraction'),
         ({'dp_max_grad_norm': 0.05}, 'initial C'),
     ],
 )

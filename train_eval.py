@@ -34,7 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description='Train and evaluate PRISM LoRA adapters on Math-10K or GLUE8.')
     p.add_argument('--config', type=Path, default=None, help='JSON defaults; explicitly supplied CLI options take precedence.')
     p.add_argument('--dataset', choices=['math10k', 'math', 'glue8', 'glue'], default=None)
-    p.add_argument('--method', choices=['baseline', 'slaclip'], default='baseline', help='Fixed-threshold PRISM baseline or SlaClip+PRISM baseline.')
+    p.add_argument(
+        '--method',
+        choices=['baseline', 'slaclip', 'slaclip_q'],
+        default='baseline',
+        help='Fixed PRISM, official full SlaClip+PRISM, or fixed-target SlaClip-Q+PRISM.',
+    )
     p.add_argument('--privacy', choices=['dp', 'nondp', 'non-dp'], default='dp')
     p.add_argument('--epsilon', dest='dp_epsilon', type=float, default=6.0)
     p.add_argument('--delta', dest='dp_delta', type=float, default=1e-05)
@@ -75,6 +80,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--slaclip_num_slots', type=int, default=0, help='Slack dimension K; 0 selects the paper bound automatically.')
     p.add_argument('--slaclip_eta', type=float, default=0.5)
     p.add_argument('--slaclip_beta', type=float, default=0.5)
+    p.add_argument(
+        '--slaclip_target_clip_fraction',
+        type=float,
+        default=0.99,
+        help=(
+            'Requested clipped fraction for slaclip_q. Internally gamma is the '
+            'complementary target unclipped-CDF proxy; 0.99 therefore maps to gamma=0.01.'
+        ),
+    )
     p.add_argument('--slaclip_c_min', type=float, default=0.1)
     p.add_argument('--slaclip_c_max', type=float, default=50.0)
     p.add_argument('--run_train', type=parse_bool, default=True)

@@ -22,7 +22,7 @@ The main records contain fields such as:
 | `telemetry_schema_version` | schema version for parser compatibility |
 | `run_id` | readable label, clipping threshold, and short configuration hash |
 | `config_fingerprint` | canonical full experiment fingerprint |
-| `method` | `baseline` or full `slaclip` |
+| `method` | `baseline`, camera-ready full `slaclip`, or fixed-target `slaclip_q` |
 | `privacy` / `telemetry_mode` | training and observation modes |
 | `step` | completed logical update count |
 | `base_model` | requested model ID or local snapshot |
@@ -44,16 +44,26 @@ These fields are emitted to `train_log.jsonl` during DP training. They are publi
 | `dp_clip_threshold` | threshold `C_t` used for this update |
 | `dp_next_clip_threshold` | threshold selected for the next update; equal to `C_t` for baseline |
 | `dp_std_per_factor` | base per-factor scale `noise_multiplier * C_t / expected_batch_size` before geometry-aware factor mapping |
-| `slack_indicator` | jointly noised Slack Indicator vector; full SlaClip only |
-| `slack_unclipped_proxy`, `slack_clipped_proxy` | summaries derived from the noised indicator, not exact clipping fractions; full SlaClip only |
-| `slaclip_gamma_t`, `slaclip_eta`, `slaclip_beta` | full-controller update values; present when SlaClip performs an adaptive update |
-| `slaclip_num_slots` | Slack Indicator dimension `K`; full SlaClip only |
+| `dp_tangent_noise_sampler` / `dp_tangent_query_chart` / `dp_factor_rank_rcond` / `dp_factor_relative_gram_eigenvalue_min` | exact full-rank QR tangent sampler and matching isometric query-chart identifiers, fail-closed numerical-rank tolerance, and the minimum checked relative Gram eigenvalue across all LoRA factors |
+| `slack_indicator` | jointly noised Slack Indicator vector; either SlaClip controller only |
+| `slack_unclipped_proxy`, `slack_clipped_proxy` | summaries derived from the noised first coordinate, not exact clipping fractions |
+| `slack_indicator_noise_std` | public normalized per-coordinate noise s.d. `sigma*sqrt(K)/expected_batch_size` |
+| `slaclip_controller` | `slaclip` (dynamic full controller) or `slaclip_q` (fixed-target ablation) |
+| `slaclip_gamma_t`, `slaclip_eta`, `slaclip_beta` | camera-ready full-controller update values |
+| `slaclip_target_clip_fraction` | requested exact-rate label for SlaClip-Q; 0.99 maps internally to an unclipped-proxy target of 0.01 |
+| `slaclip_target_unclipped_proxy`, `slaclip_target_clipped_proxy` | controller target used in the current update; dynamic for full SlaClip and fixed for SlaClip-Q |
+| `slaclip_c_next_unbounded`, `slaclip_c_min/max`, `slaclip_c_hit_min/max` | pre-clamp candidate, declared bounds, and post-processing bound diagnostics |
+| `slaclip_num_slots` | Slack Indicator dimension `K`; either SlaClip controller only |
 | `dp_noisy_tangent_gradient_norm` | norm of the noised tangent-gradient release |
 | `dp_factor_product_update_norm` | exact norm of the resulting low-rank product update, a function of the released model transition |
 | `dp_floor*`, `dp_precond_*`, `dp_trust_ratio_*`, `dp_update_clip_coef_min` | numerical optimizer diagnostics computed while post-processing the noised release |
 | `eps_spent` | accountant epsilon after this completed update at configured delta |
 
 `dp_safe` intentionally does **not** emit the exact DP-training loss, target-token count, exact per-record norm distribution, exact clipping fraction, unclipped signal, clipping bias, or realized noise decomposition. In particular, it does not log an actual noise norm: revealing output and its exact random-noise decomposition together can reveal the pre-noise signal.
+
+The non-private telemetry summarizer reports `slaclip_c_hit_min/max` under `boolean_metrics`, including `true_count` and `true_rate`, so boundary saturation can be audited without treating booleans as ordinary numeric measurements.
+
+The DP interpretation assumes Poisson subsampling with add/remove record adjacency. It also treats benchmark identity, size, and content hash as public auxiliary information. For a genuinely private dataset, a deterministic content hash, the fingerprint/run ID derived from it, and a config/status snapshot containing it are not DP-safe outputs. Resume checkpoints contain sampler/RNG state and are controlled training state, never release artifacts.
 
 Non-DP runs may put `loss_mean`, `tokens`, and `batch_n` in the main log; that does not make those fields safe for a private dataset. Release classification must always consider `privacy` as well as the filename.
 

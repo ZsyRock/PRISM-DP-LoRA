@@ -39,6 +39,8 @@ def test_summarizer_flattens_metrics_merges_safe_log_and_handles_missing_fields(
                 "dp_clip_threshold": 1.0,
                 "dp_next_clip_threshold": 1.1,
                 "slaclip_gamma_t": 0.6,
+                "slaclip_c_hit_min": False,
+                "slaclip_c_hit_max": False,
                 "raw_global_norm_quantiles": {"0.1": 0.2, "0.5": 0.8, "0.99": 3.0},
                 "raw_clip_fraction": 0.4,
                 "raw_clip_coefficient_mean": 0.8,
@@ -59,6 +61,8 @@ def test_summarizer_flattens_metrics_merges_safe_log_and_handles_missing_fields(
                 "dp_clip_threshold": 1.1,
                 "dp_next_clip_threshold": 1.2,
                 "raw_clip_fraction": 0.3,
+                "slaclip_c_hit_min": True,
+                "slaclip_c_hit_max": False,
             },
             # A resumed legacy log may contain a duplicate; default policy keeps the last.
             {
@@ -68,6 +72,8 @@ def test_summarizer_flattens_metrics_merges_safe_log_and_handles_missing_fields(
                 "dp_clip_threshold": 1.1,
                 "dp_next_clip_threshold": 1.25,
                 "raw_clip_fraction": 0.25,
+                "slaclip_c_hit_min": True,
+                "slaclip_c_hit_max": False,
                 "raw_global_norm_quantiles": {"0.5": 0.7},
                 "eps_spent": 1.6,
             },
@@ -162,6 +168,14 @@ def test_summarizer_flattens_metrics_merges_safe_log_and_handles_missing_fields(
     }
     assert summary["metrics"]["loss_mean"]["last"] == 1.5
     assert summary["field_coverage"]["slaclip_gamma_t"] == {"present": 1, "missing": 2}
+    assert summary["boolean_metrics"]["slaclip_c_hit_min"] == {
+        "count": 2,
+        "missing": 1,
+        "true_count": 1,
+        "false_count": 1,
+        "true_rate": 0.5,
+    }
+    assert summary["boolean_metrics"]["slaclip_c_hit_max"]["true_rate"] == 0.0
 
 
 def test_summarizer_rejects_unmarked_raw_record(tmp_path: Path) -> None:

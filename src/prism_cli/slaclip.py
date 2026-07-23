@@ -7,6 +7,7 @@ tangent update.  They must never be computed as a second, unaccounted query.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Tuple
 
 import torch
@@ -14,6 +15,17 @@ from torch import Tensor
 
 
 Z_0995 = 2.5758293035489004
+
+
+@dataclass(frozen=True)
+class ThresholdUpdate:
+    """Diagnostics for one post-processing-only clipping-threshold update."""
+
+    next_clip: float
+    unbounded_next_clip: float
+    target_unclipped_proxy: float
+    hit_lower_bound: bool
+    hit_upper_bound: bool
 
 
 def automatic_num_slots(
@@ -67,7 +79,51 @@ def build_slack_vectors(norms: Tensor, clip_threshold: float, num_slots: int) ->
     return vectors, float(lambda_t)
 
 
-def update_slaclip_threshold(
+def slack_indicator_noise_std(
+    noise_multiplier: float,
+    num_slots: int,
+    expected_batch_size: float,
+) -> float:
+    """Return the public per-coordinate noise s.d. of the normalized indicator.
+
+    The unnormalized joint Gaussian release uses standard deviation ``sigma*C``.
+    Dividing a slack coordinate by ``lambda*B`` with ``lambda=C/sqrt(K)``
+    cancels ``C``, leaving ``sigma*sqrt(K)/B``.
+    """
+    if noise_multiplier <= 0:
+        raise ValueError("noise_multiplier must be positive")
+    if num_slots <= 0:
+        raise ValueError("num_slots must be positive")
+    if expected_batch_size <= 0:
+        raise ValueError("expected_batch_size must be positive")
+    return float(noise_multiplier) * math.sqrt(int(num_slots)) / float(expected_batch_size)
+
+
+def _bounded_exponential_update(
+    clip_threshold: float,
+    *,
+    eta: float,
+    error: float,
+    target_unclipped_proxy: float,
+    c_min: float,
+    c_max: float,
+) -> ThresholdUpdate:
+    # A DP Gaussian coordinate is unbounded.  Clamping the exponent prevents an
+    # overflow without inspecting any non-private quantity and is therefore
+    # ordinary post-processing of the same release.
+    exponent = max(-50.0, min(50.0, float(eta) * float(error)))
+    unbounded = float(clip_threshold) * math.exp(exponent)
+    bounded = max(float(c_min), min(float(c_max), unbounded))
+    return ThresholdUpdate(
+        next_clip=float(bounded),
+        unbounded_next_clip=float(unbounded),
+        target_unclipped_proxy=float(target_unclipped_proxy),
+        hit_lower_bound=bool(unbounded < float(c_min)),
+        hit_upper_bound=bool(unbounded > float(c_max)),
+    )
+
+
+def full_slaclip_threshold_update(
     clip_threshold: float,
     slack_indicator: Tensor,
     *,
@@ -75,8 +131,14 @@ def update_slaclip_threshold(
     beta: float,
     c_min: float,
     c_max: float,
-) -> Tuple[float, float]:
-    """Apply the full SlaClip controller (not the SlaClip-Q ablation)."""
+) -> ThresholdUpdate:
+    """Apply the camera-ready full-SlaClip feedback controller.
+
+    The first indicator coordinate is a noisy, bin-averaged surrogate for the
+    *unclipped* CDF near ``C_t``.  Full SlaClip constructs a dynamic target from
+    the last (near-zero) coordinate; it does not expose a fixed clipping-rate
+    target.
+    """
     if clip_threshold <= 0:
         raise ValueError("clip_threshold must be positive")
     if slack_indicator.ndim != 1 or slack_indicator.numel() == 0:
@@ -93,7 +155,72 @@ def update_slaclip_threshold(
     near_zero = float(slack_indicator[-1].item())
     gamma_t = 1.0 - float(beta) * (1.0 - near_zero / (c_t + 1e-6))
     gamma_t = max(0.0, min(1.0, gamma_t))
-    exponent = max(-50.0, min(50.0, float(eta) * (gamma_t - near_threshold)))
-    c_next = c_t * math.exp(exponent)
-    c_next = max(float(c_min), min(float(c_max), c_next))
-    return float(c_next), float(gamma_t)
+    return _bounded_exponential_update(
+        c_t,
+        eta=eta,
+        error=gamma_t - near_threshold,
+        target_unclipped_proxy=gamma_t,
+        c_min=c_min,
+        c_max=c_max,
+    )
+
+
+def slaclip_q_threshold_update(
+    clip_threshold: float,
+    slack_indicator: Tensor,
+    *,
+    eta: float,
+    target_clip_fraction: float,
+    c_min: float,
+    c_max: float,
+) -> ThresholdUpdate:
+    """Apply SlaClip-Q with an explicit requested clipped fraction.
+
+    SlaClip-Q's paper parameter ``gamma`` is the desired *unclipped* CDF level.
+    This interface accepts the complement because it prevents the common and
+    consequential inversion error when an experiment is specified as, e.g.,
+    "99% clipped".  The controller tracks a noisy, smoothed CDF proxy, so the
+    requested fraction is not a guarantee about the exact raw clipping rate.
+    """
+    if clip_threshold <= 0:
+        raise ValueError("clip_threshold must be positive")
+    if slack_indicator.ndim != 1 or slack_indicator.numel() == 0:
+        raise ValueError("slack_indicator must be a non-empty vector")
+    if eta < 0:
+        raise ValueError("eta must be non-negative")
+    if not 0.0 <= target_clip_fraction <= 1.0:
+        raise ValueError("target_clip_fraction must be in [0, 1]")
+    if c_min <= 0 or c_max < c_min:
+        raise ValueError("require 0 < c_min <= c_max")
+
+    target_unclipped = 1.0 - float(target_clip_fraction)
+    near_threshold = float(slack_indicator[0].item())
+    return _bounded_exponential_update(
+        float(clip_threshold),
+        eta=eta,
+        error=target_unclipped - near_threshold,
+        target_unclipped_proxy=target_unclipped,
+        c_min=c_min,
+        c_max=c_max,
+    )
+
+
+def update_slaclip_threshold(
+    clip_threshold: float,
+    slack_indicator: Tensor,
+    *,
+    eta: float,
+    beta: float,
+    c_min: float,
+    c_max: float,
+) -> Tuple[float, float]:
+    """Compatibility wrapper returning ``(C_next, gamma_t)`` for full SlaClip."""
+    update = full_slaclip_threshold_update(
+        clip_threshold,
+        slack_indicator,
+        eta=eta,
+        beta=beta,
+        c_min=c_min,
+        c_max=c_max,
+    )
+    return update.next_clip, update.target_unclipped_proxy

@@ -21,11 +21,10 @@ def test_research_raw_requires_explicit_acknowledgement(tmp_path: Path) -> None:
         cfg.finalize()
 
 
-def test_only_baseline_and_full_slaclip_are_public_methods(tmp_path: Path) -> None:
+def test_baseline_full_slaclip_and_fixed_target_q_are_public_methods(tmp_path: Path) -> None:
     assert RunConfig(dataset='math10k', method='prism', privacy='dp', root=tmp_path).finalize().method == 'baseline'
     assert RunConfig(dataset='math10k', method='slaclip', privacy='dp', root=tmp_path).finalize().method == 'slaclip'
-    with pytest.raises(ValueError, match='baseline or slaclip'):
-        RunConfig(dataset='math10k', method='slaclip_q', privacy='dp', root=tmp_path).finalize()
+    assert RunConfig(dataset='math10k', method='slaclip_q', privacy='dp', root=tmp_path).finalize().method == 'slaclip_q'
 
 
 def test_checkpoint_loader_accepts_old_opacus_module_prefix() -> None:

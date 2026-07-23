@@ -18,8 +18,8 @@ from .modeling import (
 from .utils import JsonlLogger, adapter_is_complete, build_tokenizer, checkpoint_file, clean_output_dir, cleanup_cuda, collect_runtime_metadata, ensure_text_only_token_type_ids, freeze_vision_tower_params, generate_prompt, iter_microbatches, llm_adapters_dir, load_resume_checkpoint_if_available, load_trainable_state_dict, save_resume_checkpoint, save_status, set_rng_state, set_seed, tokenize_prompt, truncate_jsonl_to_step, unwrap_for_save
 
 
-CHECKPOINT_SCHEMA_VERSION = 2
-TELEMETRY_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
+TELEMETRY_SCHEMA_VERSION = 3
 LOSS_DEFINITION = 'per_record_mean_of_nonignored_next_token_losses'
 
 @dataclass
@@ -63,6 +63,7 @@ class RunConfig:
     slaclip_num_slots: int = 0
     slaclip_eta: float = 0.5
     slaclip_beta: float = 0.5
+    slaclip_target_clip_fraction: float = 0.99
     slaclip_c_min: float = 0.1
     slaclip_c_max: float = 50.0
     force_train: bool = False
@@ -129,6 +130,7 @@ class RunConfig:
             'slaclip_num_slots': int(self.slaclip_num_slots),
             'slaclip_eta': float(self.slaclip_eta),
             'slaclip_beta': float(self.slaclip_beta),
+            'slaclip_target_clip_fraction': float(self.slaclip_target_clip_fraction),
             'slaclip_c_min': float(self.slaclip_c_min),
             'slaclip_c_max': float(self.slaclip_c_max),
             'spectral_svd_device': self.spectral_svd_device,
@@ -157,14 +159,16 @@ class RunConfig:
             self.method = 'baseline'
         elif method in {'slaclip', 'slaclip_prism'}:
             self.method = 'slaclip'
+        elif method in {'slaclip_q', 'slaclipq', 'slaclip_q_prism'}:
+            self.method = 'slaclip_q'
         else:
-            raise ValueError('method must be baseline or slaclip')
+            raise ValueError('method must be baseline, slaclip, or slaclip_q')
         self.privacy = self.privacy.lower().replace('_', '-')
         if self.privacy in {'non-dp', 'nondp', 'none'}:
             self.privacy = 'nondp'
         if self.privacy not in {'dp', 'nondp'}:
             raise ValueError('privacy must be dp or nondp')
-        if self.method == 'slaclip' and self.privacy != 'dp':
+        if self.method in {'slaclip', 'slaclip_q'} and self.privacy != 'dp':
             raise ValueError('SlaClip is a DP clipping controller; use --privacy dp')
         self.telemetry_mode = self.telemetry_mode.lower().replace('-', '_')
         if self.telemetry_mode not in {'dp_safe', 'research_raw'}:
@@ -235,9 +239,11 @@ class RunConfig:
             raise ValueError('slaclip_eta must be non-negative')
         if not 0.0 <= float(self.slaclip_beta) <= 1.0:
             raise ValueError('slaclip_beta must be in [0, 1]')
+        if not 0.0 <= float(self.slaclip_target_clip_fraction) <= 1.0:
+            raise ValueError('slaclip_target_clip_fraction must be in [0, 1]')
         if float(self.slaclip_c_min) <= 0 or float(self.slaclip_c_max) < float(self.slaclip_c_min):
             raise ValueError('require 0 < slaclip_c_min <= slaclip_c_max')
-        if self.method == 'slaclip' and not (
+        if self.method in {'slaclip', 'slaclip_q'} and not (
             float(self.slaclip_c_min) <= float(self.dp_max_grad_norm) <= float(self.slaclip_c_max)
         ):
             raise ValueError('SlaClip initial C must satisfy slaclip_c_min <= C0 <= slaclip_c_max')
@@ -487,6 +493,7 @@ def _build_prism_optimizer(cfg: RunConfig, model):
         slaclip_num_slots=int(cfg.slaclip_num_slots),
         slaclip_eta=float(cfg.slaclip_eta),
         slaclip_beta=float(cfg.slaclip_beta),
+        slaclip_target_clip_fraction=float(cfg.slaclip_target_clip_fraction),
         slaclip_c_min=float(cfg.slaclip_c_min),
         slaclip_c_max=float(cfg.slaclip_c_max),
         telemetry_mode=cfg.telemetry_mode,
