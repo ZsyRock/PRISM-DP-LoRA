@@ -62,6 +62,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--cutoff_len', type=int, default=None)
     p.add_argument('--train_on_inputs', type=parse_bool, default=None)
     p.add_argument(
+        '--val_set_size',
+        type=int,
+        default=0,
+        help='Public selection holdout size; 0 trains on all rows and skips validation.',
+    )
+    p.add_argument('--validation_seed', type=int, default=1729)
+    p.add_argument('--validation_batch_size', type=int, default=8)
+    p.add_argument('--protocol_stage', choices=['pilot', 'selection', 'final'], default='pilot')
+    p.add_argument(
+        '--validation_data_is_public',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Explicit acknowledgement required for validation-based hyperparameter selection.',
+    )
+    p.add_argument(
         '--initial_clip_threshold',
         '--dp_max_grad_norm',
         dest='dp_max_grad_norm',

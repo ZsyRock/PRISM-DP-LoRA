@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 
-FINGERPRINT_SCHEMA_VERSION = 4
+FINGERPRINT_SCHEMA_VERSION = 5
 
 
 def git_worktree_identity(

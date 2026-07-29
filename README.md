@@ -125,6 +125,17 @@ bash scripts/run_math10k_pair.sh \
 
 For full SlaClip, `--slaclip_eta`, `--slaclip_beta`, `--slaclip_c_min`, and `--slaclip_c_max` configure the controller. `beta` is a feedback coefficient, not a fixed clipping-rate target. For SlaClip-Q, `--slaclip_target_clip_fraction 0.99` is converted to the complementary target-unclipped proxy `0.01`. `--slaclip_num_slots 0` follows the journal-extension policy: expected batches below 128 use `K=15`, while batches of 128 or more use the paper-bound formula based on expected batch size and noise multiplier. Small-batch `K=15` remains DP-valid but can exceed the paper's high-probability CDF-monotonicity bound, so experiments must label it as the journal policy rather than a paper-bound choice.
 
+Journal hyperparameter selection uses a deterministic prompt-grouped public
+holdout, never the task test sets or exact raw clipping telemetry.  Selection
+runs must pass `--protocol_stage selection`, `--validation_data_is_public`, and
+`--run_eval false` with a nonzero `--val_set_size`; configuration locking is
+performed by `scripts/select_validation_candidates.py`.  Once locked, formal
+arms use fresh seeds, `--protocol_stage final`, and `--val_set_size 0` to retrain
+on the complete training set before evaluation.  In particular, a saturated
+100% baseline clipping median is not treated as a full-SlaClip target.  See
+[the experiment protocol](docs/experiment_protocol.md) for the leakage guards
+and public-data privacy boundary.
+
 The noise multiplier is calibrated for the requested update count. Each Poisson batch is normalized by Opacus's fixed expected batch size, not by the randomly realized batch size. Dynamic clipping changes the absolute noise scale with `C_t`, while the matched noise multiplier and accountant determine the same privacy schedule. The sensitivity statement uses Poisson subsampling and add/remove record adjacency; replace-one adjacency must not be substituted without changing the analysis.
 
 ## Training loss and microbatch invariance

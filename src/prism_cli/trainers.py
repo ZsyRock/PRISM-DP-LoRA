@@ -1,4 +1,5 @@
 from __future__ import annotations
+import hashlib
 import json
 import math
 import os
@@ -15,12 +16,13 @@ from .modeling import (
     resolve_text_lora_target_modules,
     resolved_model_revision,
 )
-from .utils import JsonlLogger, adapter_is_complete, build_tokenizer, checkpoint_file, clean_output_dir, cleanup_cuda, collect_runtime_metadata, ensure_text_only_token_type_ids, freeze_vision_tower_params, generate_prompt, iter_microbatches, llm_adapters_dir, load_resume_checkpoint_if_available, load_trainable_state_dict, save_resume_checkpoint, save_status, set_rng_state, set_seed, tokenize_prompt, truncate_jsonl_to_step, unwrap_for_save
+from .utils import JsonlLogger, adapter_is_complete, build_tokenizer, checkpoint_file, clean_output_dir, cleanup_cuda, collect_runtime_metadata, ensure_text_only_token_type_ids, freeze_vision_tower_params, generate_prompt, get_rng_state, iter_microbatches, llm_adapters_dir, load_resume_checkpoint_if_available, load_trainable_state_dict, save_resume_checkpoint, save_status, set_rng_state, set_seed, tokenize_prompt, truncate_jsonl_to_step, unwrap_for_save, write_json_atomic
 
 
-CHECKPOINT_SCHEMA_VERSION = 3
+CHECKPOINT_SCHEMA_VERSION = 4
 TELEMETRY_SCHEMA_VERSION = 3
 LOSS_DEFINITION = 'per_record_mean_of_nonignored_next_token_losses'
+VALIDATION_SPLIT_SCHEMA_VERSION = 1
 
 @dataclass
 class RunConfig:
@@ -47,6 +49,10 @@ class RunConfig:
     cutoff_len: Optional[int] = None
     train_on_inputs: Optional[bool] = None
     val_set_size: int = 0
+    validation_seed: int = 1729
+    validation_batch_size: int = 8
+    protocol_stage: str = 'pilot'
+    validation_data_is_public: bool = False
     eval_step: int = 100
     save_step: int = 200
     dp_epsilon: float = 6.0
@@ -116,6 +122,11 @@ class RunConfig:
             'cutoff_len': int(self.cutoff_len),
             'train_on_inputs': bool(self.train_on_inputs),
             'val_set_size': int(self.val_set_size),
+            'validation_seed': int(self.validation_seed),
+            'validation_batch_size': int(self.validation_batch_size),
+            'validation_split_schema_version': VALIDATION_SPLIT_SCHEMA_VERSION,
+            'protocol_stage': self.protocol_stage,
+            'validation_data_is_public': bool(self.validation_data_is_public),
             'eval_step': int(self.eval_step),
             'save_step': int(self.save_step),
             'dp_epsilon': float(self.dp_epsilon),
@@ -195,7 +206,7 @@ class RunConfig:
             self.learning_rate = 0.0003 if self.learning_rate is None else self.learning_rate
             self.cutoff_len = 256 if self.cutoff_len is None else self.cutoff_len
             self.train_on_inputs = True if self.train_on_inputs is None else self.train_on_inputs
-            self.val_set_size = int(self.val_set_size or 120)
+            self.val_set_size = int(self.val_set_size)
             self.eval_step = int(self.eval_step or 10)
             self.save_step = int(self.save_step or 20)
             self.data_path = self.data_path or adapters / 'ft-training_set' / 'math_10k.json'
@@ -204,7 +215,7 @@ class RunConfig:
             self.learning_rate = 0.0002 if self.learning_rate is None else self.learning_rate
             self.cutoff_len = 384 if self.cutoff_len is None else self.cutoff_len
             self.train_on_inputs = False if self.train_on_inputs is None else self.train_on_inputs
-            self.val_set_size = int(self.val_set_size or 1000)
+            self.val_set_size = int(self.val_set_size)
             self.eval_step = int(self.eval_step or 100)
             self.save_step = int(self.save_step or 200)
             self.data_path = self.data_path or adapters / 'ft-training_set' / 'glue8_1250.json'
@@ -223,6 +234,30 @@ class RunConfig:
             raise ValueError('learning_rate must be positive')
         if int(self.cutoff_len) <= 0:
             raise ValueError('cutoff_len must be positive')
+        if int(self.val_set_size) < 0:
+            raise ValueError('val_set_size must be non-negative')
+        if int(self.validation_seed) < 0:
+            raise ValueError('validation_seed must be non-negative')
+        if int(self.validation_batch_size) <= 0:
+            raise ValueError('validation_batch_size must be positive')
+        self.protocol_stage = str(self.protocol_stage).lower().replace('-', '_')
+        if self.protocol_stage not in {'pilot', 'selection', 'final'}:
+            raise ValueError('protocol_stage must be pilot, selection, or final')
+        has_validation_holdout = int(self.val_set_size) > 0
+        if has_validation_holdout and bool(self.run_eval):
+            raise ValueError(
+                'validation-holdout runs forbid task test evaluation; set run_eval=false'
+            )
+        if has_validation_holdout and not bool(self.validation_data_is_public):
+            raise ValueError(
+                'validation-holdout runs require explicit validation_data_is_public=true; '
+                'exact validation metrics are otherwise a non-DP data-dependent release'
+            )
+        if self.protocol_stage == 'selection':
+            if not has_validation_holdout:
+                raise ValueError('selection stage requires val_set_size > 0')
+        if self.protocol_stage == 'final' and int(self.val_set_size) != 0:
+            raise ValueError('final stage requires val_set_size=0 and full-data retraining')
         if self.lora_r <= 0 or self.lora_alpha <= 0:
             raise ValueError('lora_r and lora_alpha must be positive')
         if not 0.0 <= float(self.lora_dropout) < 1.0:
@@ -404,16 +439,157 @@ def _step_accountant(privacy_engine, noise_multiplier: float, sample_rate: float
     except TypeError:
         privacy_engine.accountant.step(noise_multiplier, sample_rate)
 
+def _deterministic_holdout_indices(
+    records,
+    holdout_size: int,
+    seed: int,
+    *,
+    dataset: str,
+) -> tuple[list[int], list[int], Dict[str, Any]]:
+    """Return a stable stratified prompt-group split and an audit manifest."""
+    total_rows = int(len(records))
+    holdout_size = int(holdout_size)
+    seed = int(seed)
+    if total_rows <= 0:
+        raise ValueError('training dataset must contain at least one row')
+    if holdout_size < 0 or holdout_size >= total_rows:
+        raise ValueError(
+            f'val_set_size must satisfy 0 <= val_set_size < {total_rows}, got {holdout_size}'
+        )
+    groups_by_stratum: Dict[str, Dict[str, list[int]]] = {}
+    record_hashes: Dict[int, str] = {}
+    for index in range(total_rows):
+        record = dict(records[index])
+        instruction = str(record.get('instruction', ''))
+        input_text = str(record.get('input', ''))
+        stratum = instruction if str(dataset) == 'glue8' else str(dataset)
+        prompt_payload = json.dumps(
+            [instruction, input_text],
+            ensure_ascii=False,
+            separators=(',', ':'),
+        ).encode('utf-8')
+        prompt_hash = hashlib.sha256(prompt_payload).hexdigest()
+        groups_by_stratum.setdefault(stratum, {}).setdefault(prompt_hash, []).append(index)
+        record_payload = json.dumps(
+            record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=str,
+        ).encode('utf-8')
+        record_hashes[index] = hashlib.sha256(record_payload).hexdigest()
+
+    stratum_sizes = {key: sum(len(group) for group in groups.values()) for key, groups in groups_by_stratum.items()}
+    raw_targets = {
+        key: float(holdout_size) * float(size) / float(total_rows)
+        for key, size in stratum_sizes.items()
+    }
+    stratum_targets = {key: int(math.floor(value)) for key, value in raw_targets.items()}
+    remainder = holdout_size - sum(stratum_targets.values())
+    for key in sorted(
+        stratum_targets,
+        key=lambda value: (-(raw_targets[value] - stratum_targets[value]), value),
+    )[:remainder]:
+        stratum_targets[key] += 1
+
+    validation_indices: list[int] = []
+    for stratum in sorted(groups_by_stratum):
+        target = stratum_targets[stratum]
+        ranked_groups = sorted(
+            groups_by_stratum[stratum].items(),
+            key=lambda item: (
+                hashlib.sha256(f'{seed}:{stratum}:{item[0]}'.encode('utf-8')).hexdigest(),
+                item[0],
+            ),
+        )
+        selected: list[int] = []
+        remaining = target
+        for _group_hash, indices in ranked_groups:
+            if len(indices) <= remaining:
+                selected.extend(indices)
+                remaining -= len(indices)
+            if remaining == 0:
+                break
+        if remaining != 0:
+            raise ValueError(
+                f'could not construct an exact prompt-group validation split for stratum={stratum!r}; '
+                f'target={target}, missing={remaining}'
+            )
+        validation_indices.extend(selected)
+    validation_indices = sorted(validation_indices)
+    validation_set = set(validation_indices)
+    train_indices = [index for index in range(total_rows) if index not in validation_set]
+    index_bytes = json.dumps(validation_indices, separators=(',', ':')).encode('utf-8')
+    train_hash_bytes = json.dumps(
+        sorted(record_hashes[index] for index in train_indices),
+        separators=(',', ':'),
+    ).encode('utf-8')
+    validation_hash_bytes = json.dumps(
+        sorted(record_hashes[index] for index in validation_indices),
+        separators=(',', ':'),
+    ).encode('utf-8')
+    metadata = {
+        'schema_version': VALIDATION_SPLIT_SCHEMA_VERSION,
+        'algorithm': 'sha256_ranked_stratified_prompt_group_v1',
+        'seed': seed,
+        'source_rows': total_rows,
+        'train_rows': len(train_indices),
+        'validation_rows': len(validation_indices),
+        'requested_validation_rows': holdout_size,
+        'stratum_targets': stratum_targets,
+        'validation_indices': validation_indices,
+        'validation_indices_sha256': hashlib.sha256(index_bytes).hexdigest(),
+        'train_record_hashes_sha256': hashlib.sha256(train_hash_bytes).hexdigest(),
+        'validation_record_hashes_sha256': hashlib.sha256(validation_hash_bytes).hexdigest(),
+    }
+    return train_indices, validation_indices, metadata
+
+
 def _make_loader(cfg: RunConfig, tokenizer):
     import transformers
     from datasets import load_dataset
     from torch.utils.data import DataLoader
     data = load_dataset('json', data_files=str(cfg.data_path)) if str(cfg.data_path).endswith('.json') else load_dataset(str(cfg.data_path))
-    train_ds = data['train']
+    source_ds = data['train']
+    train_indices, validation_indices, split_metadata = _deterministic_holdout_indices(
+        source_ds,
+        int(cfg.val_set_size),
+        int(cfg.validation_seed),
+        dataset=cfg.dataset,
+    )
+    split_metadata['source_content_sha256'] = cfg.data_content_sha256
+    split_metadata['protocol_stage'] = cfg.protocol_stage
+    split_metadata['validation_data_is_public'] = bool(cfg.validation_data_is_public)
+    split_payload = json.dumps(
+        split_metadata,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    split_metadata['manifest_sha256'] = hashlib.sha256(split_payload).hexdigest()
+    train_ds = source_ds.select(train_indices)
+    validation_ds = source_ds.select(validation_indices) if validation_indices else None
 
     def map_fn(ex):
         return tokenize_prompt(tokenizer, ex, cutoff_len=int(cfg.cutoff_len), train_on_inputs=bool(cfg.train_on_inputs), base_model=cfg.base_model)
+
+    def validation_map_fn(ex):
+        # Hyperparameter selection is preregistered on response-only loss so a
+        # long prompt cannot dominate the utility signal used to choose beta/C.
+        return tokenize_prompt(
+            tokenizer,
+            ex,
+            cutoff_len=int(cfg.cutoff_len),
+            train_on_inputs=False,
+            base_model=cfg.base_model,
+        )
     train_ds = train_ds.map(map_fn, remove_columns=train_ds.column_names, desc='Tokenizing')
+    if validation_ds is not None:
+        validation_ds = validation_ds.map(
+            validation_map_fn,
+            remove_columns=validation_ds.column_names,
+            desc='Tokenizing validation holdout',
+        )
     collator = transformers.DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8, return_tensors='pt', padding=True)
     loader_kwargs = dict(dataset=train_ds, batch_size=int(cfg.batch_size), shuffle=True, drop_last=False, collate_fn=collator)
     generator = torch.Generator()
@@ -421,7 +597,81 @@ def _make_loader(cfg: RunConfig, tokenizer):
     loader_kwargs['generator'] = generator
     loader_kwargs['num_workers'] = 0
     loader = DataLoader(**loader_kwargs)
-    return (loader, train_ds)
+    validation_loader = None
+    if validation_ds is not None:
+        validation_generator = torch.Generator()
+        validation_generator.manual_seed((int(cfg.validation_seed) + 0x0A11CE) % (2**63 - 1))
+        validation_loader = DataLoader(
+            dataset=validation_ds,
+            batch_size=int(cfg.validation_batch_size),
+            shuffle=False,
+            drop_last=False,
+            collate_fn=collator,
+            num_workers=0,
+            generator=validation_generator,
+        )
+    return (loader, train_ds, validation_loader, split_metadata)
+
+
+@torch.no_grad()
+def _evaluate_validation_loss(
+    model,
+    validation_loader,
+    *,
+    device: torch.device,
+    needs_text_token_type_ids: bool,
+) -> Dict[str, Any]:
+    """Evaluate the public selection holdout without touching task test sets."""
+    evaluation_model = unwrap_for_save(model)
+    was_training = bool(evaluation_model.training)
+    rng_state = get_rng_state()
+    evaluation_model.eval()
+    loss_sum = 0.0
+    token_loss_sum = 0.0
+    record_count = 0
+    supervised_tokens = 0
+    try:
+        for batch in validation_loader:
+            batch = {key: value.to(device) for key, value in batch.items()}
+            batch = ensure_text_only_token_type_ids(
+                batch,
+                required=needs_text_token_type_ids,
+            )
+            per_example_loss, token_counts = forward_causal_lm_per_example_loss(
+                evaluation_model,
+                batch,
+            )
+            zero_token_records = int(token_counts.eq(0).sum().detach().cpu().item())
+            if zero_token_records:
+                raise RuntimeError(
+                    'response-only validation produced '
+                    f'{zero_token_records} record(s) with no supervised tokens; '
+                    'increase cutoff_len or revise the validation tokenization protocol'
+                )
+            loss_sum += float(per_example_loss.detach().sum().cpu().item())
+            token_loss_sum += float(
+                (per_example_loss.detach() * token_counts.detach()).sum().cpu().item()
+            )
+            record_count += int(per_example_loss.numel())
+            supervised_tokens += int(token_counts.detach().sum().cpu().item())
+    finally:
+        if was_training:
+            evaluation_model.train()
+        set_rng_state(rng_state)
+    if record_count <= 0:
+        raise RuntimeError('validation holdout produced no evaluable records')
+    mean_loss = loss_sum / float(record_count)
+    token_mean_loss = token_loss_sum / float(max(1, supervised_tokens))
+    return {
+        'metric_schema_version': 1,
+        'selection_metric': 'response_only_mean_per_record_causal_lm_loss',
+        'loss_definition': 'response_only_per_record_mean_of_nonignored_next_token_losses',
+        'loss_mean': float(mean_loss),
+        'token_mean_loss': float(token_mean_loss),
+        'token_perplexity': float(math.exp(min(token_mean_loss, 50.0))),
+        'records': int(record_count),
+        'supervised_tokens': int(supervised_tokens),
+    }
 
 def _build_lora_model(cfg: RunConfig):
     from peft import LoraConfig, get_peft_model
@@ -776,14 +1026,14 @@ def train_prism_manual(cfg: RunConfig) -> Path:
         set_seed(cfg.seed)
         model, tokenizer, device = _build_lora_model(cfg)
         _initialize_prism_factors(cfg, model)
-        train_loader, train_ds = _make_loader(cfg, tokenizer)
+        train_loader, train_ds, validation_loader, split_metadata = _make_loader(cfg, tokenizer)
         optimizer = _build_prism_optimizer(cfg, model)
     else:
         set_seed(cfg.seed)
         model, tokenizer, device = _build_lora_model(cfg)
         _initialize_prism_factors(cfg, model)
         optimizer = _build_prism_optimizer(cfg, model)
-        train_loader, train_ds = _make_loader(cfg, tokenizer)
+        train_loader, train_ds, validation_loader, split_metadata = _make_loader(cfg, tokenizer)
     needs_text_token_type_ids = is_multimodal_causal_lm_config(model.config)
     checkpoint = _restore_if_possible(cfg, model, optimizer)
     privacy_engine = None
@@ -832,6 +1082,9 @@ def train_prism_manual(cfg: RunConfig) -> Path:
         removed_raw = truncate_jsonl_to_step(cfg.raw_log_jsonl, start_step)
         print(f'[resume] truncated log records after step {start_step}: main={removed_main}, raw={removed_raw}')
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+    validation_dir = Path(cfg.result_dir) / 'validation'
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(validation_dir / 'split_manifest.json', split_metadata)
     logger = JsonlLogger(cfg.log_jsonl)
     raw_logger = None
     if cfg.telemetry_mode == 'research_raw':
@@ -880,6 +1133,7 @@ def train_prism_manual(cfg: RunConfig) -> Path:
             'expected_batch_size': expected_batch_size,
             'planned_update_steps': cfg.total_update_steps,
         },
+        data_split=split_metadata,
         runtime=collect_runtime_metadata(cfg.root),
     )
     model.train()
@@ -1034,6 +1288,24 @@ def train_prism_manual(cfg: RunConfig) -> Path:
     logger.close()
     if raw_logger is not None:
         raw_logger.close()
+    validation_metrics = None
+    if validation_loader is not None:
+        validation_metrics = _evaluate_validation_loss(
+            model,
+            validation_loader,
+            device=device,
+            needs_text_token_type_ids=needs_text_token_type_ids,
+        )
+        validation_metrics.update(split_metadata)
+        validation_metrics['NON_PRIVATE_SELECTION_METRIC'] = True
+        validation_path = validation_dir / 'validation_metrics.json'
+        write_json_atomic(validation_path, validation_metrics)
+        print(
+            '[validation] '
+            f"records={validation_metrics['records']} "
+            f"loss={validation_metrics['loss_mean']:.8f} "
+            f"split_sha256={validation_metrics['validation_indices_sha256']}"
+        )
     to_save = unwrap_for_save(model)
     rebase_stats = _rebase_prism_for_save(to_save)
     to_save.save_pretrained(str(cfg.output_dir))
@@ -1049,6 +1321,8 @@ def train_prism_manual(cfg: RunConfig) -> Path:
         'training_lora_r': int(cfg.lora_r),
         'saved_adapter_r': saved_rank,
         'spectral_rebase': rebase_stats,
+        'data_split': split_metadata,
+        'validation': validation_metrics,
         'privacy_accounting': {
             'accountant': cfg.dp_accountant,
             'secure_mode': bool(cfg.dp_secure_mode),

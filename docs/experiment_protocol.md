@@ -110,6 +110,37 @@ If tuning is part of the research question:
 - never choose configurations or stopping points using the test set;
 - state whether the privacy cost of data-dependent selection is included in the final claim.
 
+For the journal-extension campaign, use a fixed public Math-10K holdout rather
+than choosing a controller from exact clipping telemetry.  A baseline clipping
+fraction of 100% is a censored statistic: its median contains no information
+about how far the gradient norms lie above `C`, so it must not be converted
+mechanically into a SlaClip target.  Full SlaClip also has no fixed clipping-rate
+target; `beta` controls the dynamic target constructed from the noised Slack
+Indicator.
+
+The implemented selection protocol is:
+
+1. predeclare the complete fixed-`C` and full-SlaClip candidate registry;
+2. reserve one deterministic, prompt-grouped public holdout with a fixed
+   `validation_seed` shared by every candidate and training seed;
+3. train selection arms with `--protocol_stage selection`,
+   `--validation_data_is_public`, and `--run_eval false`;
+4. rank candidates only by response-only, per-record mean causal-LM validation
+   loss; exact raw clipping telemetry is diagnostic and is not a selector input;
+5. confirm the short list across the preregistered selection seeds and write an
+   immutable selection record;
+6. after the record is locked, retrain with fresh seeds, `--protocol_stage final`,
+   and `--val_set_size 0`, then evaluate the task test sets.
+
+The split keeps all records with the same `(instruction, input)` prompt on the
+same side and stratifies GLUE8 by task instruction.  Its source hash, membership
+digests, indices, algorithm version, and manifest hash are stored with every run.
+Any nonzero holdout fails closed unless task-test evaluation is disabled and the
+data is explicitly acknowledged as public auxiliary data.  This public-benchmark
+workflow does not make exact validation release or validation-driven selection
+free for a genuinely private dataset; such a deployment needs its own privacy
+accounting or a separately public selection set.
+
 ## Loss definition
 
 The training objective is defined at the privacy unit (one record):
