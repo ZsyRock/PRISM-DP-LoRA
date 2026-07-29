@@ -123,7 +123,7 @@ bash scripts/run_math10k_pair.sh \
   --run_eval false
 ```
 
-For full SlaClip, `--slaclip_eta`, `--slaclip_beta`, `--slaclip_c_min`, and `--slaclip_c_max` configure the controller. `beta` is a feedback coefficient, not a fixed clipping-rate target. For SlaClip-Q, `--slaclip_target_clip_fraction 0.99` is converted to the complementary target-unclipped proxy `0.01`. `--slaclip_num_slots 0` selects `K` automatically from the paper bound using expected batch size and noise multiplier.
+For full SlaClip, `--slaclip_eta`, `--slaclip_beta`, `--slaclip_c_min`, and `--slaclip_c_max` configure the controller. `beta` is a feedback coefficient, not a fixed clipping-rate target. For SlaClip-Q, `--slaclip_target_clip_fraction 0.99` is converted to the complementary target-unclipped proxy `0.01`. `--slaclip_num_slots 0` follows the journal-extension policy: expected batches below 128 use `K=15`, while batches of 128 or more use the paper-bound formula based on expected batch size and noise multiplier. Small-batch `K=15` remains DP-valid but can exceed the paper's high-probability CDF-monotonicity bound, so experiments must label it as the journal policy rather than a paper-bound choice.
 
 The noise multiplier is calibrated for the requested update count. Each Poisson batch is normalized by Opacus's fixed expected batch size, not by the randomly realized batch size. Dynamic clipping changes the absolute noise scale with `C_t`, while the matched noise multiplier and accountant determine the same privacy schedule. The sensitivity statement uses Poisson subsampling and add/remove record adjacency; replace-one adjacency must not be substituted without changing the analysis.
 

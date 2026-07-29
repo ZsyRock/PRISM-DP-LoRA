@@ -15,6 +15,8 @@ from torch import Tensor
 
 
 Z_0995 = 2.5758293035489004
+SMALL_BATCH_SLOT_THRESHOLD = 128.0
+SMALL_BATCH_NUM_SLOTS = 15
 
 
 @dataclass(frozen=True)
@@ -28,7 +30,7 @@ class ThresholdUpdate:
     hit_upper_bound: bool
 
 
-def automatic_num_slots(
+def paper_bound_num_slots(
     expected_batch_size: float,
     noise_multiplier: float,
     *,
@@ -43,6 +45,33 @@ def automatic_num_slots(
         raise ValueError("confidence_z must be positive")
     upper = (float(expected_batch_size) / (2.0 * confidence_z * float(noise_multiplier))) ** (2.0 / 3.0)
     return max(1, int(math.floor(upper)))
+
+
+def automatic_num_slots(
+    expected_batch_size: float,
+    noise_multiplier: float,
+    *,
+    confidence_z: float = Z_0995,
+) -> int:
+    """Select K using the journal-extension experimental policy.
+
+    Expected batches below 128 use K=15.  Batches of 128 or more use the
+    original paper monotonicity-bound formula.  The strict boundary keeps the
+    policy faithful to the declared ``B < 128`` rule.
+
+    K=15 can exceed the paper's high-probability monotonicity bound for small
+    batches.  It remains a valid joint Gaussian DP query, but must be reported
+    as the small-batch journal policy rather than a paper-bound choice.
+    """
+    # Run the shared validation even on the fixed-K branch.
+    paper_k = paper_bound_num_slots(
+        expected_batch_size,
+        noise_multiplier,
+        confidence_z=confidence_z,
+    )
+    if float(expected_batch_size) < SMALL_BATCH_SLOT_THRESHOLD:
+        return SMALL_BATCH_NUM_SLOTS
+    return paper_k
 
 
 def build_slack_vectors(norms: Tensor, clip_threshold: float, num_slots: int) -> Tuple[Tensor, float]:

@@ -77,7 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--allow_non_private_telemetry', action=argparse.BooleanOptionalAction, default=False, help='Required acknowledgement for exact, non-DP research diagnostics.')
     p.add_argument('--raw_hist_bins', type=int, default=32)
     p.add_argument('--raw_hist_max', type=float, default=0.0, help='Fixed norm histogram upper edge; 0 uses 4 * initial C.')
-    p.add_argument('--slaclip_num_slots', type=int, default=0, help='Slack dimension K; 0 selects the paper bound automatically.')
+    p.add_argument(
+        '--slaclip_num_slots',
+        type=int,
+        default=0,
+        help=(
+            'Slack dimension K; 0 uses K=15 when expected batch size is below '
+            '128, otherwise the paper-bound formula.'
+        ),
+    )
     p.add_argument('--slaclip_eta', type=float, default=0.5)
     p.add_argument('--slaclip_beta', type=float, default=0.5)
     p.add_argument(

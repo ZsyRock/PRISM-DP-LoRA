@@ -18,6 +18,7 @@ from prism_cli.optim.prism import (
 from prism_cli.slaclip import (
     automatic_num_slots,
     build_slack_vectors,
+    paper_bound_num_slots,
     slaclip_q_threshold_update,
     slack_indicator_noise_std,
     update_slaclip_threshold,
@@ -220,15 +221,24 @@ def test_exact_dp_tangent_noise_is_independent_of_optimizer_eps() -> None:
     assert torch.equal(first_b, second_b)
 
 
-def test_automatic_num_slots_uses_paper_bound() -> None:
-    k = automatic_num_slots(expected_batch_size=64, noise_multiplier=1.0)
+def test_paper_bound_num_slots_uses_original_formula() -> None:
+    k = paper_bound_num_slots(expected_batch_size=64, noise_multiplier=1.0)
     expected = math.floor((64 / (2 * 2.5758293035489004)) ** (2 / 3))
     assert k == expected
 
 
-def test_math10k_actual_privacy_parameters_select_eight_slots() -> None:
-    assert automatic_num_slots(expected_batch_size=63.9935, noise_multiplier=0.516357) == 8
-    assert slack_indicator_noise_std(0.516357, 8, 63.9935) == pytest.approx(0.022822, rel=1e-4)
+def test_automatic_num_slots_uses_fifteen_below_128() -> None:
+    assert automatic_num_slots(expected_batch_size=63.9935, noise_multiplier=0.516357) == 15
+    assert automatic_num_slots(expected_batch_size=127.999, noise_multiplier=0.516357) == 15
+    assert slack_indicator_noise_std(0.516357, 15, 63.9935) == pytest.approx(0.031251, rel=1e-4)
+
+
+def test_automatic_num_slots_uses_paper_formula_at_and_above_128() -> None:
+    for expected_batch_size in (128.0, 128.001, 256.0):
+        assert automatic_num_slots(expected_batch_size, 0.516357) == paper_bound_num_slots(
+            expected_batch_size,
+            0.516357,
+        )
 
 
 def test_full_slaclip_controller_uses_near_zero_coordinate() -> None:
@@ -517,7 +527,7 @@ def test_automatic_slots_resolve_once_and_restore_from_checkpoint() -> None:
         noise_multiplier=0.516357,
     )
     source.dp_finalize(noise_multiplier=0.516357)
-    assert source.slaclip_num_slots == 8
+    assert source.slaclip_num_slots == 15
     saved = source.state_dict()
 
     restored, _, _ = _make_optimizer(
@@ -526,7 +536,7 @@ def test_automatic_slots_resolve_once_and_restore_from_checkpoint() -> None:
         c_max=15.0,
     )
     restored.load_state_dict(saved)
-    assert restored.slaclip_num_slots == 8
+    assert restored.slaclip_num_slots == 15
 
 
 def test_factorized_delta_norm_matches_dense_matrix() -> None:
