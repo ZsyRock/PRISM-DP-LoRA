@@ -64,7 +64,12 @@ def _config(tmp_path: Path, *, method: str = 'slaclip') -> RunConfig:
         telemetry_mode='research_raw',
         allow_non_private_telemetry=True,
         slaclip_num_slots=3,
-        slaclip_target_clip_fraction=0.99,
+        slaclip_target_non_small_clip_fraction=(
+            0.8 if method == 'slaclip' else None
+        ),
+        slaclip_target_clip_fraction=(
+            0.99 if method == 'slaclip_q' else None
+        ),
         slaclip_c_min=0.1,
         slaclip_c_max=15.0 if method == 'slaclip_q' else 50.0,
     ).finalize()
@@ -89,6 +94,9 @@ def _build(cfg: RunConfig, *, resume: bool) -> _Run:
         lr=1e-2,
         clipping_method=cfg.method,
         slaclip_num_slots=3,
+        slaclip_target_non_small_clip_fraction=(
+            cfg.slaclip_target_non_small_clip_fraction
+        ),
         slaclip_target_clip_fraction=cfg.slaclip_target_clip_fraction,
         slaclip_c_min=cfg.slaclip_c_min,
         slaclip_c_max=cfg.slaclip_c_max,

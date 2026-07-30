@@ -68,7 +68,7 @@ def run_method(
     steps: int,
     clip_norm: float,
     noise_multiplier: float,
-    slaclip_beta: float,
+    slaclip_target_non_small_clip_fraction: float,
     slaclip_target_clip_fraction: float,
     slaclip_eta: float,
     slaclip_num_slots: int,
@@ -89,7 +89,9 @@ def run_method(
         clipping_method=method,
         slaclip_num_slots=slaclip_num_slots,
         slaclip_eta=slaclip_eta,
-        slaclip_beta=slaclip_beta,
+        slaclip_target_non_small_clip_fraction=(
+            slaclip_target_non_small_clip_fraction
+        ),
         slaclip_target_clip_fraction=slaclip_target_clip_fraction,
         slaclip_c_min=slaclip_c_min,
         slaclip_c_max=slaclip_c_max,
@@ -136,6 +138,17 @@ def run_method(
         required_safe = {"dp_clip_threshold", "dp_next_clip_threshold"}
         if method in {"slaclip", "slaclip_q"}:
             required_safe.add("slack_indicator")
+        if method == "slaclip":
+            required_safe.update(
+                {
+                    "slaclip_target_non_small_clip_fraction",
+                    "slaclip_small_gradient_proxy_noisy",
+                    "slaclip_remaining_mass_proxy_noisy",
+                    "slaclip_target_unclipped_proxy_preprojection",
+                    "slaclip_observed_unclipped_proxy",
+                    "slaclip_controller_error",
+                }
+            )
         required_raw = {
             "NON_PRIVATE_TELEMETRY",
             "raw_clip_fraction",
@@ -170,6 +183,9 @@ def run_method(
                 "batch_n": finalized,
                 "slack_proxy": safe_log.get("slack_unclipped_proxy"),
                 "target_unclipped_proxy": safe_log.get("slaclip_target_unclipped_proxy"),
+                "target_non_small_clip_fraction": safe_log.get(
+                    "slaclip_target_non_small_clip_fraction"
+                ),
                 "hit_min": safe_log.get("slaclip_c_hit_min"),
                 "hit_max": safe_log.get("slaclip_c_hit_max"),
             }
@@ -190,6 +206,17 @@ def run_method(
                 abs_tol=1e-12,
             ):
                 raise RuntimeError(f"SlaClip-Q target complement is incorrect: {record}")
+    if method == "slaclip":
+        for record in trajectory:
+            if not math.isclose(
+                float(record["target_non_small_clip_fraction"]),
+                slaclip_target_non_small_clip_fraction,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise RuntimeError(
+                    f"Full SlaClip non-small target is incorrect: {record}"
+                )
     return {
         "method": method,
         "device": str(device),
@@ -207,7 +234,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--clip-norm", type=float, default=1.0)
     parser.add_argument("--noise-multiplier", type=float, default=0.8)
-    parser.add_argument("--slaclip-beta", type=float, default=0.5)
+    parser.add_argument(
+        "--slaclip-target-non-small-clip-fraction",
+        "--slaclip-beta",
+        dest="slaclip_target_non_small_clip_fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "Full SlaClip target clipped fraction within the non-small-gradient "
+            "mass; --slaclip-beta is the legacy spelling."
+        ),
+    )
     parser.add_argument("--slaclip-target-clip-fraction", type=float, default=0.99)
     parser.add_argument("--slaclip-eta", type=float, default=0.2)
     parser.add_argument("--slaclip-num-slots", type=int, default=3)
@@ -227,8 +264,10 @@ def main() -> int:
         raise SystemExit("--steps must be positive")
     if args.clip_norm <= 0 or args.noise_multiplier <= 0:
         raise SystemExit("--clip-norm and --noise-multiplier must be positive")
-    if not 0 <= args.slaclip_beta <= 1:
-        raise SystemExit("--slaclip-beta must be in [0, 1]")
+    if not 0 <= args.slaclip_target_non_small_clip_fraction <= 1:
+        raise SystemExit(
+            "--slaclip-target-non-small-clip-fraction must be in [0, 1]"
+        )
     if not 0 <= args.slaclip_target_clip_fraction <= 1:
         raise SystemExit("--slaclip-target-clip-fraction must be in [0, 1]")
     if args.slaclip_eta < 0 or args.slaclip_num_slots < 0:
@@ -252,7 +291,9 @@ def main() -> int:
             steps=args.steps,
             clip_norm=args.clip_norm,
             noise_multiplier=args.noise_multiplier,
-            slaclip_beta=args.slaclip_beta,
+            slaclip_target_non_small_clip_fraction=(
+                args.slaclip_target_non_small_clip_fraction
+            ),
             slaclip_target_clip_fraction=args.slaclip_target_clip_fraction,
             slaclip_eta=args.slaclip_eta,
             slaclip_num_slots=args.slaclip_num_slots,

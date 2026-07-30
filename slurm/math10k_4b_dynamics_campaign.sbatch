@@ -550,8 +550,8 @@ summarize_run_telemetry() {
 
 run_training_spec() {
   local spec="$1"
-  local kind phase candidate_id role seed method clip beta eta schedule_path arm_root
-  IFS='|' read -r kind phase candidate_id role seed method clip beta eta schedule_path arm_root <<<"${spec}"
+  local kind phase candidate_id role seed method clip rho eta schedule_path arm_root
+  IFS='|' read -r kind phase candidate_id role seed method clip rho eta schedule_path arm_root <<<"${spec}"
   if [[ "${kind}" != "train" ]]; then
     echo "error: invalid training spec: ${spec}" >&2
     return 2
@@ -568,7 +568,7 @@ run_training_spec() {
     echo "seed=${seed}"
     echo "method=${method}"
     echo "initial_or_fixed_clip=${clip}"
-    echo "slaclip_beta=${beta}"
+    echo "slaclip_target_non_small_clip_fraction=${rho}"
     echo "slaclip_eta=${eta}"
     echo "clip_schedule_path=${schedule_path}"
     echo "code_sha=${EXPECTED_REPO_SHA}"
@@ -646,7 +646,7 @@ run_training_spec() {
   case "${method}" in
     slaclip)
       train_args+=(
-        --slaclip_beta "${beta}"
+        --slaclip_target_non_small_clip_fraction "${rho}"
         --slaclip_eta "${eta}"
         --slaclip_num_slots 15
         --slaclip_c_min 0.1
@@ -800,7 +800,7 @@ PY
   )
   if [[ "${method}" == "slaclip" ]]; then
     args+=(
-      --slaclip_beta 0.99
+      --slaclip_target_non_small_clip_fraction 0.99
       --slaclip_eta 0.15
       --slaclip_num_slots 15
       --slaclip_c_min 0.1
@@ -917,7 +917,7 @@ from pathlib import Path
 target = Path(sys.argv[1])
 fixed_values = (0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0)
 c0_values = (0.5, 1.0)
-betas = (0.95, 0.99, 0.995)
+rhos = (0.95, 0.99, 0.995)
 etas = (0.05, 0.15, 0.30)
 
 def slug(value):
@@ -933,15 +933,15 @@ for clip in fixed_values:
         "params": {"dp_max_grad_norm": clip},
     })
 for c0 in c0_values:
-    for beta in betas:
+    for rho in rhos:
         for eta in etas:
             candidates.append({
-                "id": f"sla-c{slug(c0)}-b{slug(beta)}-e{slug(eta)}",
+                "id": f"sla-c{slug(c0)}-r{slug(rho)}-e{slug(eta)}",
                 "family": "slaclip",
                 "method": "slaclip",
                 "params": {
                     "dp_max_grad_norm": c0,
-                    "slaclip_beta": beta,
+                    "slaclip_target_non_small_clip_fraction": rho,
                     "slaclip_eta": eta,
                     "slaclip_num_slots": 15,
                     "slaclip_c_min": 0.1,
@@ -1163,10 +1163,15 @@ def emit(phase, candidate, role, seed, arm_root, schedule="NA"):
     params = candidate["params"]
     method = candidate["method"]
     clip = params["dp_max_grad_norm"]
-    beta = params.get("slaclip_beta", "NA")
+    # New registries use the semantic target name. The fallback keeps this
+    # planner able to consume already-locked pre-migration registries.
+    rho = params.get(
+        "slaclip_target_non_small_clip_fraction",
+        params.get("slaclip_beta", "NA"),
+    )
     eta = params.get("slaclip_eta", "NA")
     print("|".join(str(item) for item in (
-        "train", phase, candidate["id"], role, seed, method, clip, beta, eta,
+        "train", phase, candidate["id"], role, seed, method, clip, rho, eta,
         schedule, arm_root,
     )))
 
@@ -1624,7 +1629,12 @@ for fields, arm_root in zip(all_specs, arm_roots):
         "seed": int(fields[4]),
         "method": fields[5],
         "initial_or_fixed_C": finite(float(fields[6]), "plan C"),
-        "slaclip_beta": "" if fields[7] == "NA" else finite(float(fields[7]), "plan beta"),
+        "slaclip_target_non_small_clip_fraction": (
+            "" if fields[7] == "NA" else finite(float(fields[7]), "plan target")
+        ),
+        # Preserve the old column for readers of pre-migration campaign
+        # indexes. It is an alias of the canonical full-SlaClip target.
+        "slaclip_beta": "" if fields[7] == "NA" else finite(float(fields[7]), "plan target"),
         "slaclip_eta": "" if fields[8] == "NA" else finite(float(fields[8]), "plan eta"),
         "numeric_exact_accuracy": finite(validation.get("numeric_exact_accuracy"), "numeric accuracy"),
         "numeric_exact_correct": int(validation.get("numeric_exact_correct")),
@@ -1692,6 +1702,7 @@ run_index_fields = [
     "seed",
     "method",
     "initial_or_fixed_C",
+    "slaclip_target_non_small_clip_fraction",
     "slaclip_beta",
     "slaclip_eta",
     "numeric_exact_accuracy",

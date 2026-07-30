@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import math
 import sys
 from dataclasses import fields
 from pathlib import Path
@@ -27,6 +28,7 @@ CONFIG_KEY_ALIASES = {
     'steps': 'total_update_steps',
     'lr': 'learning_rate',
     'initial_clip_threshold': 'dp_max_grad_norm',
+    'slaclip_beta': 'slaclip_target_non_small_clip_fraction',
 }
 
 
@@ -126,14 +128,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument('--slaclip_eta', type=float, default=0.5)
-    p.add_argument('--slaclip_beta', type=float, default=0.5)
+    p.add_argument(
+        '--slaclip_target_non_small_clip_fraction',
+        '--slaclip_beta',
+        dest='slaclip_target_non_small_clip_fraction',
+        type=float,
+        default=None,
+        help=(
+            'Full-SlaClip rho: requested clipped fraction of the mass remaining '
+            'after subtracting the noisy small-gradient proxy. The paper default '
+            'is 0.5; this is not a fixed whole-batch clipping rate. '
+            '--slaclip_beta is a deprecated alias.'
+        ),
+    )
     p.add_argument(
         '--slaclip_target_clip_fraction',
         type=float,
-        default=0.99,
+        default=None,
         help=(
-            'Requested clipped fraction for slaclip_q. Internally gamma is the '
-            'complementary target unclipped-CDF proxy; 0.99 therefore maps to gamma=0.01.'
+            'Requested clipped fraction for slaclip_q (default: 0.99). '
+            'Internally gamma is the complementary target unclipped-CDF proxy; '
+            '0.99 therefore maps to gamma=0.01. Invalid with method=slaclip.'
         ),
     )
     p.add_argument('--slaclip_c_min', type=float, default=0.1)
@@ -187,13 +202,43 @@ def _json_defaults(config_path: Path, parser: argparse.ArgumentParser) -> dict:
 
 
 def parse_cli_args(argv=None) -> argparse.Namespace:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument('--config', type=Path, default=None)
-    preliminary, _ = pre_parser.parse_known_args(argv)
+    preliminary, _ = pre_parser.parse_known_args(raw_argv)
     parser = build_parser()
     if preliminary.config is not None:
         parser.set_defaults(**_json_defaults(preliminary.config, parser))
-    args = parser.parse_args(argv)
+    target_aliases = (
+        '--slaclip_target_non_small_clip_fraction',
+        '--slaclip_beta',
+    )
+    explicit_target_values = []
+    for index, token in enumerate(raw_argv):
+        for option in target_aliases:
+            if token == option and index + 1 < len(raw_argv):
+                try:
+                    explicit_target_values.append(float(raw_argv[index + 1]))
+                except ValueError:
+                    pass
+            elif token.startswith(option + '='):
+                try:
+                    explicit_target_values.append(float(token.split('=', 1)[1]))
+                except ValueError:
+                    pass
+    if explicit_target_values and any(
+        not math.isclose(
+            explicit_target_values[0],
+            value,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+        for value in explicit_target_values[1:]
+    ):
+        parser.error(
+            'Conflicting values supplied through full-SlaClip target aliases'
+        )
+    args = parser.parse_args(raw_argv)
     if args.dataset is None:
         parser.error('--dataset is required either on the CLI or in --config')
     for name in ('data_path', 'output_dir', 'result_dir', 'clip_schedule_path'):

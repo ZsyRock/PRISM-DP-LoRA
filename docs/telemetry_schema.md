@@ -22,7 +22,7 @@ The main records contain fields such as:
 | `telemetry_schema_version` | schema version for parser compatibility |
 | `run_id` | readable label, clipping threshold, and short configuration hash |
 | `config_fingerprint` | canonical full experiment fingerprint |
-| `method` | `baseline`, camera-ready full `slaclip`, fixed-target `slaclip_q`, or deterministic `replay` |
+| `method` | `baseline`, dynamic full `slaclip`, fixed-global-target `slaclip_q`, or deterministic `replay` |
 | `privacy` / `telemetry_mode` | training and observation modes |
 | `step` | completed logical update count |
 | `base_model` | requested model ID or local snapshot |
@@ -50,15 +50,42 @@ These fields are emitted to `train_log.jsonl` during DP training. They are publi
 | `slack_unclipped_proxy`, `slack_clipped_proxy` | summaries derived from the noised first coordinate, not exact clipping fractions |
 | `slack_indicator_noise_std` | public normalized per-coordinate noise s.d. `sigma*sqrt(K)/expected_batch_size` |
 | `slaclip_controller` | `slaclip` (dynamic full controller) or `slaclip_q` (fixed-target ablation) |
-| `slaclip_gamma_t`, `slaclip_eta`, `slaclip_beta` | camera-ready full-controller update values |
-| `slaclip_target_clip_fraction` | requested exact-rate label for SlaClip-Q; 0.99 maps internally to an unclipped-proxy target of 0.01 |
-| `slaclip_target_unclipped_proxy`, `slaclip_target_clipped_proxy` | controller target used in the current update; dynamic for full SlaClip and fixed for SlaClip-Q |
+| `slaclip_target_non_small_clip_fraction` | full-SlaClip `rho`: requested clipped fraction within the residual/non-small proxy mass; 0.5 is the paper default |
+| `slaclip_beta` | legacy telemetry alias for the same full-SlaClip `rho`, not a separate gain |
+| `slaclip_small_gradient_proxy_noisy` | full-SlaClip paper proxy `z_t=s_hat_K/C_t` before target projection; DP-safe post-processing of the jointly noised Slack Indicator, so it can lie outside `[0,1]` |
+| `slaclip_remaining_mass_proxy_noisy` | full-SlaClip residual proxy `1-z_t` before target projection; also DP-safe post-processing of the jointly noised release and not a non-private raw measurement |
+| `slaclip_target_unclipped_proxy_preprojection` | full-SlaClip value `1-rho*(1-z_t)` before `Proj_[0,1]` |
+| `slaclip_gamma_t`, `slaclip_target_unclipped_proxy` | projected dynamic target-unclipped proxy `gamma_t` for full SlaClip; fixed target for SlaClip-Q |
+| `slaclip_target_clipped_proxy` | complement of the projected target-unclipped proxy; for full SlaClip it is dynamic, not equal in general to `rho` |
+| `slaclip_observed_unclipped_proxy` | controller observation `s_hat_1`; equivalent to `slack_unclipped_proxy` but named explicitly for the update equation |
+| `slaclip_controller_error` | `target_unclipped_proxy - observed_unclipped_proxy`, whose sign determines the threshold-update direction |
+| `slaclip_eta` | exponential threshold-update gain; this, not `rho`, controls the response step size |
+| `slaclip_target_clip_fraction` | requested fixed global clipped-rate label for SlaClip-Q; 0.99 maps internally to an unclipped-proxy target of 0.01 |
 | `slaclip_c_next_unbounded`, `slaclip_c_min/max`, `slaclip_c_hit_min/max` | pre-clamp candidate, declared bounds, and post-processing bound diagnostics |
 | `slaclip_num_slots` | Slack Indicator dimension `K`; either SlaClip controller only |
 | `dp_noisy_tangent_gradient_norm` | norm of the noised tangent-gradient release |
 | `dp_factor_product_update_norm` | exact norm of the resulting low-rank product update, a function of the released model transition |
 | `dp_floor*`, `dp_precond_*`, `dp_trust_ratio_*`, `dp_update_clip_coef_min` | numerical optimizer diagnostics computed while post-processing the noised release |
 | `eps_spent` | accountant epsilon after this completed update at configured delta |
+
+For full SlaClip, the safe telemetry fields above encode
+
+```text
+z_t = s_hat_K / C_t
+gamma_t = Proj_[0,1](1 - rho * (1 - z_t))
+C_next = clip(C_t * exp(eta * (gamma_t - s_hat_1)), c_min, c_max)
+```
+
+The paper-default `rho=0.5` yields its literal `1/2`. A different `rho` remains
+full SlaClip because the global target still depends on `s_hat_K`. By contrast,
+SlaClip-Q omits `s_hat_K` and supplies a fixed target for `s_hat_1`. Neither the
+full conditional `rho` nor the SlaClip-Q requested label is an exact achieved
+clipping fraction; exact achievement is available only as non-private
+`raw_clip_fraction`. A positive `slaclip_controller_error` increases `C_t` and
+tends to reduce clipping; a negative value decreases `C_t` and tends to
+increase clipping. The `_noisy` proxy fields belong to `train_log.jsonl` and
+must not be confused with `_raw` fields in the explicitly non-private
+`research_raw` artifact.
 
 `dp_safe` intentionally does **not** emit the exact DP-training loss, target-token count, exact per-record norm distribution, exact clipping fraction, unclipped signal, clipping bias, or realized noise decomposition. In particular, it does not log an actual noise norm: revealing output and its exact random-noise decomposition together can reveal the pre-noise signal.
 

@@ -36,7 +36,7 @@
   "prism_debias_second_moment": false,
   "slaclip_num_slots": 0,
   "slaclip_eta": 0.5,
-  "slaclip_beta": 0.5,
+  "slaclip_target_non_small_clip_fraction": 0.5,
   "slaclip_c_min": 0.1,
   "slaclip_c_max": 50.0,
   "checkpoint_every": 25,

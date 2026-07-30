@@ -18,10 +18,11 @@ from .modeling import (
 )
 from .utils import JsonlLogger, adapter_is_complete, build_tokenizer, checkpoint_file, clean_output_dir, cleanup_cuda, collect_runtime_metadata, ensure_text_only_token_type_ids, freeze_vision_tower_params, generate_prompt, get_rng_state, iter_microbatches, llm_adapters_dir, load_resume_checkpoint_if_available, load_trainable_state_dict, save_resume_checkpoint, save_status, set_rng_state, set_seed, tokenize_prompt, truncate_jsonl_to_step, unwrap_for_save, write_json_atomic
 from .validation_math import evaluate_public_math_numeric_exact
+from .slaclip import resolve_full_slaclip_target
 
 
 CHECKPOINT_SCHEMA_VERSION = 4
-TELEMETRY_SCHEMA_VERSION = 4
+TELEMETRY_SCHEMA_VERSION = 5
 LOSS_DEFINITION = 'per_record_mean_of_nonignored_next_token_losses'
 VALIDATION_SPLIT_SCHEMA_VERSION = 1
 
@@ -74,8 +75,9 @@ class RunConfig:
     raw_hist_max: float = 0.0
     slaclip_num_slots: int = 0
     slaclip_eta: float = 0.5
-    slaclip_beta: float = 0.5
-    slaclip_target_clip_fraction: float = 0.99
+    slaclip_target_non_small_clip_fraction: Optional[float] = None
+    slaclip_beta: Optional[float] = None
+    slaclip_target_clip_fraction: Optional[float] = None
     slaclip_c_min: float = 0.1
     slaclip_c_max: float = 50.0
     clip_schedule_path: Optional[Path] = None
@@ -155,8 +157,16 @@ class RunConfig:
             'raw_hist_max': float(self.raw_hist_max),
             'slaclip_num_slots': int(self.slaclip_num_slots),
             'slaclip_eta': float(self.slaclip_eta),
-            'slaclip_beta': float(self.slaclip_beta),
-            'slaclip_target_clip_fraction': float(self.slaclip_target_clip_fraction),
+            'slaclip_target_non_small_clip_fraction': (
+                float(self.slaclip_target_non_small_clip_fraction)
+                if self.method == 'slaclip'
+                else None
+            ),
+            'slaclip_target_clip_fraction': (
+                float(self.slaclip_target_clip_fraction)
+                if self.method == 'slaclip_q'
+                else None
+            ),
             'slaclip_c_min': float(self.slaclip_c_min),
             'slaclip_c_max': float(self.slaclip_c_max),
             # Machine-specific paths never define experiment identity.  For a
@@ -316,10 +326,52 @@ class RunConfig:
             raise ValueError('slaclip_num_slots must be >= 0 (0 selects it automatically)')
         if float(self.slaclip_eta) < 0:
             raise ValueError('slaclip_eta must be non-negative')
-        if not 0.0 <= float(self.slaclip_beta) <= 1.0:
-            raise ValueError('slaclip_beta must be in [0, 1]')
-        if not 0.0 <= float(self.slaclip_target_clip_fraction) <= 1.0:
+        full_target_was_supplied = (
+            self.slaclip_target_non_small_clip_fraction is not None
+            or self.slaclip_beta is not None
+        )
+        q_target_was_supplied = self.slaclip_target_clip_fraction is not None
+        if self.method == 'slaclip' and q_target_was_supplied:
+            raise ValueError(
+                'slaclip_target_clip_fraction is only valid for method=slaclip_q; '
+                'full SlaClip uses slaclip_target_non_small_clip_fraction'
+            )
+        if self.method == 'slaclip_q' and full_target_was_supplied:
+            raise ValueError(
+                'slaclip_target_non_small_clip_fraction/slaclip_beta is only '
+                'valid for method=slaclip'
+            )
+        resolved_full_target = resolve_full_slaclip_target(
+            self.slaclip_target_non_small_clip_fraction,
+            beta=self.slaclip_beta,
+        )
+        resolved_q_target = (
+            0.99
+            if self.slaclip_target_clip_fraction is None
+            else float(self.slaclip_target_clip_fraction)
+        )
+        if not 0.0 <= resolved_q_target <= 1.0:
             raise ValueError('slaclip_target_clip_fraction must be in [0, 1]')
+        if self.method == 'slaclip':
+            self.slaclip_target_non_small_clip_fraction = resolved_full_target
+            # Preserve the old status/config key as a normalized alias so
+            # existing campaign analyzers can still read new artifacts.
+            self.slaclip_beta = resolved_full_target
+            self.slaclip_target_clip_fraction = None
+        elif self.method == 'slaclip_q':
+            self.slaclip_target_non_small_clip_fraction = None
+            self.slaclip_beta = None
+            self.slaclip_target_clip_fraction = resolved_q_target
+        else:
+            # Baseline/replay configs may intentionally carry the target for a
+            # paired adaptive arm, but do not invent inactive defaults.
+            self.slaclip_target_non_small_clip_fraction = (
+                resolved_full_target if full_target_was_supplied else None
+            )
+            self.slaclip_beta = self.slaclip_target_non_small_clip_fraction
+            self.slaclip_target_clip_fraction = (
+                resolved_q_target if q_target_was_supplied else None
+            )
         if float(self.slaclip_c_min) <= 0 or float(self.slaclip_c_max) < float(self.slaclip_c_min):
             raise ValueError('require 0 < slaclip_c_min <= slaclip_c_max')
         if self.method in {'slaclip', 'slaclip_q'} and not (
@@ -936,8 +988,10 @@ def _build_prism_optimizer(cfg: RunConfig, model):
         clipping_method='baseline' if cfg.method == 'replay' else cfg.method,
         slaclip_num_slots=int(cfg.slaclip_num_slots),
         slaclip_eta=float(cfg.slaclip_eta),
-        slaclip_beta=float(cfg.slaclip_beta),
-        slaclip_target_clip_fraction=float(cfg.slaclip_target_clip_fraction),
+        slaclip_target_non_small_clip_fraction=(
+            cfg.slaclip_target_non_small_clip_fraction
+        ),
+        slaclip_target_clip_fraction=cfg.slaclip_target_clip_fraction,
         slaclip_c_min=float(cfg.slaclip_c_min),
         slaclip_c_max=float(cfg.slaclip_c_max),
         telemetry_mode=cfg.telemetry_mode,

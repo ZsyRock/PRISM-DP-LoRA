@@ -9,7 +9,10 @@ from pathlib import Path
 import pytest
 
 import train_eval
-from prism_cli.experiment_identity import git_worktree_identity
+from prism_cli.experiment_identity import (
+    FINGERPRINT_SCHEMA_VERSION,
+    git_worktree_identity,
+)
 from prism_cli.trainers import (
     CHECKPOINT_SCHEMA_VERSION,
     LOSS_DEFINITION,
@@ -103,6 +106,71 @@ def test_slaclip_q_cli_keeps_requested_clipped_fraction_unambiguous() -> None:
     assert args.slaclip_target_clip_fraction == pytest.approx(0.99)
     assert args.slaclip_c_min == pytest.approx(0.1)
     assert args.slaclip_c_max == pytest.approx(15.0)
+
+
+def test_full_slaclip_cli_exposes_conditional_target_and_legacy_alias() -> None:
+    canonical = train_eval.parse_cli_args(
+        [
+            '--dataset',
+            'math10k',
+            '--method',
+            'slaclip',
+            '--slaclip_target_non_small_clip_fraction',
+            '0.975',
+        ]
+    )
+    assert canonical.slaclip_target_non_small_clip_fraction == pytest.approx(
+        0.975
+    )
+    assert not hasattr(canonical, 'slaclip_beta')
+
+    legacy = train_eval.parse_cli_args(
+        [
+            '--dataset',
+            'math10k',
+            '--method',
+            'slaclip',
+            '--slaclip_beta',
+            '0.95',
+        ]
+    )
+    assert legacy.slaclip_target_non_small_clip_fraction == pytest.approx(0.95)
+    assert not hasattr(legacy, 'slaclip_beta')
+
+    with pytest.raises(SystemExit):
+        train_eval.parse_cli_args(
+            [
+                '--dataset',
+                'math10k',
+                '--slaclip_target_non_small_clip_fraction',
+                '0.95',
+                '--slaclip_beta',
+                '0.5',
+            ]
+        )
+
+
+def test_full_target_cli_overrides_legacy_json_default(tmp_path: Path) -> None:
+    config_file = tmp_path / 'legacy.json'
+    config_file.write_text(
+        json.dumps(
+            {
+                'schema_version': 1,
+                'dataset': 'math10k',
+                'slaclip_beta': 0.5,
+            }
+        ),
+        encoding='utf-8',
+    )
+    args = train_eval.parse_cli_args(
+        [
+            '--config',
+            str(config_file),
+            '--slaclip_target_non_small_clip_fraction',
+            '0.875',
+        ]
+    )
+    assert args.slaclip_target_non_small_clip_fraction == pytest.approx(0.875)
 
 
 def test_replay_cli_accepts_schedule_path() -> None:
@@ -320,12 +388,37 @@ def test_training_changes_get_distinct_hashed_directories(tmp_path: Path) -> Non
     third = _config(tmp_path, dp_max_grad_norm=2.0, slaclip_eta=0.2)
     fourth = _config(tmp_path, method='slaclip_q', slaclip_target_clip_fraction=0.99)
     fifth = _config(tmp_path, method='slaclip_q', slaclip_target_clip_fraction=0.98)
+    sixth = _config(
+        tmp_path,
+        slaclip_target_non_small_clip_fraction=0.75,
+    )
+    seventh = _config(
+        tmp_path,
+        slaclip_target_non_small_clip_fraction=0.95,
+    )
     assert first.config_fingerprint != second.config_fingerprint
     assert second.config_fingerprint != third.config_fingerprint
     assert fourth.config_fingerprint != fifth.config_fingerprint
+    assert sixth.config_fingerprint != seventh.config_fingerprint
     assert first.output_dir != second.output_dir
     assert '_C0p5_' in first.run_id
     assert '_C2_' in second.run_id
+
+
+def test_full_target_aliases_normalize_to_one_identity(tmp_path: Path) -> None:
+    canonical = _config(
+        tmp_path,
+        slaclip_target_non_small_clip_fraction=0.8,
+    )
+    legacy = _config(tmp_path, slaclip_beta=0.8)
+    assert canonical.slaclip_target_non_small_clip_fraction == pytest.approx(0.8)
+    assert canonical.slaclip_beta == pytest.approx(0.8)
+    assert canonical.fingerprint_payload() == legacy.fingerprint_payload()
+    assert canonical.config_fingerprint == legacy.config_fingerprint
+    assert canonical.run_id == legacy.run_id
+    assert canonical.fingerprint_payload()['fingerprint_schema_version'] == 7
+    assert FINGERPRINT_SCHEMA_VERSION == 7
+    assert 'slaclip_beta' not in canonical.fingerprint_payload()
 
 
 @pytest.mark.parametrize(
@@ -335,6 +428,10 @@ def test_training_changes_get_distinct_hashed_directories(tmp_path: Path) -> Non
         ({'slaclip_num_slots': -1}, 'slaclip_num_slots'),
         ({'slaclip_eta': -0.1}, 'slaclip_eta'),
         ({'slaclip_beta': 1.1}, 'slaclip_beta'),
+        (
+            {'slaclip_target_non_small_clip_fraction': 1.1},
+            'slaclip_target_non_small_clip_fraction',
+        ),
         ({'slaclip_target_clip_fraction': 1.1}, 'slaclip_target_clip_fraction'),
         ({'dp_max_grad_norm': 0.05}, 'initial C'),
     ],
@@ -343,6 +440,47 @@ def test_slaclip_and_checkpoint_ranges_are_validated(tmp_path: Path, overrides: 
     _write_math_data(tmp_path)
     with pytest.raises(ValueError, match=message):
         RunConfig(dataset='math10k', method='slaclip', privacy='dp', root=tmp_path, **overrides).finalize()
+
+
+def test_full_slaclip_target_alias_conflict_fails_closed(tmp_path: Path) -> None:
+    _write_math_data(tmp_path)
+    with pytest.raises(ValueError, match='conflicts'):
+        RunConfig(
+            dataset='math10k',
+            method='slaclip',
+            privacy='dp',
+            root=tmp_path,
+            slaclip_target_non_small_clip_fraction=0.75,
+            slaclip_beta=0.5,
+        ).finalize()
+
+
+def test_full_and_q_target_names_cannot_be_silently_crossed(tmp_path: Path) -> None:
+    _write_math_data(tmp_path)
+    with pytest.raises(ValueError, match='only valid for method=slaclip_q'):
+        RunConfig(
+            dataset='math10k',
+            method='slaclip',
+            privacy='dp',
+            root=tmp_path,
+            slaclip_target_clip_fraction=0.99,
+        ).finalize()
+    with pytest.raises(ValueError, match='only valid for method=slaclip'):
+        RunConfig(
+            dataset='math10k',
+            method='slaclip_q',
+            privacy='dp',
+            root=tmp_path,
+            slaclip_target_non_small_clip_fraction=0.5,
+        ).finalize()
+    with pytest.raises(ValueError, match='slaclip_target_clip_fraction'):
+        RunConfig(
+            dataset='math10k',
+            method='slaclip_q',
+            privacy='dp',
+            root=tmp_path,
+            slaclip_target_clip_fraction=1.1,
+        ).finalize()
 
 
 def test_existing_status_with_other_fingerprint_is_rejected(tmp_path: Path) -> None:

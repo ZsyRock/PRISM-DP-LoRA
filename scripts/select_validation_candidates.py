@@ -30,13 +30,18 @@ NUMERIC_EXACT_METRIC = "public_math10k_numeric_exact_match_accuracy"
 SUPPORTED_METRICS = {EXPECTED_METRIC, NUMERIC_EXACT_METRIC}
 EXPECTED_LOSS_DEFINITION = "response_only_per_record_mean_of_nonignored_next_token_losses"
 FIXED_PARAM_KEYS = {"dp_max_grad_norm"}
-SLACLIP_PARAM_KEYS = {
+SLACLIP_COMMON_PARAM_KEYS = {
     "dp_max_grad_norm",
-    "slaclip_beta",
     "slaclip_eta",
     "slaclip_num_slots",
     "slaclip_c_min",
     "slaclip_c_max",
+}
+SLACLIP_TARGET_PARAM_KEY = "slaclip_target_non_small_clip_fraction"
+SLACLIP_LEGACY_TARGET_PARAM_KEY = "slaclip_beta"
+SLACLIP_PARAM_KEYS = SLACLIP_COMMON_PARAM_KEYS | {SLACLIP_TARGET_PARAM_KEY}
+SLACLIP_LEGACY_PARAM_KEYS = SLACLIP_COMMON_PARAM_KEYS | {
+    SLACLIP_LEGACY_TARGET_PARAM_KEY
 }
 FORBIDDEN_PATH_PARTS = {
     "test",
@@ -196,7 +201,12 @@ def _validate_protocol(registry: Mapping[str, Any]) -> dict[str, Any]:
     for key, value in common_config.items():
         if not isinstance(key, str) or not key or isinstance(value, (dict, list)):
             raise SelectionError("selection_protocol.common_config must contain scalar RunConfig fields")
-    forbidden_common = FIXED_PARAM_KEYS | (SLACLIP_PARAM_KEYS - {"dp_max_grad_norm"}) | {"method", "seed"}
+    forbidden_common = (
+        FIXED_PARAM_KEYS
+        | (SLACLIP_PARAM_KEYS - {"dp_max_grad_norm"})
+        | (SLACLIP_LEGACY_PARAM_KEYS - {"dp_max_grad_norm"})
+        | {"method", "seed"}
+    )
     overlap = sorted(set(common_config).intersection(forbidden_common))
     if overlap:
         raise SelectionError(f"common_config contains candidate-specific fields: {overlap}")
@@ -252,11 +262,23 @@ def _candidate_map(registry: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         for key, value in params.items():
             if not isinstance(key, str) or not key or isinstance(value, (dict, list)):
                 raise SelectionError(f"candidate {candidate_id} params must contain scalar config fields")
-        expected_param_keys = FIXED_PARAM_KEYS if family == "fixed" else SLACLIP_PARAM_KEYS
-        if set(params) != expected_param_keys:
+        accepted_param_key_sets = (
+            (FIXED_PARAM_KEYS,)
+            if family == "fixed"
+            else (SLACLIP_PARAM_KEYS, SLACLIP_LEGACY_PARAM_KEYS)
+        )
+        if not any(set(params) == keys for keys in accepted_param_key_sets):
+            expected_text = (
+                sorted(FIXED_PARAM_KEYS)
+                if family == "fixed"
+                else [
+                    sorted(SLACLIP_PARAM_KEYS),
+                    sorted(SLACLIP_LEGACY_PARAM_KEYS),
+                ]
+            )
             raise SelectionError(
                 f"candidate {candidate_id} params must contain exactly transferable fields "
-                f"{sorted(expected_param_keys)}, got {sorted(params)}"
+                f"{expected_text}, got {sorted(params)}"
             )
         candidates[candidate_id] = dict(candidate)
     if not any(item["family"] == "fixed" for item in candidates.values()):

@@ -185,7 +185,7 @@ python train_eval.py \
   --batch_size 4 \
   --micro_batch_size 1 \
   --initial_clip_threshold 1.0 \
-  --slaclip_beta 0.5 \
+  --slaclip_target_non_small_clip_fraction 0.5 \
   --telemetry_mode research_raw \
   --allow_non_private_telemetry \
   --output_dir "$SMOKE_ROOT/slaclip/model" \
@@ -252,7 +252,7 @@ PRISM_MICRO_BATCH_SIZE=4
 PRISM_STEPS=300                 # Math-10K; GLUE8 template defaults to 500
 PRISM_CHECKPOINT_EVERY=10
 PRISM_TELEMETRY_MODE=research_raw
-PRISM_SLACLIP_BETA=0.5
+PRISM_SLACLIP_TARGET_NON_SMALL_CLIP_FRACTION=0.5
 PRISM_SLACLIP_ETA=0.5
 PRISM_SLACLIP_C_MIN=0.1
 PRISM_SLACLIP_C_MAX=50
@@ -260,9 +260,14 @@ PRISM_SLACLIP_NUM_SLOTS=0
 ```
 
 For the baseline, `PRISM_CLIP_NORM` is the fixed clipping threshold. For
-SlaClip, it is the initial threshold `C_0`; SlaClip then adapts it. `beta` is a
-controller parameter, not a fixed target value for `C`. Predeclare custom
-values before looking at test-set results.
+SlaClip, it is the initial threshold `C_0`; SlaClip then adapts it.
+`PRISM_SLACLIP_TARGET_NON_SMALL_CLIP_FRACTION` is full SlaClip's `rho`, the
+target clipped fraction within the noisy residual/non-small mass. Its
+paper-default value is 0.5, and `PRISM_SLACLIP_BETA` is only the legacy name.
+The dynamic global target is
+`Proj_[0,1](1-rho*(1-s_hat_K/C_t))`, so `rho` is neither a fixed global
+clipping rate nor an exact achieved rate. `PRISM_SLACLIP_ETA` is the update
+gain. Predeclare custom values before looking at test-set results.
 
 The templates default to `research_raw` because they are intended for internal
 training-dynamics analysis. Set `PRISM_TELEMETRY_MODE=dp_safe` for release

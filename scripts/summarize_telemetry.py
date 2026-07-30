@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 
-SUMMARY_SCHEMA_VERSION = 3
+SUMMARY_SCHEMA_VERSION = 4
 NON_PRIVATE_WARNING = (
     "Contains exact statistics derived from training examples; this summary is "
     "NON-PRIVATE and must not be treated as a DP release."
@@ -74,6 +74,9 @@ FIELD_ALIASES = {
     "dp_noisy_gradient_norm": "dp_noisy_tangent_gradient_norm",
     "dp_update_norm": "dp_factor_product_update_norm",
     "epsilon": "eps_spent",
+    # ``beta`` was the historical name for full SlaClip's configured target
+    # clipped fraction within the non-small-gradient mass.
+    "slaclip_beta": "slaclip_target_non_small_clip_fraction",
 }
 
 PREFERRED_COLUMNS = (
@@ -103,9 +106,14 @@ PREFERRED_COLUMNS = (
     "replay_clip_schedule_sha256",
     "slaclip_gamma_t",
     "slaclip_eta",
-    "slaclip_beta",
     "slaclip_controller",
+    "slaclip_target_non_small_clip_fraction",
+    "slaclip_beta",
+    "slaclip_small_gradient_proxy_noisy",
+    "slaclip_remaining_mass_proxy_noisy",
+    "slaclip_target_unclipped_proxy_preprojection",
     "slaclip_target_clip_fraction",
+    "slaclip_observed_unclipped_proxy",
     "slaclip_target_unclipped_proxy",
     "slaclip_target_clipped_proxy",
     "slaclip_controller_error",
@@ -125,6 +133,8 @@ PREFERRED_COLUMNS = (
     "raw_global_norm_hist_edges_json",
     "raw_global_norm_hist_overflow",
     "raw_clip_fraction",
+    "raw_clip_fraction_reference_target",
+    "raw_clip_fraction_error_target_kind",
     "raw_clip_fraction_error",
     "raw_clip_coefficient_mean",
     "raw_clip_coefficient_min",
@@ -349,14 +359,41 @@ def add_derived_fields(rows: Sequence[Dict[str, Any]]) -> None:
         )
         if bias_ratio is not None:
             row["raw_clipping_bias_ratio"] = bias_ratio
-        proxy = _finite_number(row.get("slack_unclipped_proxy"))
+        proxy = _finite_number(row.get("slaclip_observed_unclipped_proxy"))
+        if proxy is None:
+            proxy = _finite_number(row.get("slack_unclipped_proxy"))
         target_proxy = _finite_number(row.get("slaclip_target_unclipped_proxy"))
         if proxy is not None and target_proxy is not None:
             row["slaclip_controller_error"] = target_proxy - proxy
         raw_clip = _finite_number(row.get("raw_clip_fraction"))
-        requested_clip = _finite_number(row.get("slaclip_target_clip_fraction"))
-        if raw_clip is not None and requested_clip is not None:
-            row["raw_clip_fraction_error"] = raw_clip - requested_clip
+        controller = str(
+            row.get("slaclip_controller") or row.get("method") or ""
+        ).casefold()
+        reference_clip: Optional[float] = None
+        reference_kind: Optional[str] = None
+        if controller == "slaclip":
+            # Full SlaClip's configured rho applies only to the mass remaining
+            # after its near-zero/small-gradient proxy. Consequently the
+            # per-step comparison target is dynamic, not rho itself.
+            reference_clip = _finite_number(
+                row.get("slaclip_target_clipped_proxy")
+            )
+            if reference_clip is None:
+                legacy_gamma = _finite_number(row.get("slaclip_gamma_t"))
+                if legacy_gamma is not None:
+                    reference_clip = 1.0 - legacy_gamma
+            reference_kind = "full_dynamic_clipped_proxy"
+        elif controller == "slaclip_q":
+            # SlaClip-Q deliberately ignores the near-zero endpoint and tracks
+            # one fixed requested global clipped fraction.
+            reference_clip = _finite_number(
+                row.get("slaclip_target_clip_fraction")
+            )
+            reference_kind = "slaclip_q_fixed_clipped_fraction"
+        if raw_clip is not None and reference_clip is not None:
+            row["raw_clip_fraction_reference_target"] = reference_clip
+            row["raw_clip_fraction_error_target_kind"] = reference_kind
+            row["raw_clip_fraction_error"] = raw_clip - reference_clip
         loss = _finite_number(row.get("loss_mean"))
         if loss is not None:
             if previous_loss is not None:

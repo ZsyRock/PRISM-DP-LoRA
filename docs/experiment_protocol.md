@@ -7,7 +7,31 @@ The official primary comparison has exactly two method labels:
 1. `baseline`: fixed-threshold PRISM;
 2. `slaclip`: full SlaClip controlling the threshold of that same PRISM mechanism.
 
-The interface additionally supports `slaclip_q` for a separately labelled fixed-target ablation. It must not be substituted for `slaclip` in a table claiming to evaluate the camera-ready full controller. In either adaptive arm, `--initial_clip_threshold` is `C_0`; in the baseline arm it is the fixed `C`. `--dp_max_grad_norm` is only a legacy alias.
+The interface additionally supports `slaclip_q` for a separately labelled
+fixed-target ablation. It must not be substituted for `slaclip` in a table
+claiming to evaluate the camera-ready full controller. In either adaptive arm,
+`--initial_clip_threshold` is `C_0`; in the baseline arm it is the fixed `C`.
+`--dp_max_grad_norm` is only a legacy alias.
+
+Full SlaClip has a tunable conditional target. Write
+`rho=slaclip_target_non_small_clip_fraction`,
+`z_t=s_hat_K/C_t`, and let `s_hat_1` be the noised near-threshold unclipped-CDF
+proxy. Its update is
+
+```text
+gamma_t = Proj_[0,1](1 - rho * (1 - z_t))
+C_next = clip(C_t * exp(eta * (gamma_t - s_hat_1)), c_min, c_max)
+```
+
+Here `z_t` is the paper's noisy, threshold-adjusted proxy for near-zero
+small-gradient mass. Consequently, `rho` is the target clipped fraction within
+the residual/non-small proxy mass `1-z_t`; the dynamic global clipped proxy is
+`1-gamma_t` (equal to `rho*(1-z_t)` before projection). `rho=0.5` reproduces
+the paper's literal `1/2`, and `slaclip_beta` is the legacy name for the same
+quantity. `rho` is neither a fixed global clipping rate nor a promise about
+exact `raw_clip_fraction`; `eta` is the threshold-update gain. A positive
+`gamma_t-s_hat_1` increases `C_t` and tends to reduce clipping, while a negative
+error decreases `C_t` and tends to increase clipping.
 
 For a paired run, keep every field identical except `method` and fields that only have an effect in the SlaClip arm (`slaclip_*`). Match at least:
 
@@ -79,11 +103,19 @@ bash scripts/run_math10k_pair.sh \
   --run_eval false
 ```
 
-For SlaClip, predeclare `eta`, `beta`, `c_min`, `c_max`, and either `K` or automatic `K=0`. `beta` is a feedback coefficient in the full controller and must not be described as a fixed clipping-rate target.
+For full SlaClip, predeclare
+`slaclip_target_non_small_clip_fraction` (`rho`), `eta`, `c_min`, `c_max`, and
+either `K` or automatic `K=0`. Use `rho=0.5` for the paper-default arm.
+Sweeping `rho` retains the full controller because `s_hat_K` still determines
+the dynamic global target; report other values as a target-conditioned
+full-SlaClip extension. Do not describe `rho` as the exact or fixed global
+clipping fraction. The legacy `slaclip_beta` spelling has the same semantics.
 
 ### Fixed 99%-clipped SlaClip-Q ablation
 
-The first Slack Indicator coordinate is a noisy, bin-averaged surrogate for the *unclipped* CDF near `C_t`. A requested clipped fraction of 0.99 therefore maps to the SlaClip-Q target `gamma=0.01`:
+The first Slack Indicator coordinate is a noisy, bin-averaged surrogate for the
+*unclipped* CDF near `C_t`. SlaClip-Q ignores `s_hat_K`, so a requested fixed
+global clipped fraction of 0.99 maps to the SlaClip-Q target `gamma=0.01`:
 
 ```text
 C_next = clip(C_t * exp(eta * (0.01 - s_hat_1)), 0.1, 15)
@@ -98,7 +130,13 @@ bash scripts/run_math10k_q99_pair.sh --model_revision "$MODEL_REVISION" --run_ev
 bash scripts/run_glue8_q99_pair.sh --model_revision "$MODEL_REVISION" --run_eval false
 ```
 
-The Q99 configs use `eta=0.2`, matching the official SlaClip CLI default/example. This tracks a noisy proxy and does not guarantee that exact `raw_clip_fraction` is 0.99. Report `slack_unclipped_proxy`, its 0.01 target, controller error, `C_t`, bound-hit rates, and access-controlled exact clipping diagnostics across predeclared seeds. Keep the official full-SlaClip result as a separate arm.
+The Q99 configs use `eta=0.2`, matching the official SlaClip CLI
+default/example. This tracks a noisy proxy and does not guarantee that exact
+`raw_clip_fraction` is 0.99. Report `slack_unclipped_proxy`, its fixed 0.01
+target, controller error, `C_t`, bound-hit rates, and access-controlled exact
+clipping diagnostics across predeclared seeds. Keep both the paper-default full
+SlaClip (`rho=0.5`) and any predeclared target-conditioned full-SlaClip arms
+separate from SlaClip-Q.
 
 ### Validation-budget-matched comparison
 
@@ -114,9 +152,11 @@ For the journal-extension campaign, use a fixed public Math-10K holdout rather
 than choosing a controller from exact clipping telemetry.  A baseline clipping
 fraction of 100% is a censored statistic: its median contains no information
 about how far the gradient norms lie above `C`, so it must not be converted
-mechanically into a SlaClip target.  Full SlaClip also has no fixed clipping-rate
-target; `beta` controls the dynamic target constructed from the noised Slack
-Indicator.
+mechanically into a full-SlaClip `rho`. Full SlaClip predeclares a conditional
+target `rho`, but its global clipped target remains dynamic because it is
+`rho*(1-z_t)` before projection. Candidate `rho` values must be selected under
+the same public-validation budget as other tuned controller parameters, not
+from task-test results or private exact clipping telemetry.
 
 The implemented selection protocol is:
 

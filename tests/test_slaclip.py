@@ -19,7 +19,9 @@ from prism_cli.optim.prism import (
 from prism_cli.slaclip import (
     automatic_num_slots,
     build_slack_vectors,
+    full_slaclip_threshold_update,
     paper_bound_num_slots,
+    resolve_full_slaclip_target,
     slaclip_q_threshold_update,
     slack_indicator_noise_std,
     update_slaclip_threshold,
@@ -258,17 +260,66 @@ def test_automatic_num_slots_uses_paper_formula_at_and_above_128() -> None:
 
 
 def test_full_slaclip_controller_uses_near_zero_coordinate() -> None:
-    indicator = torch.tensor([0.25, 0.50])
+    # Use C != 1 to lock the paper/official implementation's threshold-
+    # adjusted small-gradient proxy s_hat[K] / C.
+    indicator = torch.tensor([0.20, 0.40])
     c_next, gamma_t = update_slaclip_threshold(
-        1.0,
+        2.0,
         indicator,
         eta=0.5,
         beta=0.5,
         c_min=0.1,
         c_max=10.0,
     )
-    assert gamma_t == pytest.approx(0.75, abs=1e-6)
-    assert c_next == pytest.approx(math.exp(0.5 * (0.75 - 0.25)), rel=1e-6)
+    assert gamma_t == pytest.approx(0.60, abs=1e-6)
+    assert c_next == pytest.approx(
+        2.0 * math.exp(0.5 * (0.60 - 0.20)),
+        rel=1e-6,
+    )
+
+
+@pytest.mark.parametrize(
+    ("rho", "expected_gamma"),
+    [(0.0, 1.0), (0.5, 0.60), (0.75, 0.40), (1.0, 0.20)],
+)
+def test_full_slaclip_configures_non_small_target_fraction(
+    rho: float,
+    expected_gamma: float,
+) -> None:
+    update = full_slaclip_threshold_update(
+        2.0,
+        torch.tensor([0.20, 0.40]),
+        eta=0.5,
+        c_min=0.1,
+        c_max=10.0,
+        target_non_small_clip_fraction=rho,
+    )
+    assert update.small_gradient_proxy_noisy == pytest.approx(0.20, abs=1e-6)
+    assert update.remaining_mass_proxy_noisy == pytest.approx(0.80, abs=1e-6)
+    assert update.target_unclipped_proxy_preprojection == pytest.approx(
+        expected_gamma,
+        abs=1e-6,
+    )
+    assert update.target_unclipped_proxy == pytest.approx(
+        expected_gamma,
+        abs=1e-6,
+    )
+    assert update.observed_unclipped_proxy == pytest.approx(0.20)
+    assert update.controller_error == pytest.approx(
+        expected_gamma - 0.20,
+        abs=1e-6,
+    )
+
+
+def test_full_slaclip_target_legacy_alias_is_compatible_and_conflict_safe() -> None:
+    assert resolve_full_slaclip_target() == pytest.approx(0.5)
+    assert resolve_full_slaclip_target(beta=0.75) == pytest.approx(0.75)
+    assert resolve_full_slaclip_target(0.75, beta=0.75) == pytest.approx(0.75)
+    with pytest.raises(ValueError, match="conflicts"):
+        resolve_full_slaclip_target(0.75, beta=0.5)
+    for invalid in (float("nan"), float("inf"), -0.1, 1.1):
+        with pytest.raises(ValueError, match="must be in"):
+            resolve_full_slaclip_target(invalid)
 
 
 @pytest.mark.parametrize(
@@ -323,6 +374,7 @@ def _make_optimizer(
     eps: float = 1e-8,
     num_slots: int = 3,
     clipping_method: str = 'baseline',
+    target_non_small_clip_fraction: float | None = None,
     target_clip_fraction: float = 0.99,
     c_min: float = 0.1,
     c_max: float = 50.0,
@@ -337,6 +389,7 @@ def _make_optimizer(
         eps=eps,
         clipping_method=clipping_method,
         slaclip_num_slots=num_slots,
+        slaclip_target_non_small_clip_fraction=target_non_small_clip_fraction,
         slaclip_target_clip_fraction=target_clip_fraction,
         slaclip_c_min=c_min,
         slaclip_c_max=c_max,
@@ -451,7 +504,51 @@ def test_slaclip_emits_noisy_indicator_and_updates_threshold() -> None:
     assert 'slack_indicator' in opt.last_log
     assert opt.last_log['slaclip_num_slots'] == 3
     assert 'slaclip_gamma_t' in opt.last_log
+    assert opt.last_log[
+        'slaclip_target_non_small_clip_fraction'
+    ] == pytest.approx(0.5)
+    assert 'slaclip_small_gradient_proxy_noisy' in opt.last_log
+    assert 'slaclip_remaining_mass_proxy_noisy' in opt.last_log
+    assert 'slaclip_target_unclipped_proxy_preprojection' in opt.last_log
+    assert 'slaclip_observed_unclipped_proxy' in opt.last_log
+    assert 'slaclip_controller_error' in opt.last_log
     assert opt.last_log['dp_next_clip_threshold'] == pytest.approx(opt.current_clip)
+
+
+def test_full_target_is_postprocessing_of_same_current_step_dp_release() -> None:
+    torch.manual_seed(101)
+    grad_a = torch.randn(4, 2, 3)
+    grad_b = torch.randn(4, 4, 2)
+    results = []
+    for rho in (0.25, 0.9):
+        opt, p_a, p_b = _make_optimizer(
+            'dp_safe',
+            clipping_method='slaclip',
+            target_non_small_clip_fraction=rho,
+        )
+        opt.dp_begin(
+            max_grad_norm=1.0,
+            expected_batch_size=4,
+            noise_multiplier=0.8,
+        )
+        _set_grad_samples(p_a, p_b, grad_a, grad_b)
+        opt.dp_accumulate()
+        torch.manual_seed(202)
+        opt.dp_finalize(noise_multiplier=0.8)
+        results.append(
+            (
+                p_a.detach().clone(),
+                p_b.detach().clone(),
+                list(opt.last_log['slack_indicator']),
+                float(opt.current_clip),
+            )
+        )
+
+    first, second = results
+    assert torch.equal(first[0], second[0])
+    assert torch.equal(first[1], second[1])
+    assert first[2] == pytest.approx(second[2])
+    assert first[3] != pytest.approx(second[3])
 
 
 def test_slaclip_q_99_optimizer_records_proxy_target_noise_and_bounds() -> None:
@@ -567,6 +664,28 @@ def test_optimizer_checkpoint_rejects_different_slaclip_q_target() -> None:
     )
     with pytest.raises(ValueError, match='slaclip_target_clip_fraction'):
         target.load_state_dict(saved)
+
+
+def test_optimizer_checkpoint_restores_old_beta_alias_and_rejects_new_target() -> None:
+    source, _, _ = _make_optimizer(
+        clipping_method='slaclip',
+        target_non_small_clip_fraction=0.75,
+    )
+    saved = source.state_dict()
+    saved['_prism_runtime'].pop('slaclip_target_non_small_clip_fraction')
+
+    compatible, _, _ = _make_optimizer(
+        clipping_method='slaclip',
+        target_non_small_clip_fraction=0.75,
+    )
+    compatible.load_state_dict(saved)
+
+    incompatible, _, _ = _make_optimizer(
+        clipping_method='slaclip',
+        target_non_small_clip_fraction=0.5,
+    )
+    with pytest.raises(ValueError, match='target_non_small'):
+        incompatible.load_state_dict(saved)
 
 
 def test_automatic_slots_resolve_once_and_restore_from_checkpoint() -> None:

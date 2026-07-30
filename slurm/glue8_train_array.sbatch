@@ -62,7 +62,16 @@ if [[ -z "${MODEL_REVISION}" || "${MODEL_REVISION}" == "main" ]]; then
   exit 2
 fi
 TELEMETRY_MODE="${PRISM_TELEMETRY_MODE:-research_raw}"
-SLACLIP_BETA="${PRISM_SLACLIP_BETA:-0.5}"
+# Legacy environment-variable spelling retained for portable old launch
+# environments. Its value is full SlaClip's target clipped fraction within the
+# non-small-gradient mass, not an optimizer feedback gain.
+if [[ -n "${PRISM_SLACLIP_TARGET_NON_SMALL_CLIP_FRACTION:-}" \
+      && -n "${PRISM_SLACLIP_BETA:-}" \
+      && "${PRISM_SLACLIP_TARGET_NON_SMALL_CLIP_FRACTION}" != "${PRISM_SLACLIP_BETA}" ]]; then
+  echo "Conflicting canonical and legacy full-SlaClip target values." >&2
+  exit 2
+fi
+SLACLIP_TARGET_NON_SMALL="${PRISM_SLACLIP_TARGET_NON_SMALL_CLIP_FRACTION:-${PRISM_SLACLIP_BETA:-0.5}}"
 SLACLIP_ETA="${PRISM_SLACLIP_ETA:-0.5}"
 SLACLIP_C_MIN="${PRISM_SLACLIP_C_MIN:-0.1}"
 SLACLIP_C_MAX="${PRISM_SLACLIP_C_MAX:-50.0}"
@@ -71,7 +80,7 @@ SLACLIP_NUM_SLOTS="${PRISM_SLACLIP_NUM_SLOTS:-0}"
 BASE_RUN_ID="${PRISM_RUN_ID:-${SLURM_ARRAY_JOB_ID:-manual}}"
 RUN_KEY="glue8_${METHOD}_eps${EPSILON}_C${CLIP_NORM}_seed${SEED}_${BASE_RUN_ID}_task${TASK_ID}"
 if [[ "${METHOD}" == "slaclip" ]]; then
-  RUN_KEY+="_beta${SLACLIP_BETA}_eta${SLACLIP_ETA}"
+  RUN_KEY+="_rho${SLACLIP_TARGET_NON_SMALL}_eta${SLACLIP_ETA}"
 fi
 OUTPUT_DIR="${RUN_ROOT}/trained_models/${RUN_KEY}"
 RESULT_DIR="${RUN_ROOT}/experiment/${RUN_KEY}"
@@ -137,7 +146,7 @@ esac
 
 if [[ "${METHOD}" == "slaclip" ]]; then
   train_cmd+=(
-    --slaclip_beta "${SLACLIP_BETA}"
+    --slaclip_target_non_small_clip_fraction "${SLACLIP_TARGET_NON_SMALL}"
     --slaclip_eta "${SLACLIP_ETA}"
     --slaclip_c_min "${SLACLIP_C_MIN}"
     --slaclip_c_max "${SLACLIP_C_MAX}"

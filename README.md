@@ -3,10 +3,29 @@
 This repository provides reproducible, separately labelled comparisons among:
 
 - `baseline`: PRISM with a fixed clipping threshold `C`;
-- `slaclip`: the camera-ready full SlaClip controller, whose target is dynamically constructed from the jointly noised Slack Indicator;
+- `slaclip`: the camera-ready full SlaClip controller, whose global target is dynamically constructed from the jointly noised Slack Indicator and a predeclared conditional target fraction;
 - `slaclip_q`: the paper's fixed-target SlaClip-Q ablation applied to PRISM.
 
-The official full-SlaClip comparison remains `baseline` versus `slaclip`. The requested “99% clipped” experiment is explicitly named SlaClip-Q-99: SlaClip's first indicator coordinate estimates a smoothed *unclipped* CDF near `C_t`, so a requested clipped fraction of `0.99` maps to the fixed target `gamma=0.01`. It must not be reported as the full controller, and the noisy proxy target does not guarantee that the exact clipping fraction equals 99%.
+For full SlaClip, let `rho=slaclip_target_non_small_clip_fraction`, let
+`s_hat_1` denote the noisy near-threshold *unclipped* CDF proxy, and let
+`z_t=s_hat_K/C_t` denote the paper's noisy, threshold-adjusted small-gradient
+proxy. The controller uses
+`gamma_t=Proj_[0,1](1-rho*(1-z_t))` and
+`C_(t+1)=C_t*exp(eta*(gamma_t-s_hat_1))`, followed by the declared threshold
+bounds. Thus `rho` is the target clipped fraction of the residual/non-small
+mass after accounting for `z_t`; it is not a fixed global clipping rate and is
+not guaranteed to equal the exact realized clipping fraction. `rho=0.5`
+reproduces the paper's literal `1/2`, while `eta` is the threshold-update gain.
+When `gamma_t-s_hat_1` is positive the controller increases `C_t`, tending to
+reduce clipping; when it is negative the controller decreases `C_t`, tending
+to increase clipping. The legacy name `slaclip_beta` refers to the same `rho`.
+
+SlaClip-Q is different: it omits `s_hat_K` and tracks a fixed global
+unclipped-CDF target. A requested SlaClip-Q global clipped fraction of `0.99`
+therefore maps to the fixed target `gamma=0.01`. A full-SlaClip run with
+`rho=0.99` remains full SlaClip because its global target still changes with
+`z_t`; it must not be labelled SlaClip-Q-99. Neither controller's noisy proxy
+target guarantees an exact achieved clipping fraction.
 
 Every paired launcher keeps the model, data order, Poisson sampling, optimizer, privacy target, accountant, noise multiplier, update count, LoRA setup, and evaluation settings identical. Only the declared clipping controller differs.
 
@@ -111,7 +130,8 @@ python train_eval.py \
   --config configs/math10k_paper.json \
   --method slaclip \
   --model_revision "$MODEL_REVISION" \
-  --initial_clip_threshold 1.0
+  --initial_clip_threshold 1.0 \
+  --slaclip_target_non_small_clip_fraction 0.5
 ```
 
 `--initial_clip_threshold` means fixed `C` for `baseline` and initial `C_0` for either adaptive controller. `--dp_max_grad_norm` remains only as a legacy alias. A custom initial-threshold experiment can therefore use, for example:
@@ -123,7 +143,19 @@ bash scripts/run_math10k_pair.sh \
   --run_eval false
 ```
 
-For full SlaClip, `--slaclip_eta`, `--slaclip_beta`, `--slaclip_c_min`, and `--slaclip_c_max` configure the controller. `beta` is a feedback coefficient, not a fixed clipping-rate target. For SlaClip-Q, `--slaclip_target_clip_fraction 0.99` is converted to the complementary target-unclipped proxy `0.01`. `--slaclip_num_slots 0` follows the journal-extension policy: expected batches below 128 use `K=15`, while batches of 128 or more use the paper-bound formula based on expected batch size and noise multiplier. Small-batch `K=15` remains DP-valid but can exceed the paper's high-probability CDF-monotonicity bound, so experiments must label it as the journal policy rather than a paper-bound choice.
+For full SlaClip, `--slaclip_target_non_small_clip_fraction`,
+`--slaclip_eta`, `--slaclip_c_min`, and `--slaclip_c_max` configure the
+controller. The first option is `rho`, the target clipped fraction within the
+noisy residual/non-small mass; `--slaclip_beta` is its legacy alias. It is not
+a fixed global or exact achieved clipping rate. `eta`, not `rho`, is the
+feedback/update gain. For SlaClip-Q, `--slaclip_target_clip_fraction 0.99` is
+converted to the complementary fixed target-unclipped proxy `0.01`.
+`--slaclip_num_slots 0` follows the journal-extension policy: expected batches
+below 128 use `K=15`, while batches of 128 or more use the paper-bound formula
+based on expected batch size and noise multiplier. Small-batch `K=15` remains
+DP-valid but can exceed the paper's high-probability CDF-monotonicity bound, so
+experiments must label it as the journal policy rather than a paper-bound
+choice.
 
 Journal hyperparameter selection uses a deterministic prompt-grouped public
 holdout, never the task test sets or exact raw clipping telemetry.  Selection
@@ -136,8 +168,10 @@ tie-break. `--validation_eval_interval 50` records the public response-loss
 curve at steps `0, 50, ..., 300`; endpoint predictions, parse-failure counts,
 decoding settings, and hashes are stored with the run. Once locked, formal
 arms use fresh seeds, `--protocol_stage final`, and `--val_set_size 0` to retrain
-on the complete training set before evaluation.  In particular, a saturated
-100% baseline clipping median is not treated as a full-SlaClip target.  See
+on the complete training set before evaluation. In particular, a saturated
+100% baseline clipping median is not mechanically equated with full SlaClip's
+conditional `rho`; candidate `rho` values are predeclared and selected only
+with the public validation protocol. See
 [the experiment protocol](docs/experiment_protocol.md) for the leakage guards
 and public-data privacy boundary.
 
@@ -188,10 +222,19 @@ They include exact record-mean training loss and supervised-token count,
 per-record tangent-gradient norm summaries/histograms, clipping fraction and
 coefficients, clipped and unclipped signal norms, clipping-bias norm, realized
 noise norm, signal-to-noise ratio, exact-vs-noisy Slack/CDF residuals, signal
-cosines, bias/noise ratio, and a bias-squared-plus-noise-squared proxy. The file
-is self-contained and marked `NON_PRIVATE_TELEMETRY`.
+cosines, bias/noise ratio, and a bias-squared-plus-noise-squared proxy. The
+DP-safe controller record separately exposes the requested conditional `rho`,
+the noisy pre-projection small-gradient and remaining-mass proxies, the dynamic
+target before and after projection, the observed `s_hat_1` proxy, and the
+controller error. These proxy fields are post-processing of the jointly noised
+DP-safe Slack Indicator release; they are not `research_raw` measurements.
+The raw file is self-contained and marked `NON_PRIVATE_TELEMETRY`.
 
-For SlaClip-Q-99 dynamics, use `scripts/run_math10k_q99_analysis_pair.sh` (or the GLUE counterpart). Its summary separates the requested exact-rate label, noisy CDF proxy, proxy target, controller error, unbounded/bounded next threshold, and bound-hit flags.
+For SlaClip-Q-99 dynamics, use `scripts/run_math10k_q99_analysis_pair.sh` (or
+the GLUE counterpart). Its summary separates the requested global clipped-rate
+label, noisy CDF proxy, fixed proxy target, controller error,
+unbounded/bounded next threshold, and bound-hit flags. The label is a requested
+proxy target, not a claim that the exact achieved rate is 99%.
 
 To turn one raw trajectory into a step-wise CSV plus a compact JSON summary:
 

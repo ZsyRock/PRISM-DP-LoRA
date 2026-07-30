@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "summarize_telemetry.py"
@@ -106,6 +108,14 @@ def test_summarizer_flattens_metrics_merges_safe_log_and_handles_missing_fields(
                 "dataset": "math10k",
                 "step": 1,
                 "dp_noise_multiplier": 0.9,
+                "slaclip_controller": "slaclip",
+                "slaclip_beta": 0.75,
+                "slaclip_small_gradient_proxy_noisy": 0.6,
+                "slaclip_remaining_mass_proxy_noisy": 0.4,
+                "slaclip_target_unclipped_proxy_preprojection": 0.7,
+                "slaclip_target_unclipped_proxy": 0.7,
+                "slaclip_target_clipped_proxy": 0.3,
+                "slaclip_observed_unclipped_proxy": 0.4,
             },
             {
                 "run_id": "run-a",
@@ -170,6 +180,13 @@ def test_summarizer_flattens_metrics_merges_safe_log_and_handles_missing_fields(
     assert float(rows[0]["raw_bias_noise_squared_error_proxy"]) == 5.0
     assert math.isclose(float(rows[0]["clip_threshold_delta"]), 0.1)
     assert math.isclose(float(rows[1]["epsilon_increment"]), 0.6)
+    assert float(rows[0]["slaclip_target_non_small_clip_fraction"]) == 0.75
+    assert float(rows[0]["raw_clip_fraction_reference_target"]) == 0.3
+    assert rows[0]["raw_clip_fraction_error_target_kind"] == (
+        "full_dynamic_clipped_proxy"
+    )
+    assert math.isclose(float(rows[0]["raw_clip_fraction_error"]), 0.1)
+    assert math.isclose(float(rows[0]["slaclip_controller_error"]), 0.3)
 
     summary = json.loads(json_path.read_text(encoding="utf-8"))
     assert summary["NON_PRIVATE_TELEMETRY"] is True
@@ -187,6 +204,9 @@ def test_summarizer_flattens_metrics_merges_safe_log_and_handles_missing_fields(
     assert summary["metrics"]["raw_slack_indicator_noise_residual_rmse"][
         "mean"
     ] == 0.1
+    assert summary["metrics"]["raw_clip_fraction_error"]["mean"] == pytest.approx(
+        0.1
+    )
     assert summary["field_coverage"]["slaclip_gamma_t"] == {"present": 1, "missing": 2}
     assert summary["boolean_metrics"]["slaclip_c_hit_min"] == {
         "count": 2,

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -17,6 +17,7 @@ from torch import Tensor
 Z_0995 = 2.5758293035489004
 SMALL_BATCH_SLOT_THRESHOLD = 128.0
 SMALL_BATCH_NUM_SLOTS = 15
+PAPER_DEFAULT_TARGET_NON_SMALL_CLIP_FRACTION = 0.5
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,46 @@ class ThresholdUpdate:
     target_unclipped_proxy: float
     hit_lower_bound: bool
     hit_upper_bound: bool
+    target_unclipped_proxy_preprojection: float
+    observed_unclipped_proxy: float
+    controller_error: float
+    small_gradient_proxy_noisy: Optional[float] = None
+    remaining_mass_proxy_noisy: Optional[float] = None
+
+
+def resolve_full_slaclip_target(
+    target_non_small_clip_fraction: Optional[float] = None,
+    *,
+    beta: Optional[float] = None,
+) -> float:
+    """Resolve the full-SlaClip target and its deprecated ``beta`` alias.
+
+    The resolved value is the requested clipped fraction *within the mass left
+    after subtracting the small-gradient proxy*.  The paper's literal ``1/2``
+    corresponds to the default value 0.5.  It is not the full-batch clipping
+    fraction and it is not the controller gain (the latter is ``eta``).
+    """
+
+    if target_non_small_clip_fraction is None and beta is None:
+        value = PAPER_DEFAULT_TARGET_NON_SMALL_CLIP_FRACTION
+    elif target_non_small_clip_fraction is None:
+        value = float(beta)
+    elif beta is None:
+        value = float(target_non_small_clip_fraction)
+    else:
+        target = float(target_non_small_clip_fraction)
+        legacy = float(beta)
+        if not math.isclose(target, legacy, rel_tol=1e-12, abs_tol=1e-12):
+            raise ValueError(
+                "target_non_small_clip_fraction conflicts with legacy beta"
+            )
+        value = target
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(
+            "slaclip_target_non_small_clip_fraction "
+            "(legacy slaclip_beta) must be in [0, 1]"
+        )
+    return float(value)
 
 
 def paper_bound_num_slots(
@@ -134,8 +175,12 @@ def _bounded_exponential_update(
     eta: float,
     error: float,
     target_unclipped_proxy: float,
+    target_unclipped_proxy_preprojection: float,
+    observed_unclipped_proxy: float,
     c_min: float,
     c_max: float,
+    small_gradient_proxy_noisy: Optional[float] = None,
+    remaining_mass_proxy_noisy: Optional[float] = None,
 ) -> ThresholdUpdate:
     # A DP Gaussian coordinate is unbounded.  Clamping the exponent prevents an
     # overflow without inspecting any non-private quantity and is therefore
@@ -149,6 +194,21 @@ def _bounded_exponential_update(
         target_unclipped_proxy=float(target_unclipped_proxy),
         hit_lower_bound=bool(unbounded < float(c_min)),
         hit_upper_bound=bool(unbounded > float(c_max)),
+        target_unclipped_proxy_preprojection=float(
+            target_unclipped_proxy_preprojection
+        ),
+        observed_unclipped_proxy=float(observed_unclipped_proxy),
+        controller_error=float(error),
+        small_gradient_proxy_noisy=(
+            None
+            if small_gradient_proxy_noisy is None
+            else float(small_gradient_proxy_noisy)
+        ),
+        remaining_mass_proxy_noisy=(
+            None
+            if remaining_mass_proxy_noisy is None
+            else float(remaining_mass_proxy_noisy)
+        ),
     )
 
 
@@ -157,16 +217,25 @@ def full_slaclip_threshold_update(
     slack_indicator: Tensor,
     *,
     eta: float,
-    beta: float,
     c_min: float,
     c_max: float,
+    target_non_small_clip_fraction: Optional[float] = None,
+    beta: Optional[float] = None,
 ) -> ThresholdUpdate:
-    """Apply the camera-ready full-SlaClip feedback controller.
+    """Apply full SlaClip with a configurable conditional clipping target.
 
     The first indicator coordinate is a noisy, bin-averaged surrogate for the
-    *unclipped* CDF near ``C_t``.  Full SlaClip constructs a dynamic target from
-    the last (near-zero) coordinate; it does not expose a fixed clipping-rate
-    target.
+    *unclipped* CDF near ``C_t``.  Let ``z_t = s_hat[t,K] / C_t`` be the
+    paper's noisy small-gradient proxy and ``rho`` be
+    ``target_non_small_clip_fraction``.  The dynamic target is
+
+    ``gamma_t = Proj_[0,1](1 - rho * (1 - z_t))``.
+
+    Thus ``rho`` is the requested clipped fraction of the remaining/non-small
+    mass.  The paper-default full controller uses ``rho=0.5``.  The resulting
+    whole-batch clipped proxy ``1-gamma_t`` remains dynamic and is not
+    guaranteed to equal either ``rho`` or the exact realized clipping rate.
+    ``beta`` is retained only as a backwards-compatible alias for ``rho``.
     """
     if clip_threshold <= 0:
         raise ValueError("clip_threshold must be positive")
@@ -174,23 +243,31 @@ def full_slaclip_threshold_update(
         raise ValueError("slack_indicator must be a non-empty vector")
     if eta < 0:
         raise ValueError("eta must be non-negative")
-    if not 0.0 <= beta <= 1.0:
-        raise ValueError("beta must be in [0, 1]")
     if c_min <= 0 or c_max < c_min:
         raise ValueError("require 0 < c_min <= c_max")
 
+    rho = resolve_full_slaclip_target(
+        target_non_small_clip_fraction,
+        beta=beta,
+    )
     c_t = float(clip_threshold)
     near_threshold = float(slack_indicator[0].item())
     near_zero = float(slack_indicator[-1].item())
-    gamma_t = 1.0 - float(beta) * (1.0 - near_zero / (c_t + 1e-6))
-    gamma_t = max(0.0, min(1.0, gamma_t))
+    small_gradient_proxy = near_zero / (c_t + 1e-6)
+    remaining_mass_proxy = 1.0 - small_gradient_proxy
+    gamma_preprojection = 1.0 - rho * remaining_mass_proxy
+    gamma_t = max(0.0, min(1.0, gamma_preprojection))
     return _bounded_exponential_update(
         c_t,
         eta=eta,
         error=gamma_t - near_threshold,
         target_unclipped_proxy=gamma_t,
+        target_unclipped_proxy_preprojection=gamma_preprojection,
+        observed_unclipped_proxy=near_threshold,
         c_min=c_min,
         c_max=c_max,
+        small_gradient_proxy_noisy=small_gradient_proxy,
+        remaining_mass_proxy_noisy=remaining_mass_proxy,
     )
 
 
@@ -229,6 +306,8 @@ def slaclip_q_threshold_update(
         eta=eta,
         error=target_unclipped - near_threshold,
         target_unclipped_proxy=target_unclipped,
+        target_unclipped_proxy_preprojection=target_unclipped,
+        observed_unclipped_proxy=near_threshold,
         c_min=c_min,
         c_max=c_max,
     )

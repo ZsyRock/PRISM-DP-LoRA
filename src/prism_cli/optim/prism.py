@@ -10,6 +10,7 @@ from ..slaclip import (
     automatic_num_slots,
     build_slack_vectors,
     full_slaclip_threshold_update,
+    resolve_full_slaclip_target,
     slaclip_q_threshold_update,
     slack_indicator_noise_std,
 )
@@ -457,7 +458,7 @@ class _DPAccumState:
 
 class PRISM(torch.optim.Optimizer):
 
-    def __init__(self, params: Iterable[torch.nn.Parameter], lr: float=0.0003, betas: Tuple[float, float]=(0.9, 0.999), eps: float=1e-08, weight_decay: float=0.0, rcond: float=1e-06, lora_l_dim: int=0, lora_r_dim: int=-1, use_adaptive: bool=True, dp_precond_floor_factor: float=1.0, dp_floor_mode: str='geometry', precond_cond_max: Optional[float]=10000.0, precond_cond_strategy: str='raise_small', precond_update_mode: str='current', lift_gauge_fix: str='none', gauge_fix_eps: float=1e-12, max_update_norm: float=0.0, use_trust_ratio: bool=False, trust_clip: Tuple[float, float]=(0.0, 10.0), trust_eps: float=1e-12, dp_debias_second_moment: bool=True, log_every: int=1, clipping_method: str='baseline', slaclip_num_slots: int=0, slaclip_eta: float=0.5, slaclip_beta: float=0.5, slaclip_target_clip_fraction: float=0.99, slaclip_c_min: float=0.1, slaclip_c_max: float=50.0, telemetry_mode: str='dp_safe', raw_hist_bins: int=32, raw_hist_max: float=0.0):
+    def __init__(self, params: Iterable[torch.nn.Parameter], lr: float=0.0003, betas: Tuple[float, float]=(0.9, 0.999), eps: float=1e-08, weight_decay: float=0.0, rcond: float=1e-06, lora_l_dim: int=0, lora_r_dim: int=-1, use_adaptive: bool=True, dp_precond_floor_factor: float=1.0, dp_floor_mode: str='geometry', precond_cond_max: Optional[float]=10000.0, precond_cond_strategy: str='raise_small', precond_update_mode: str='current', lift_gauge_fix: str='none', gauge_fix_eps: float=1e-12, max_update_norm: float=0.0, use_trust_ratio: bool=False, trust_clip: Tuple[float, float]=(0.0, 10.0), trust_eps: float=1e-12, dp_debias_second_moment: bool=True, log_every: int=1, clipping_method: str='baseline', slaclip_num_slots: int=0, slaclip_eta: float=0.5, slaclip_beta: Optional[float]=None, slaclip_target_non_small_clip_fraction: Optional[float]=None, slaclip_target_clip_fraction: Optional[float]=None, slaclip_c_min: float=0.1, slaclip_c_max: float=50.0, telemetry_mode: str='dp_safe', raw_hist_bins: int=32, raw_hist_max: float=0.0):
         if lr <= 0:
             raise ValueError('lr must be positive')
         beta1, beta2 = betas
@@ -496,8 +497,12 @@ class PRISM(torch.optim.Optimizer):
             raise ValueError('slaclip_num_slots must be >= 0 (0 selects it automatically)')
         if float(slaclip_eta) < 0:
             raise ValueError('slaclip_eta must be non-negative')
-        if not 0.0 <= float(slaclip_beta) <= 1.0:
-            raise ValueError('slaclip_beta must be in [0, 1]')
+        target_non_small_clip_fraction = resolve_full_slaclip_target(
+            slaclip_target_non_small_clip_fraction,
+            beta=slaclip_beta,
+        )
+        if slaclip_target_clip_fraction is None:
+            slaclip_target_clip_fraction = 0.99
         if not 0.0 <= float(slaclip_target_clip_fraction) <= 1.0:
             raise ValueError('slaclip_target_clip_fraction must be in [0, 1]')
         if float(slaclip_c_min) <= 0 or float(slaclip_c_max) < float(slaclip_c_min):
@@ -530,7 +535,12 @@ class PRISM(torch.optim.Optimizer):
         self.clipping_method = clipping_method
         self.slaclip_num_slots = int(slaclip_num_slots)
         self.slaclip_eta = float(slaclip_eta)
-        self.slaclip_beta = float(slaclip_beta)
+        self.slaclip_target_non_small_clip_fraction = float(
+            target_non_small_clip_fraction
+        )
+        # Keep the historical attribute/checkpoint key readable by existing
+        # analysis code. It is an alias for rho, not a feedback gain.
+        self.slaclip_beta = self.slaclip_target_non_small_clip_fraction
         self.slaclip_target_clip_fraction = float(slaclip_target_clip_fraction)
         self.slaclip_c_min = float(slaclip_c_min)
         self.slaclip_c_max = float(slaclip_c_max)
@@ -559,6 +569,9 @@ class PRISM(torch.optim.Optimizer):
             'current_clip': self.current_clip,
             'slaclip_num_slots': self.slaclip_num_slots,
             'slaclip_eta': self.slaclip_eta,
+            'slaclip_target_non_small_clip_fraction': (
+                self.slaclip_target_non_small_clip_fraction
+            ),
             'slaclip_beta': self.slaclip_beta,
             'slaclip_target_clip_fraction': self.slaclip_target_clip_fraction,
             'slaclip_c_min': self.slaclip_c_min,
@@ -583,9 +596,40 @@ class PRISM(torch.optim.Optimizer):
                 raise ValueError(
                     f"checkpoint clipping_method={saved_method!r} does not match current method={self.clipping_method!r}"
                 )
+            saved_non_small_target = runtime.get(
+                'slaclip_target_non_small_clip_fraction',
+                runtime.get('slaclip_beta'),
+            )
+            if saved_non_small_target is not None and not math.isclose(
+                float(saved_non_small_target),
+                self.slaclip_target_non_small_clip_fraction,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    'checkpoint slaclip_target_non_small_clip_fraction='
+                    f'{saved_non_small_target!r} does not match current value='
+                    f'{self.slaclip_target_non_small_clip_fraction!r}'
+                )
+            saved_legacy_target = runtime.get('slaclip_beta')
+            saved_canonical_target = runtime.get(
+                'slaclip_target_non_small_clip_fraction'
+            )
+            if (
+                saved_legacy_target is not None
+                and saved_canonical_target is not None
+                and not math.isclose(
+                    float(saved_legacy_target),
+                    float(saved_canonical_target),
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError(
+                    'checkpoint has conflicting full-SlaClip target aliases'
+                )
             for key, current in (
                 ('slaclip_eta', self.slaclip_eta),
-                ('slaclip_beta', self.slaclip_beta),
                 ('slaclip_target_clip_fraction', self.slaclip_target_clip_fraction),
                 ('slaclip_c_min', self.slaclip_c_min),
                 ('slaclip_c_max', self.slaclip_c_max),
@@ -1207,9 +1251,11 @@ class PRISM(torch.optim.Optimizer):
                 C,
                 slack_indicator,
                 eta=self.slaclip_eta,
-                beta=self.slaclip_beta,
                 c_min=self.slaclip_c_min,
                 c_max=self.slaclip_c_max,
+                target_non_small_clip_fraction=(
+                    self.slaclip_target_non_small_clip_fraction
+                ),
             )
             c_next = threshold_update.next_clip
             self.current_clip = float(c_next)
@@ -1277,8 +1323,17 @@ class PRISM(torch.optim.Optimizer):
             self.last_log['slaclip_target_unclipped_proxy'] = float(
                 threshold_update.target_unclipped_proxy
             )
+            self.last_log[
+                'slaclip_target_unclipped_proxy_preprojection'
+            ] = float(threshold_update.target_unclipped_proxy_preprojection)
             self.last_log['slaclip_target_clipped_proxy'] = float(
                 1.0 - threshold_update.target_unclipped_proxy
+            )
+            self.last_log['slaclip_observed_unclipped_proxy'] = float(
+                threshold_update.observed_unclipped_proxy
+            )
+            self.last_log['slaclip_controller_error'] = float(
+                threshold_update.controller_error
             )
             self.last_log['slaclip_c_next_unbounded'] = float(
                 threshold_update.unbounded_next_clip
@@ -1289,12 +1344,19 @@ class PRISM(torch.optim.Optimizer):
             self.last_log['slaclip_c_min'] = float(self.slaclip_c_min)
             self.last_log['slaclip_c_max'] = float(self.slaclip_c_max)
             if self.clipping_method == 'slaclip':
-                # Retain the historical name for compatibility with existing
-                # telemetry summaries; it is the dynamic target, not a fixed
-                # clipping fraction.
                 self.last_log['slaclip_gamma_t'] = float(
                     threshold_update.target_unclipped_proxy
                 )
+                self.last_log[
+                    'slaclip_target_non_small_clip_fraction'
+                ] = float(self.slaclip_target_non_small_clip_fraction)
+                self.last_log['slaclip_small_gradient_proxy_noisy'] = float(
+                    threshold_update.small_gradient_proxy_noisy
+                )
+                self.last_log['slaclip_remaining_mass_proxy_noisy'] = float(
+                    threshold_update.remaining_mass_proxy_noisy
+                )
+                # Deprecated telemetry alias retained for old campaign tools.
                 self.last_log['slaclip_beta'] = float(self.slaclip_beta)
             else:
                 self.last_log['slaclip_target_clip_fraction'] = float(
