@@ -22,7 +22,7 @@ The main records contain fields such as:
 | `telemetry_schema_version` | schema version for parser compatibility |
 | `run_id` | readable label, clipping threshold, and short configuration hash |
 | `config_fingerprint` | canonical full experiment fingerprint |
-| `method` | `baseline`, camera-ready full `slaclip`, or fixed-target `slaclip_q` |
+| `method` | `baseline`, camera-ready full `slaclip`, fixed-target `slaclip_q`, or deterministic `replay` |
 | `privacy` / `telemetry_mode` | training and observation modes |
 | `step` | completed logical update count |
 | `base_model` | requested model ID or local snapshot |
@@ -42,7 +42,8 @@ These fields are emitted to `train_log.jsonl` during DP training. They are publi
 | `dp_expected_batch_size` | fixed normalization denominator used by the mechanism |
 | `dp_noise_multiplier` | calibrated Gaussian noise multiplier |
 | `dp_clip_threshold` | threshold `C_t` used for this update |
-| `dp_next_clip_threshold` | threshold selected for the next update; equal to `C_t` for baseline |
+| `dp_next_clip_threshold` | threshold selected for the next update; equal to `C_t` for baseline and read from the locked schedule for replay |
+| `replay_schedule_index` / `replay_clip_schedule_sha256` | zero-based schedule entry used for this update and identity of the immutable replay input; replay only |
 | `dp_std_per_factor` | base per-factor scale `noise_multiplier * C_t / expected_batch_size` before geometry-aware factor mapping |
 | `dp_tangent_noise_sampler` / `dp_tangent_query_chart` / `dp_factor_rank_rcond` / `dp_factor_relative_gram_eigenvalue_min` | exact full-rank QR tangent sampler and matching isometric query-chart identifiers, fail-closed numerical-rank tolerance, and the minimum checked relative Gram eigenvalue across all LoRA factors |
 | `slack_indicator` | jointly noised Slack Indicator vector; either SlaClip controller only |
@@ -84,12 +85,32 @@ Every raw record is marked `NON_PRIVATE_TELEMETRY: true` and adds:
 | `raw_clipping_bias_norm` | norm of the difference between unclipped and clipped signals |
 | `raw_realized_noise_norm` | norm of the realized tangent noise |
 | `raw_signal_to_noise_ratio` | clipped signal norm divided by realized noise norm |
+| `raw_slack_indicator` | exact, unnoised Slack Indicator using the same `lambda=C/sqrt(K)` and expected-batch denominator as the released indicator; adaptive SlaClip arms only |
+| `raw_slack_indicator_noise_residual` | per-slot released indicator minus exact indicator; its L2 norm, RMSE, and first-coordinate residual are also recorded |
+| `raw_unclipped_clipped_cosine` | cosine between the exact unclipped and clipped tangent signals |
+| `raw_clipped_noisy_cosine` | cosine between the clipped signal and its realized noised release |
+| `raw_clipping_bias_to_noise_ratio` | clipping-bias norm divided by realized-noise norm |
+| `raw_bias_noise_squared_error_proxy` | sum of squared clipping-bias and realized-noise norms; a diagnostic proxy, not an exact squared total error because it omits the cross term |
 | `raw_global_norm_mean/std/min/max` | exact per-record tangent-gradient norm summaries |
 | `raw_global_norm_quantiles` | exact quantiles at 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, and 0.99 |
 | `raw_global_norm_hist_counts` / `raw_global_norm_hist_edges` | fixed-edge norm histogram |
 | `raw_global_norm_hist_overflow` | records above the histogram's upper edge |
 
 By default the histogram upper edge is `4 * C_0`, fixed for the run, and `raw_hist_bins` defaults to 32. A fixed edge makes distributions comparable across adaptive steps. `raw_hist_max` can set another predeclared fixed edge. Histogram resolution is independent of SlaClip's `K`.
+
+`replay` loads exactly one positive finite threshold per update from
+`--clip_schedule_path`. The file-byte SHA256 and provenance metadata are stored
+in status, and the SHA participates in the experiment fingerprint and resume
+checkpoint identity. Replay uses the baseline gradient mechanism with `C_t`
+supplied before each update; it never constructs Slack coordinates. Consequently
+the exact Slack/CDF fields are absent from replay and baseline raw logs.
+
+The replay run's accountant is conditional on that locked schedule. If the
+schedule was derived from private-data-dependent releases (for example, one or
+more earlier SlaClip trajectories), an end-to-end privacy statement must compose
+the privacy cost of those source releases with the replay run. Run status records
+this scope and propagates the schedule's declared privacy class; it must not be
+read as a fresh standalone epsilon claim.
 
 ## Loss interpretation
 

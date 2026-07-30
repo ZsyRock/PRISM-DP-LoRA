@@ -364,6 +364,37 @@ def _tangent_fro_norm_sq(dA: Tensor, dB: Tensor, A: Tensor, B: Tensor) -> Tensor
         return term1 + term2 + 2.0 * term3
     raise ValueError(f'dA must be 2D or 3D, got {dA.ndim}D')
 
+
+def _tangent_fro_inner_product(
+    dA: Tensor,
+    dB: Tensor,
+    eA: Tensor,
+    eB: Tensor,
+    A: Tensor,
+    B: Tensor,
+) -> Tensor:
+    """Inner product of two induced tangent matrices without densifying them."""
+
+    if any(value.ndim != 2 for value in (dA, dB, eA, eB)):
+        raise ValueError('_tangent_fro_inner_product expects four 2D lifts')
+    M = A.T @ A
+    N = B.T @ B
+    term_aa = torch.sum((dA.T @ eA) * N)
+    term_bb = torch.sum((dB.T @ eB) * M)
+    term_ab = torch.sum((A.T @ dA) * (B.T @ eB).T)
+    term_ba = torch.sum((A.T @ eA) * (B.T @ dB).T)
+    return term_aa + term_bb + term_ab + term_ba
+
+
+def _cosine_from_inner(inner: float, first_norm_sq: float, second_norm_sq: float) -> float:
+    denominator = math.sqrt(max(first_norm_sq, 0.0) * max(second_norm_sq, 0.0))
+    if denominator <= 1e-30:
+        return 0.0
+    # Roundoff in low-rank Gram products can put a mathematically valid
+    # cosine a few ulps outside [-1, 1].
+    return max(-1.0, min(1.0, float(inner) / denominator))
+
+
 def _z_fro_norm_sq(A: Tensor, B: Tensor) -> Tensor:
     M = A.T @ A
     N = B.T @ B
@@ -996,7 +1027,14 @@ class PRISM(torch.optim.Optimizer):
         release_denom = float(self._dp_state.expected_batch_size)
         std = sigma * C / release_denom
         slack_indicator: Optional[Tensor] = None
+        raw_slack_indicator: Optional[Tensor] = None
         if self._dp_state.slack_sum is not None and self._dp_state.slack_lambda > 0:
+            if self.telemetry_mode == 'research_raw':
+                # Exact, non-DP oracle corresponding to the same normalization
+                # used by the released/noised Slack Indicator.
+                raw_slack_indicator = self._dp_state.slack_sum / (
+                    float(self._dp_state.slack_lambda) * release_denom
+                )
             slack_noise = self._generate_dp_noise(self._dp_state.slack_sum, sigma * C)
             slack_indicator = (
                 self._dp_state.slack_sum + slack_noise
@@ -1005,6 +1043,8 @@ class PRISM(torch.optim.Optimizer):
         raw_unclipped_norm_sq = 0.0
         clipping_bias_norm_sq = 0.0
         noise_norm_sq = 0.0
+        raw_unclipped_clipped_inner = 0.0
+        raw_clipped_noisy_inner = 0.0
         noisy_gradient_norm_sq = 0.0
         effective_update_norm_sq = 0.0
         update_clip_coef_min = 1.0
@@ -1079,6 +1119,26 @@ class PRISM(torch.optim.Optimizer):
                 )
                 raw_unclipped_norm_sq += float(raw_n2.item())
                 clipping_bias_norm_sq += float(bias_n2.item())
+                raw_unclipped_clipped_inner += float(
+                    _tangent_fro_inner_product(
+                        raw_gradA,
+                        raw_gradB,
+                        gradA,
+                        gradB,
+                        A,
+                        B,
+                    ).item()
+                )
+                raw_clipped_noisy_inner += float(
+                    _tangent_fro_inner_product(
+                        gradA,
+                        gradB,
+                        gradA_noisy,
+                        gradB_noisy,
+                        A,
+                        B,
+                    ).item()
+                )
             noise_norm_sq += float(noi_n2.item())
             base_floor = float(self.dp_precond_floor_factor) * float(std * std)
             if self.dp_floor_mode == 'none':
@@ -1245,6 +1305,16 @@ class PRISM(torch.optim.Optimizer):
             sig = math.sqrt(max(signal_norm_sq, 0.0))
             raw_unclipped = math.sqrt(max(raw_unclipped_norm_sq, 0.0))
             clipping_bias = math.sqrt(max(clipping_bias_norm_sq, 0.0))
+            unclipped_clipped_cosine = _cosine_from_inner(
+                raw_unclipped_clipped_inner,
+                raw_unclipped_norm_sq,
+                signal_norm_sq,
+            )
+            clipped_noisy_cosine = _cosine_from_inner(
+                raw_clipped_noisy_inner,
+                signal_norm_sq,
+                noisy_gradient_norm_sq,
+            )
             raw: Dict[str, Any] = {
                 'NON_PRIVATE_TELEMETRY': True,
                 'raw_realized_batch_size': int(total),
@@ -1256,7 +1326,38 @@ class PRISM(torch.optim.Optimizer):
                 'raw_clipping_bias_norm': float(clipping_bias),
                 'raw_realized_noise_norm': float(noi),
                 'raw_signal_to_noise_ratio': float(sig / (noi + 1e-12)),
+                'raw_unclipped_clipped_cosine': float(unclipped_clipped_cosine),
+                'raw_clipped_noisy_cosine': float(clipped_noisy_cosine),
+                'raw_clipping_bias_to_noise_ratio': float(
+                    clipping_bias / (noi + 1e-12)
+                ),
+                'raw_bias_noise_squared_error_proxy': float(
+                    clipping_bias_norm_sq + noise_norm_sq
+                ),
             }
+            if raw_slack_indicator is not None and slack_indicator is not None:
+                raw_slack_cpu = raw_slack_indicator.detach().to(
+                    'cpu', dtype=torch.float32
+                )
+                residual = (
+                    slack_indicator.detach().to('cpu', dtype=torch.float32)
+                    - raw_slack_cpu
+                )
+                raw['raw_slack_indicator'] = [
+                    float(value) for value in raw_slack_cpu.tolist()
+                ]
+                raw['raw_slack_indicator_noise_residual'] = [
+                    float(value) for value in residual.tolist()
+                ]
+                raw['raw_slack_indicator_noise_residual_l2'] = float(
+                    torch.linalg.vector_norm(residual).item()
+                )
+                raw['raw_slack_indicator_noise_residual_rmse'] = float(
+                    torch.sqrt(torch.mean(residual.square())).item()
+                )
+                raw['raw_slack_indicator_noise_residual_first_coordinate'] = float(
+                    residual[0].item()
+                )
             if self._dp_state.raw_norms:
                 norms = torch.cat(self._dp_state.raw_norms).float()
                 hist_max = float(self.raw_hist_max if self.raw_hist_max > 0 else 4.0 * C)

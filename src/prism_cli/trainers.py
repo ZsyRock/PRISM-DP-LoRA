@@ -17,10 +17,11 @@ from .modeling import (
     resolved_model_revision,
 )
 from .utils import JsonlLogger, adapter_is_complete, build_tokenizer, checkpoint_file, clean_output_dir, cleanup_cuda, collect_runtime_metadata, ensure_text_only_token_type_ids, freeze_vision_tower_params, generate_prompt, get_rng_state, iter_microbatches, llm_adapters_dir, load_resume_checkpoint_if_available, load_trainable_state_dict, save_resume_checkpoint, save_status, set_rng_state, set_seed, tokenize_prompt, truncate_jsonl_to_step, unwrap_for_save, write_json_atomic
+from .validation_math import evaluate_public_math_numeric_exact
 
 
 CHECKPOINT_SCHEMA_VERSION = 4
-TELEMETRY_SCHEMA_VERSION = 3
+TELEMETRY_SCHEMA_VERSION = 4
 LOSS_DEFINITION = 'per_record_mean_of_nonignored_next_token_losses'
 VALIDATION_SPLIT_SCHEMA_VERSION = 1
 
@@ -51,6 +52,11 @@ class RunConfig:
     val_set_size: int = 0
     validation_seed: int = 1729
     validation_batch_size: int = 8
+    validation_eval_interval: int = 0
+    validation_generate_numeric: bool = False
+    validation_num_beams: int = 1
+    validation_max_new_tokens: int = 128
+    validation_max_input_length: int = 512
     protocol_stage: str = 'pilot'
     validation_data_is_public: bool = False
     eval_step: int = 100
@@ -72,6 +78,7 @@ class RunConfig:
     slaclip_target_clip_fraction: float = 0.99
     slaclip_c_min: float = 0.1
     slaclip_c_max: float = 50.0
+    clip_schedule_path: Optional[Path] = None
     force_train: bool = False
     force_eval: bool = False
     resume: bool = True
@@ -89,6 +96,9 @@ class RunConfig:
     prism_debias_second_moment: bool = False
     max_update_norm: float = 0.0
     data_content_sha256: Optional[str] = field(init=False, default=None)
+    clip_schedule_sha256: Optional[str] = field(init=False, default=None)
+    clip_schedule_values: Optional[List[float]] = field(init=False, default=None)
+    clip_schedule_metadata: Dict[str, Any] = field(init=False, default_factory=dict)
     config_fingerprint: str = field(init=False, default='')
     run_id: str = field(init=False, default='')
     resolved_model_revision: Optional[str] = field(init=False, default=None)
@@ -124,6 +134,11 @@ class RunConfig:
             'val_set_size': int(self.val_set_size),
             'validation_seed': int(self.validation_seed),
             'validation_batch_size': int(self.validation_batch_size),
+            'validation_eval_interval': int(self.validation_eval_interval),
+            'validation_generate_numeric': bool(self.validation_generate_numeric),
+            'validation_num_beams': int(self.validation_num_beams),
+            'validation_max_new_tokens': int(self.validation_max_new_tokens),
+            'validation_max_input_length': int(self.validation_max_input_length),
             'validation_split_schema_version': VALIDATION_SPLIT_SCHEMA_VERSION,
             'protocol_stage': self.protocol_stage,
             'validation_data_is_public': bool(self.validation_data_is_public),
@@ -144,6 +159,9 @@ class RunConfig:
             'slaclip_target_clip_fraction': float(self.slaclip_target_clip_fraction),
             'slaclip_c_min': float(self.slaclip_c_min),
             'slaclip_c_max': float(self.slaclip_c_max),
+            # Machine-specific paths never define experiment identity.  For a
+            # deterministic replay, the exact schedule file bytes do.
+            'clip_schedule_sha256': self.clip_schedule_sha256,
             'spectral_svd_device': self.spectral_svd_device,
             'spectral_oversample': int(self.spectral_oversample),
             'spectral_n_iter': int(self.spectral_n_iter),
@@ -172,8 +190,10 @@ class RunConfig:
             self.method = 'slaclip'
         elif method in {'slaclip_q', 'slaclipq', 'slaclip_q_prism'}:
             self.method = 'slaclip_q'
+        elif method in {'replay', 'schedule_replay', 'deterministic_replay'}:
+            self.method = 'replay'
         else:
-            raise ValueError('method must be baseline, slaclip, or slaclip_q')
+            raise ValueError('method must be baseline, slaclip, slaclip_q, or replay')
         self.privacy = self.privacy.lower().replace('_', '-')
         if self.privacy in {'non-dp', 'nondp', 'none'}:
             self.privacy = 'nondp'
@@ -181,6 +201,8 @@ class RunConfig:
             raise ValueError('privacy must be dp or nondp')
         if self.method in {'slaclip', 'slaclip_q'} and self.privacy != 'dp':
             raise ValueError('SlaClip is a DP clipping controller; use --privacy dp')
+        if self.method == 'replay' and self.privacy != 'dp':
+            raise ValueError('replay controls a DP clipping threshold; use --privacy dp')
         self.telemetry_mode = self.telemetry_mode.lower().replace('-', '_')
         if self.telemetry_mode not in {'dp_safe', 'research_raw'}:
             raise ValueError('telemetry_mode must be dp_safe or research_raw')
@@ -240,6 +262,15 @@ class RunConfig:
             raise ValueError('validation_seed must be non-negative')
         if int(self.validation_batch_size) <= 0:
             raise ValueError('validation_batch_size must be positive')
+        if int(self.validation_eval_interval) < 0:
+            raise ValueError('validation_eval_interval must be non-negative')
+        for name in (
+            'validation_num_beams',
+            'validation_max_new_tokens',
+            'validation_max_input_length',
+        ):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f'{name} must be positive')
         self.protocol_stage = str(self.protocol_stage).lower().replace('-', '_')
         if self.protocol_stage not in {'pilot', 'selection', 'final'}:
             raise ValueError('protocol_stage must be pilot, selection, or final')
@@ -253,6 +284,19 @@ class RunConfig:
                 'validation-holdout runs require explicit validation_data_is_public=true; '
                 'exact validation metrics are otherwise a non-DP data-dependent release'
             )
+        if int(self.validation_eval_interval) > 0 and not has_validation_holdout:
+            raise ValueError(
+                'validation_eval_interval requires val_set_size > 0'
+            )
+        if bool(self.validation_generate_numeric):
+            if self.dataset != 'math10k':
+                raise ValueError(
+                    'validation_generate_numeric is only defined for Math-10K'
+                )
+            if not has_validation_holdout:
+                raise ValueError(
+                    'validation_generate_numeric requires val_set_size > 0'
+                )
         if self.protocol_stage == 'selection':
             if not has_validation_holdout:
                 raise ValueError('selection stage requires val_set_size > 0')
@@ -282,6 +326,75 @@ class RunConfig:
             float(self.slaclip_c_min) <= float(self.dp_max_grad_norm) <= float(self.slaclip_c_max)
         ):
             raise ValueError('SlaClip initial C must satisfy slaclip_c_min <= C0 <= slaclip_c_max')
+        if self.method == 'replay':
+            if self.clip_schedule_path is None:
+                raise ValueError('replay requires --clip_schedule_path')
+            schedule_path = Path(self.clip_schedule_path).expanduser().resolve()
+            try:
+                with schedule_path.open('r', encoding='utf-8') as handle:
+                    schedule_payload = json.load(handle)
+            except FileNotFoundError as exc:
+                raise ValueError(f'clip schedule does not exist: {schedule_path}') from exc
+            except json.JSONDecodeError as exc:
+                raise ValueError(f'invalid clip schedule JSON {schedule_path}: {exc}') from exc
+            if isinstance(schedule_payload, list):
+                schedule_values = schedule_payload
+                schedule_metadata: Dict[str, Any] = {}
+            elif isinstance(schedule_payload, dict):
+                schedule_values = schedule_payload.get('clip_thresholds')
+                schedule_metadata = {
+                    str(key): value
+                    for key, value in schedule_payload.items()
+                    if key != 'clip_thresholds'
+                }
+            else:
+                schedule_values = None
+                schedule_metadata = {}
+            if not isinstance(schedule_values, list):
+                raise ValueError(
+                    'clip schedule JSON must be an array or an object containing '
+                    'a clip_thresholds array'
+                )
+            if len(schedule_values) != int(self.total_update_steps):
+                raise ValueError(
+                    f'clip schedule length={len(schedule_values)} must equal '
+                    f'total_update_steps={int(self.total_update_steps)}'
+                )
+            normalized_schedule: List[float] = []
+            for index, value in enumerate(schedule_values):
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(
+                        f'clip schedule value at index {index} must be a finite positive number'
+                    )
+                number = float(value)
+                if not math.isfinite(number) or number <= 0:
+                    raise ValueError(
+                        f'clip schedule value at index {index} must be finite and positive'
+                    )
+                normalized_schedule.append(number)
+            if not math.isclose(
+                normalized_schedule[0],
+                float(self.dp_max_grad_norm),
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    'clip schedule first value must equal initial C: '
+                    f'schedule[0]={normalized_schedule[0]!r}, '
+                    f'initial_C={float(self.dp_max_grad_norm)!r}'
+                )
+            self.clip_schedule_path = schedule_path
+            self.clip_schedule_values = normalized_schedule
+            self.clip_schedule_metadata = schedule_metadata
+            self.clip_schedule_sha256 = content_sha256(schedule_path)
+            if not self.clip_schedule_sha256:
+                raise RuntimeError(f'could not hash clip schedule: {schedule_path}')
+        elif self.clip_schedule_path is not None:
+            raise ValueError('clip_schedule_path is only valid with method=replay')
+        else:
+            self.clip_schedule_values = None
+            self.clip_schedule_metadata = {}
+            self.clip_schedule_sha256 = None
         if self.raw_hist_bins <= 0 or self.raw_hist_max < 0:
             raise ValueError('raw_hist_bins must be positive and raw_hist_max must be non-negative')
         if int(self.checkpoint_every) <= 0:
@@ -313,6 +426,20 @@ class RunConfig:
         self.output_dir = Path(self.output_dir) if self.output_dir is not None else adapters / 'trained_models' / self.run_id
         self.result_dir = Path(self.result_dir) if self.result_dir is not None else adapters / 'experiment' / self.run_id
         return self
+
+    def clip_threshold_for_step(self, zero_based_step: int) -> float:
+        """Return the pre-committed clipping threshold for one update."""
+
+        step = int(zero_based_step)
+        if step < 0 or step >= int(self.total_update_steps):
+            raise IndexError(
+                f'update step {step} is outside [0, {int(self.total_update_steps)})'
+            )
+        if self.method != 'replay':
+            return float(self.dp_max_grad_norm)
+        if self.clip_schedule_values is None:
+            raise RuntimeError('replay schedule was not loaded during finalize()')
+        return float(self.clip_schedule_values[step])
 
     @property
     def log_jsonl(self) -> Path:
@@ -569,6 +696,10 @@ def _make_loader(cfg: RunConfig, tokenizer):
     split_metadata['manifest_sha256'] = hashlib.sha256(split_payload).hexdigest()
     train_ds = source_ds.select(train_indices)
     validation_ds = source_ds.select(validation_indices) if validation_indices else None
+    validation_records = [
+        {**dict(source_ds[index]), '_source_index': int(index)}
+        for index in validation_indices
+    ]
 
     def map_fn(ex):
         return tokenize_prompt(tokenizer, ex, cutoff_len=int(cfg.cutoff_len), train_on_inputs=bool(cfg.train_on_inputs), base_model=cfg.base_model)
@@ -610,7 +741,13 @@ def _make_loader(cfg: RunConfig, tokenizer):
             num_workers=0,
             generator=validation_generator,
         )
-    return (loader, train_ds, validation_loader, split_metadata)
+    return (
+        loader,
+        train_ds,
+        validation_loader,
+        validation_records,
+        split_metadata,
+    )
 
 
 @torch.no_grad()
@@ -672,6 +809,60 @@ def _evaluate_validation_loss(
         'records': int(record_count),
         'supervised_tokens': int(supervised_tokens),
     }
+
+
+def _validation_curve_steps(path: Path) -> set[int]:
+    """Read already committed curve steps so checkpoint resume is idempotent."""
+    path = Path(path)
+    if not path.exists():
+        return set()
+    steps: set[int] = set()
+    with path.open('r', encoding='utf-8') as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f'invalid validation curve JSON at {path}:{line_number}'
+                ) from exc
+            step = record.get('step') if isinstance(record, dict) else None
+            if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+                raise RuntimeError(
+                    f'invalid validation curve step at {path}:{line_number}'
+                )
+            if step in steps:
+                raise RuntimeError(
+                    f'duplicate validation curve step={step} in {path}'
+                )
+            steps.add(int(step))
+    return steps
+
+
+def _required_curve_steps_before_resume(
+    *,
+    start_step: int,
+    total_update_steps: int,
+    interval: int,
+) -> set[int]:
+    """Return curve points that must already exist at a saved checkpoint.
+
+    Periodic curve points are written before their same-step checkpoint.  The
+    final checkpoint is deliberately written before endpoint evaluation, so the
+    final curve point is optional and can be regenerated after resume.
+    """
+
+    start = int(start_step)
+    total = int(total_update_steps)
+    cadence = int(interval)
+    if start < 0 or total <= 0 or start > total or cadence <= 0:
+        raise ValueError('invalid validation-curve resume bounds')
+    required = {0}
+    upper = start if start < total else total - 1
+    required.update(range(cadence, upper + 1, cadence))
+    return required
+
 
 def _build_lora_model(cfg: RunConfig):
     from peft import LoraConfig, get_peft_model
@@ -739,7 +930,10 @@ def _build_prism_optimizer(cfg: RunConfig, model):
         gauge_fix_eps=1e-12,
         max_update_norm=float(cfg.max_update_norm),
         dp_debias_second_moment=bool(cfg.prism_debias_second_moment),
-        clipping_method=cfg.method,
+        # Replay is deliberately the baseline Gaussian mechanism.  Its only
+        # difference is that the trainer supplies a pre-committed C_t before
+        # each update; it must not construct or release Slack coordinates.
+        clipping_method='baseline' if cfg.method == 'replay' else cfg.method,
         slaclip_num_slots=int(cfg.slaclip_num_slots),
         slaclip_eta=float(cfg.slaclip_eta),
         slaclip_beta=float(cfg.slaclip_beta),
@@ -820,15 +1014,26 @@ def _validate_checkpoint_identity(cfg: RunConfig, checkpoint: Dict[str, Any]) ->
             f'checkpoint config fingerprint mismatch: saved={saved_fingerprint!r}, '
             f'current={cfg.config_fingerprint!r}'
         )
+    saved_schedule_sha = extra.get('clip_schedule_sha256')
+    if saved_schedule_sha != cfg.clip_schedule_sha256:
+        raise RuntimeError(
+            'checkpoint clip schedule SHA256 mismatch: '
+            f'saved={saved_schedule_sha!r}, current={cfg.clip_schedule_sha256!r}'
+        )
     saved_loss = extra.get('loss_definition')
     if saved_loss != LOSS_DEFINITION:
         raise RuntimeError(
             f'checkpoint loss definition mismatch: saved={saved_loss!r}, current={LOSS_DEFINITION!r}'
         )
     step = int(checkpoint.get('update_steps', 0))
-    if step < 0 or step >= int(cfg.total_update_steps):
+    # A checkpoint at exactly ``total_update_steps`` is intentional: it is
+    # written after the final private update but before public endpoint
+    # generation and artifact finalization.  Accept it so a preempted run can
+    # skip training and repeat only those deterministic post-training steps.
+    if step < 0 or step > int(cfg.total_update_steps):
         raise RuntimeError(
-            f'checkpoint update_steps={step} is outside [0, {int(cfg.total_update_steps)})'
+            f'checkpoint update_steps={step} is outside '
+            f'[0, {int(cfg.total_update_steps)}]'
         )
     return extra
 
@@ -920,6 +1125,7 @@ def _checkpoint_extra(
     return {
         'checkpoint_schema_version': CHECKPOINT_SCHEMA_VERSION,
         'config_fingerprint': cfg.config_fingerprint,
+        'clip_schedule_sha256': cfg.clip_schedule_sha256,
         'run_id': cfg.run_id,
         'loss_definition': LOSS_DEFINITION,
         'resolved_model_revision': cfg.resolved_model_revision,
@@ -947,7 +1153,7 @@ def _read_status(output_dir: Path) -> Optional[Dict[str, Any]]:
 
 
 def _status_common(cfg: RunConfig) -> Dict[str, Any]:
-    return {
+    status = {
         'method': cfg.method,
         'privacy': cfg.privacy,
         'run_id': cfg.run_id,
@@ -962,6 +1168,25 @@ def _status_common(cfg: RunConfig) -> Dict[str, Any]:
         'loss_definition': LOSS_DEFINITION,
         'config': cfg.__dict__,
     }
+    if cfg.method == 'replay':
+        schedule_privacy_class = cfg.clip_schedule_metadata.get(
+            'schedule_privacy_class',
+            cfg.clip_schedule_metadata.get(
+                'source_privacy_class',
+                'UNSPECIFIED_PRECOMMITTED_SCHEDULE',
+            ),
+        )
+        status['clip_schedule'] = {
+            'sha256': cfg.clip_schedule_sha256,
+            'steps': len(cfg.clip_schedule_values or ()),
+            'metadata': cfg.clip_schedule_metadata,
+            'privacy_accounting_scope': (
+                'training_run_epsilon_is_conditional_on_the_locked_schedule'
+            ),
+            'schedule_privacy_class': schedule_privacy_class,
+            'end_to_end_privacy_requires_schedule_provenance_and_composition': True,
+        }
+    return status
 
 
 def completed_adapter_status(cfg: RunConfig) -> Optional[Dict[str, Any]]:
@@ -1026,14 +1251,26 @@ def train_prism_manual(cfg: RunConfig) -> Path:
         set_seed(cfg.seed)
         model, tokenizer, device = _build_lora_model(cfg)
         _initialize_prism_factors(cfg, model)
-        train_loader, train_ds, validation_loader, split_metadata = _make_loader(cfg, tokenizer)
+        (
+            train_loader,
+            train_ds,
+            validation_loader,
+            validation_records,
+            split_metadata,
+        ) = _make_loader(cfg, tokenizer)
         optimizer = _build_prism_optimizer(cfg, model)
     else:
         set_seed(cfg.seed)
         model, tokenizer, device = _build_lora_model(cfg)
         _initialize_prism_factors(cfg, model)
         optimizer = _build_prism_optimizer(cfg, model)
-        train_loader, train_ds, validation_loader, split_metadata = _make_loader(cfg, tokenizer)
+        (
+            train_loader,
+            train_ds,
+            validation_loader,
+            validation_records,
+            split_metadata,
+        ) = _make_loader(cfg, tokenizer)
     needs_text_token_type_ids = is_multimodal_causal_lm_config(model.config)
     checkpoint = _restore_if_possible(cfg, model, optimizer)
     privacy_engine = None
@@ -1085,6 +1322,36 @@ def train_prism_manual(cfg: RunConfig) -> Path:
     validation_dir = Path(cfg.result_dir) / 'validation'
     validation_dir.mkdir(parents=True, exist_ok=True)
     write_json_atomic(validation_dir / 'split_manifest.json', split_metadata)
+    validation_curve_path = validation_dir / 'validation_curve.jsonl'
+    if checkpoint is not None and validation_curve_path.exists():
+        removed_curve = truncate_jsonl_to_step(
+            validation_curve_path,
+            start_step,
+        )
+        print(
+            '[resume] truncated validation curve records after '
+            f'step {start_step}: removed={removed_curve}'
+        )
+    validation_curve_logger = None
+    validation_curve_steps: set[int] = set()
+    if validation_loader is not None and int(cfg.validation_eval_interval) > 0:
+        validation_curve_steps = _validation_curve_steps(validation_curve_path)
+        if checkpoint is not None and start_step > 0:
+            required_curve_steps = _required_curve_steps_before_resume(
+                start_step=start_step,
+                total_update_steps=int(cfg.total_update_steps),
+                interval=int(cfg.validation_eval_interval),
+            )
+            missing_curve_steps = sorted(
+                required_curve_steps - validation_curve_steps
+            )
+            if missing_curve_steps:
+                raise RuntimeError(
+                    'resume checkpoint cannot reconstruct missing historical '
+                    'validation curve steps: '
+                    f'{missing_curve_steps}'
+                )
+        validation_curve_logger = JsonlLogger(validation_curve_path)
     logger = JsonlLogger(cfg.log_jsonl)
     raw_logger = None
     if cfg.telemetry_mode == 'research_raw':
@@ -1126,6 +1393,11 @@ def train_prism_manual(cfg: RunConfig) -> Path:
             'accountant': cfg.dp_accountant,
             'secure_mode': bool(cfg.dp_secure_mode),
             'grad_sample_mode': used_mode,
+            'scope': (
+                'conditional_on_locked_clip_schedule'
+                if cfg.method == 'replay'
+                else 'single_training_run'
+            ),
             'target_epsilon': cfg.dp_epsilon,
             'target_delta': cfg.dp_delta,
             'noise_multiplier': noise_multiplier,
@@ -1136,6 +1408,45 @@ def train_prism_manual(cfg: RunConfig) -> Path:
         data_split=split_metadata,
         runtime=collect_runtime_metadata(cfg.root),
     )
+
+    def record_validation_curve(step: int) -> Optional[Dict[str, Any]]:
+        if validation_curve_logger is None or validation_loader is None:
+            return None
+        step = int(step)
+        if step in validation_curve_steps:
+            return None
+        metrics = _evaluate_validation_loss(
+            model,
+            validation_loader,
+            device=device,
+            needs_text_token_type_ids=needs_text_token_type_ids,
+        )
+        curve_record = {
+            **metrics,
+            'NON_PRIVATE_SELECTION_METRIC': True,
+            'PUBLIC_VALIDATION_DATA': True,
+            'run_id': cfg.run_id,
+            'config_fingerprint': cfg.config_fingerprint,
+            'step': step,
+            'planned_update_steps': int(cfg.total_update_steps),
+            'validation_indices_sha256': split_metadata[
+                'validation_indices_sha256'
+            ],
+            'validation_record_hashes_sha256': split_metadata[
+                'validation_record_hashes_sha256'
+            ],
+            'manifest_sha256': split_metadata['manifest_sha256'],
+        }
+        validation_curve_logger.log(curve_record)
+        validation_curve_steps.add(step)
+        print(
+            '[validation curve] '
+            f"step={step} records={metrics['records']} "
+            f"loss={metrics['loss_mean']:.8f}"
+        )
+        return metrics
+
+    record_validation_curve(0)
     model.train()
     update_steps = int(start_step)
     pbar = tqdm(total=int(cfg.total_update_steps), initial=update_steps, desc=f'{cfg.method}/{cfg.privacy} updates')
@@ -1154,8 +1465,10 @@ def train_prism_manual(cfg: RunConfig) -> Path:
             if cfg.privacy == 'dp':
                 assert expected_batch_size is not None
                 assert noise_multiplier is not None
+                scheduled_step = update_steps
+                step_clip_threshold = cfg.clip_threshold_for_step(scheduled_step)
                 optimizer.dp_begin(
-                    max_grad_norm=float(cfg.dp_max_grad_norm),
+                    max_grad_norm=step_clip_threshold,
                     expected_batch_size=float(expected_batch_size),
                     noise_multiplier=float(noise_multiplier),
                 )
@@ -1222,7 +1535,20 @@ def train_prism_manual(cfg: RunConfig) -> Path:
             }
             if cfg.privacy != 'dp':
                 rec.update({'loss_mean': loss_sum / max(1, seen), 'tokens': token_sum, 'batch_n': seen})
-            safe_optimizer_log = getattr(optimizer, 'last_log', {}) or {}
+            safe_optimizer_log = dict(getattr(optimizer, 'last_log', {}) or {})
+            if cfg.method == 'replay':
+                if cfg.clip_schedule_values is None:
+                    raise RuntimeError('replay schedule disappeared after configuration')
+                next_index = min(scheduled_step + 1, len(cfg.clip_schedule_values) - 1)
+                # For replay, C_{t+1} comes from the immutable schedule, not a
+                # private-data-dependent controller.
+                safe_optimizer_log['dp_next_clip_threshold'] = float(
+                    cfg.clip_schedule_values[next_index]
+                )
+                safe_optimizer_log['replay_schedule_index'] = int(scheduled_step)
+                safe_optimizer_log['replay_clip_schedule_sha256'] = str(
+                    cfg.clip_schedule_sha256
+                )
             rec.update(safe_optimizer_log)
             if privacy_engine is not None:
                 try:
@@ -1268,7 +1594,19 @@ def train_prism_manual(cfg: RunConfig) -> Path:
                 if 'eps_spent' in rec:
                     msg += f" eps≈{rec['eps_spent']:.3f}"
                 print(msg)
-            if cfg.resume and update_steps % int(cfg.checkpoint_every) == 0 and (update_steps < int(cfg.total_update_steps)):
+            if (
+                validation_curve_logger is not None
+                and update_steps < int(cfg.total_update_steps)
+                and update_steps % int(cfg.validation_eval_interval) == 0
+            ):
+                record_validation_curve(update_steps)
+            # Keep the final pre-evaluation state as well.  If endpoint
+            # generation or artifact writing is preempted, resume can repeat
+            # only validation instead of the last training interval.
+            if cfg.resume and (
+                update_steps % int(cfg.checkpoint_every) == 0
+                or update_steps == int(cfg.total_update_steps)
+            ):
                 save_resume_checkpoint(
                     Path(cfg.output_dir),
                     model,
@@ -1290,22 +1628,60 @@ def train_prism_manual(cfg: RunConfig) -> Path:
         raw_logger.close()
     validation_metrics = None
     if validation_loader is not None:
-        validation_metrics = _evaluate_validation_loss(
-            model,
-            validation_loader,
-            device=device,
-            needs_text_token_type_ids=needs_text_token_type_ids,
+        validation_metrics = record_validation_curve(
+            int(cfg.total_update_steps)
         )
+        if validation_metrics is None:
+            validation_metrics = _evaluate_validation_loss(
+                model,
+                validation_loader,
+                device=device,
+                needs_text_token_type_ids=needs_text_token_type_ids,
+            )
+        if bool(cfg.validation_generate_numeric):
+            numeric_metrics = evaluate_public_math_numeric_exact(
+                model,
+                tokenizer,
+                validation_records,
+                device=device,
+                batch_size=int(cfg.validation_batch_size),
+                max_input_length=int(cfg.validation_max_input_length),
+                max_new_tokens=int(cfg.validation_max_new_tokens),
+                num_beams=int(cfg.validation_num_beams),
+                needs_text_token_type_ids=needs_text_token_type_ids,
+                predictions_path=(
+                    validation_dir / 'public_numeric_predictions.json'
+                ),
+            )
+            if int(numeric_metrics['records']) != int(
+                validation_metrics['records']
+            ):
+                raise RuntimeError(
+                    'numeric generation and response-loss validation row '
+                    'counts do not match'
+                )
+            validation_metrics.update(numeric_metrics)
+            validation_metrics['metric_schema_version'] = 2
         validation_metrics.update(split_metadata)
         validation_metrics['NON_PRIVATE_SELECTION_METRIC'] = True
+        validation_metrics['PUBLIC_VALIDATION_DATA'] = True
         validation_path = validation_dir / 'validation_metrics.json'
         write_json_atomic(validation_path, validation_metrics)
+        accuracy_message = ''
+        if 'numeric_exact_accuracy' in validation_metrics:
+            accuracy_message = (
+                f" numeric_exact={validation_metrics['numeric_exact_accuracy']:.6f}"
+                f" parse_failures={validation_metrics['numeric_parse_failures']}"
+            )
         print(
             '[validation] '
             f"records={validation_metrics['records']} "
             f"loss={validation_metrics['loss_mean']:.8f} "
+            f"{accuracy_message} "
             f"split_sha256={validation_metrics['validation_indices_sha256']}"
         )
+    if validation_curve_logger is not None:
+        validation_curve_logger.close()
     to_save = unwrap_for_save(model)
     rebase_stats = _rebase_prism_for_save(to_save)
     to_save.save_pretrained(str(cfg.output_dir))
@@ -1327,6 +1703,11 @@ def train_prism_manual(cfg: RunConfig) -> Path:
             'accountant': cfg.dp_accountant,
             'secure_mode': bool(cfg.dp_secure_mode),
             'grad_sample_mode': used_mode,
+            'scope': (
+                'conditional_on_locked_clip_schedule'
+                if cfg.method == 'replay'
+                else 'single_training_run'
+            ),
             'target_epsilon': cfg.dp_epsilon,
             'target_delta': cfg.dp_delta,
             'epsilon_spent': epsilon_spent,

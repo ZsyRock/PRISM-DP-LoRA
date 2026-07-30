@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 
-SUMMARY_SCHEMA_VERSION = 2
+SUMMARY_SCHEMA_VERSION = 3
 NON_PRIVATE_WARNING = (
     "Contains exact statistics derived from training examples; this summary is "
     "NON-PRIVATE and must not be treated as a DP release."
@@ -99,6 +99,8 @@ PREFERRED_COLUMNS = (
     "dp_next_clip_threshold",
     "clip_threshold_delta",
     "clip_threshold_ratio",
+    "replay_schedule_index",
+    "replay_clip_schedule_sha256",
     "slaclip_gamma_t",
     "slaclip_eta",
     "slaclip_beta",
@@ -141,6 +143,15 @@ PREFERRED_COLUMNS = (
     "slack_unclipped_proxy",
     "slack_clipped_proxy",
     "slack_indicator_json",
+    "raw_slack_indicator_json",
+    "raw_slack_indicator_noise_residual_json",
+    "raw_slack_indicator_noise_residual_l2",
+    "raw_slack_indicator_noise_residual_rmse",
+    "raw_slack_indicator_noise_residual_first_coordinate",
+    "raw_unclipped_clipped_cosine",
+    "raw_clipped_noisy_cosine",
+    "raw_clipping_bias_to_noise_ratio",
+    "raw_bias_noise_squared_error_proxy",
     "eps_spent",
     "epsilon_increment",
 )

@@ -276,6 +276,62 @@ def test_stage1_and_stage2_are_deterministic_and_ignore_unselected_runs(tmp_path
     assert stage2_path.read_bytes() == before
 
 
+def test_numeric_exact_accuracy_is_primary_and_loss_breaks_ties(tmp_path: Path) -> None:
+    campaign, registry_path = _build_campaign(tmp_path)
+    registry = json.loads(registry_path.read_text())
+    registry["selection_protocol"]["selection_metric"] = selector.NUMERIC_EXACT_METRIC
+    accuracy_by_candidate = {
+        "fixed-c1": 0.55,
+        "fixed-c15": 0.50,
+        "sla-a": 0.80,
+        "sla-b": 0.85,
+        "sla-c": 0.80,
+    }
+    for candidate in registry["candidates"]:
+        accuracy = accuracy_by_candidate[candidate["id"]]
+        for run in candidate["runs"].values():
+            metrics_path = campaign / run["validation_metrics"]
+            status_path = campaign / run["run_status"]
+            metrics = json.loads(metrics_path.read_text())
+            status = json.loads(status_path.read_text())
+            metrics.update(
+                {
+                    "selection_metric": selector.NUMERIC_EXACT_METRIC,
+                    "numeric_exact_accuracy": accuracy,
+                    "numeric_exact_correct": int(accuracy * metrics["records"]),
+                    "numeric_parse_failures": 0,
+                }
+            )
+            status["validation"] = metrics
+            _write_json(metrics_path, metrics)
+            _write_json(status_path, status)
+    _write_json(registry_path, registry)
+
+    stage1_path = campaign / "selection" / "numeric-stage1-selection.json"
+    stage1 = _select(campaign, registry_path, "stage1", stage1_path.name)
+    assert stage1["ranking_rule"].startswith(
+        "descending_validation_numeric_exact_accuracy"
+    )
+    assert stage1["best_fixed"]["candidate_id"] == "fixed-c1"
+    assert [item["candidate_id"] for item in stage1["top_slaclip"]] == [
+        "sla-b",
+        "sla-a",
+    ]
+
+    stage2 = _select(
+        campaign,
+        registry_path,
+        "stage2",
+        "numeric-selection.json",
+        stage1=stage1_path,
+    )
+    assert stage2["selected_slaclip"]["candidate_id"] == "sla-b"
+    assert stage2["selected_slaclip"]["mean_validation_accuracy"] == 0.85
+    assert "mean_validation_accuracy" in (
+        campaign / "selection" / "numeric-selection.csv"
+    ).read_text()
+
+
 def test_refuses_to_overwrite_a_different_selection(tmp_path: Path) -> None:
     campaign, registry = _build_campaign(tmp_path)
     stage1_path = campaign / "selection" / "stage1-selection.json"
@@ -351,6 +407,17 @@ def test_rejects_any_registered_input_outside_screen(tmp_path: Path) -> None:
     _write_json(registry_path, registry)
     with pytest.raises(selector.SelectionError, match="must remain inside"):
         _select(campaign, registry_path, "stage1", "stage1-selection.json")
+
+
+def test_allows_portable_campaign_below_tests_named_ancestor(tmp_path: Path) -> None:
+    campaign, registry_path = _build_campaign(tmp_path / "tests" / "portable-account")
+    selection = _select(
+        campaign,
+        registry_path,
+        "stage1",
+        "stage1-selection.json",
+    )
+    assert selection["best_fixed"]["candidate_id"] == "fixed-c15"
 
 
 def test_stage2_requires_all_fixed_control_seeds(tmp_path: Path) -> None:

@@ -129,7 +129,12 @@ Journal hyperparameter selection uses a deterministic prompt-grouped public
 holdout, never the task test sets or exact raw clipping telemetry.  Selection
 runs must pass `--protocol_stage selection`, `--validation_data_is_public`, and
 `--run_eval false` with a nonzero `--val_set_size`; configuration locking is
-performed by `scripts/select_validation_candidates.py`.  Once locked, formal
+performed by `scripts/select_validation_candidates.py`.  Math-10K screens can
+add `--validation_generate_numeric` so public-holdout numeric exact accuracy is
+the primary utility signal and response-only loss is the deterministic
+tie-break. `--validation_eval_interval 50` records the public response-loss
+curve at steps `0, 50, ..., 300`; endpoint predictions, parse-failure counts,
+decoding settings, and hashes are stored with the run. Once locked, formal
 arms use fresh seeds, `--protocol_stage final`, and `--val_set_size 0` to retrain
 on the complete training set before evaluation.  In particular, a saturated
 100% baseline clipping median is not treated as a full-SlaClip target.  See
@@ -137,6 +142,12 @@ on the complete training set before evaluation.  In particular, a saturated
 and public-data privacy boundary.
 
 The noise multiplier is calibrated for the requested update count. Each Poisson batch is normalized by Opacus's fixed expected batch size, not by the randomly realized batch size. Dynamic clipping changes the absolute noise scale with `C_t`, while the matched noise multiplier and accountant determine the same privacy schedule. The sensitivity statement uses Poisson subsampling and add/remove record adjacency; replace-one adjacency must not be substituted without changing the analysis.
+
+For `method=replay`, the reported per-run accountant is conditional on the
+locked clipping schedule. If that schedule was derived from earlier
+private-data-dependent trajectories, compose their privacy costs with the replay
+run before making any end-to-end claim. Replay is used here as a mechanistic
+control; it is not a way to reset the privacy budget.
 
 ## Training loss and microbatch invariance
 
@@ -173,7 +184,12 @@ The GLUE equivalent is `scripts/run_glue8_analysis_pair.sh`. Raw records are wri
 <result_dir>/research_raw/NON_PRIVATE_train_log.jsonl
 ```
 
-They include exact record-mean training loss and supervised-token count, per-record tangent-gradient norm summaries/histograms, clipping fraction and coefficients, clipped and unclipped signal norms, clipping-bias norm, realized noise norm, and signal-to-noise ratio. The file is self-contained and marked `NON_PRIVATE_TELEMETRY`.
+They include exact record-mean training loss and supervised-token count,
+per-record tangent-gradient norm summaries/histograms, clipping fraction and
+coefficients, clipped and unclipped signal norms, clipping-bias norm, realized
+noise norm, signal-to-noise ratio, exact-vs-noisy Slack/CDF residuals, signal
+cosines, bias/noise ratio, and a bias-squared-plus-noise-squared proxy. The file
+is self-contained and marked `NON_PRIVATE_TELEMETRY`.
 
 For SlaClip-Q-99 dynamics, use `scripts/run_math10k_q99_analysis_pair.sh` (or the GLUE counterpart). Its summary separates the requested exact-rate label, noisy CDF proxy, proxy target, controller error, unbounded/bounded next threshold, and bound-hit flags.
 

@@ -50,6 +50,15 @@ def test_summarizer_flattens_metrics_merges_safe_log_and_handles_missing_fields(
                 "raw_clipping_bias_norm": 1.0,
                 "raw_realized_noise_norm": 2.0,
                 "raw_signal_to_noise_ratio": 1.5,
+                "raw_slack_indicator": [0.2, 0.4],
+                "raw_slack_indicator_noise_residual": [0.1, -0.1],
+                "raw_slack_indicator_noise_residual_l2": 0.141421356,
+                "raw_slack_indicator_noise_residual_rmse": 0.1,
+                "raw_slack_indicator_noise_residual_first_coordinate": 0.1,
+                "raw_unclipped_clipped_cosine": 0.95,
+                "raw_clipped_noisy_cosine": 0.25,
+                "raw_clipping_bias_to_noise_ratio": 0.5,
+                "raw_bias_noise_squared_error_proxy": 5.0,
                 "dp_noisy_tangent_gradient_norm": 3.5,
                 "dp_factor_product_update_norm": 0.25,
                 "eps_spent": 1.0,
@@ -151,6 +160,14 @@ def test_summarizer_flattens_metrics_merges_safe_log_and_handles_missing_fields(
     assert rows[1]["dp_update_clip_coef_min"] == "0.95"
     assert float(rows[0]["raw_signal_retention_ratio"]) == 0.75
     assert float(rows[0]["raw_clipping_bias_ratio"]) == 0.25
+    assert json.loads(rows[0]["raw_slack_indicator_json"]) == [0.2, 0.4]
+    assert json.loads(rows[0]["raw_slack_indicator_noise_residual_json"]) == [
+        0.1,
+        -0.1,
+    ]
+    assert float(rows[0]["raw_unclipped_clipped_cosine"]) == 0.95
+    assert float(rows[0]["raw_clipped_noisy_cosine"]) == 0.25
+    assert float(rows[0]["raw_bias_noise_squared_error_proxy"]) == 5.0
     assert math.isclose(float(rows[0]["clip_threshold_delta"]), 0.1)
     assert math.isclose(float(rows[1]["epsilon_increment"]), 0.6)
 
@@ -167,6 +184,9 @@ def test_summarizer_flattens_metrics_merges_safe_log_and_handles_missing_fields(
         "missing": [3],
     }
     assert summary["metrics"]["loss_mean"]["last"] == 1.5
+    assert summary["metrics"]["raw_slack_indicator_noise_residual_rmse"][
+        "mean"
+    ] == 0.1
     assert summary["field_coverage"]["slaclip_gamma_t"] == {"present": 1, "missing": 2}
     assert summary["boolean_metrics"]["slaclip_c_hit_min"] == {
         "count": 2,

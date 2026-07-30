@@ -13,6 +13,7 @@ from prism_cli.optim.prism import (
     _full_column_rank_qr,
     _right_solve_gram,
     _right_solve_transpose,
+    _tangent_fro_inner_product,
     _tangent_fro_norm_sq,
 )
 from prism_cli.slaclip import (
@@ -64,6 +65,21 @@ def test_tangent_norm_is_gauge_invariant() -> None:
         b @ gauge_inv_t,
     )
     assert transformed == pytest.approx(float(original), rel=1e-5, abs=1e-5)
+
+
+def test_tangent_inner_product_matches_dense_factor_product() -> None:
+    torch.manual_seed(6)
+    a = torch.randn(7, 2)
+    b = torch.randn(5, 2)
+    da = torch.randn(7, 2)
+    db = torch.randn(5, 2)
+    ea = torch.randn(7, 2)
+    eb = torch.randn(5, 2)
+    dense_d = da @ b.T + a @ db.T
+    dense_e = ea @ b.T + a @ eb.T
+    expected = torch.sum(dense_d * dense_e)
+    actual = _tangent_fro_inner_product(da, db, ea, eb, a, b)
+    assert actual == pytest.approx(float(expected), rel=1e-5, abs=1e-5)
 
 
 def test_qr_sampler_is_exactly_isotropic_in_intrinsic_tangent_coordinates() -> None:
@@ -474,7 +490,45 @@ def test_research_raw_mode_is_explicitly_marked() -> None:
     assert 'raw_global_norm_hist_counts' in opt.last_raw_log
     assert 'raw_realized_noise_norm' in opt.last_raw_log
     assert 'raw_unclipped_signal_norm' in opt.last_raw_log
+    assert 'raw_unclipped_clipped_cosine' in opt.last_raw_log
+    assert 'raw_clipped_noisy_cosine' in opt.last_raw_log
+    assert 'raw_clipping_bias_to_noise_ratio' in opt.last_raw_log
+    assert 'raw_bias_noise_squared_error_proxy' in opt.last_raw_log
+    assert 'raw_slack_indicator' not in opt.last_raw_log
     assert opt.last_raw_log['raw_realized_batch_size'] == 4
+
+
+def test_research_raw_slaclip_records_exact_indicator_and_noise_residual() -> None:
+    torch.manual_seed(18)
+    opt, p_a, p_b = _make_optimizer(
+        'research_raw',
+        clipping_method='slaclip',
+    )
+    opt.dp_begin(max_grad_norm=1.0, expected_batch_size=4, noise_multiplier=0.8)
+    _set_grad_samples(
+        p_a,
+        p_b,
+        torch.randn(4, 2, 3),
+        torch.randn(4, 4, 2),
+    )
+    opt.dp_accumulate()
+    opt.dp_finalize(noise_multiplier=0.8)
+
+    raw_indicator = torch.tensor(opt.last_raw_log['raw_slack_indicator'])
+    noisy_indicator = torch.tensor(opt.last_log['slack_indicator'])
+    residual = torch.tensor(
+        opt.last_raw_log['raw_slack_indicator_noise_residual']
+    )
+    assert raw_indicator.numel() == noisy_indicator.numel() == 3
+    assert torch.allclose(noisy_indicator - raw_indicator, residual, atol=1e-6)
+    assert opt.last_raw_log[
+        'raw_slack_indicator_noise_residual_l2'
+    ] == pytest.approx(float(torch.linalg.vector_norm(residual)), rel=1e-6)
+    assert opt.last_raw_log[
+        'raw_slack_indicator_noise_residual_rmse'
+    ] == pytest.approx(float(torch.sqrt(torch.mean(residual.square()))), rel=1e-6)
+    assert -1.0 <= opt.last_raw_log['raw_unclipped_clipped_cosine'] <= 1.0
+    assert -1.0 <= opt.last_raw_log['raw_clipped_noisy_cosine'] <= 1.0
 
 
 def test_optimizer_checkpoint_restores_slaclip_runtime() -> None:

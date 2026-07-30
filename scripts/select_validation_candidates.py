@@ -26,6 +26,8 @@ from typing import Any, Iterable, Mapping
 REGISTRY_SCHEMA_VERSION = 1
 SELECTION_SCHEMA_VERSION = 1
 EXPECTED_METRIC = "response_only_mean_per_record_causal_lm_loss"
+NUMERIC_EXACT_METRIC = "public_math10k_numeric_exact_match_accuracy"
+SUPPORTED_METRICS = {EXPECTED_METRIC, NUMERIC_EXACT_METRIC}
 EXPECTED_LOSS_DEFINITION = "response_only_per_record_mean_of_nonignored_next_token_losses"
 FIXED_PARAM_KEYS = {"dp_max_grad_norm"}
 SLACLIP_PARAM_KEYS = {
@@ -96,12 +98,12 @@ def _resolve_screen_input(campaign_root: Path, value: Any, *, filename: str, lab
         raise SelectionError(f"missing {label}: {path}") from exc
     screen_root = (campaign_root / "screen").resolve(strict=True)
     try:
-        resolved.relative_to(screen_root)
+        screen_relative = resolved.relative_to(screen_root)
     except ValueError as exc:
         raise SelectionError(f"{label} must remain inside {screen_root}: {resolved}") from exc
     if resolved.name != filename:
         raise SelectionError(f"{label} must be named {filename}, got: {resolved.name}")
-    forbidden = FORBIDDEN_PATH_PARTS.intersection(part.casefold() for part in resolved.parts)
+    forbidden = FORBIDDEN_PATH_PARTS.intersection(part.casefold() for part in screen_relative.parts)
     if forbidden:
         raise SelectionError(f"{label} path contains forbidden test/evaluation component(s): {sorted(forbidden)}")
     return resolved
@@ -167,8 +169,10 @@ def _validate_protocol(registry: Mapping[str, Any]) -> dict[str, Any]:
         raise SelectionError("selection_protocol.protocol_stage must be 'selection'")
     if protocol.get("validation_data_is_public") is not True:
         raise SelectionError("selection requires validation_data_is_public=true")
-    if protocol.get("selection_metric") != EXPECTED_METRIC:
-        raise SelectionError(f"selection_metric must be {EXPECTED_METRIC!r}")
+    if protocol.get("selection_metric") not in SUPPORTED_METRICS:
+        raise SelectionError(
+            f"selection_metric must be one of {sorted(SUPPORTED_METRICS)!r}"
+        )
     if protocol.get("loss_definition") != EXPECTED_LOSS_DEFINITION:
         raise SelectionError(f"loss_definition must be {EXPECTED_LOSS_DEFINITION!r}")
     required_steps = _integer(protocol.get("required_update_steps"), label="required_update_steps")
@@ -349,12 +353,50 @@ def _validate_run(
     if records != split.get("validation_rows"):
         raise SelectionError(f"candidate {candidate['id']} seed {seed} validation row count mismatch")
     loss = _finite_number(metrics.get("loss_mean"), label="validation response-only loss", minimum=0.0)
+    accuracy: float | None = None
+    if protocol["selection_metric"] == NUMERIC_EXACT_METRIC:
+        accuracy = _finite_number(
+            metrics.get("numeric_exact_accuracy"),
+            label="validation numeric exact accuracy",
+            minimum=0.0,
+        )
+        if accuracy > 1.0:
+            raise SelectionError(
+                f"validation numeric exact accuracy must be <= 1, got {accuracy!r}"
+            )
+        correct = _integer(
+            metrics.get("numeric_exact_correct"),
+            label="validation numeric exact correct",
+        )
+        parse_failures = _integer(
+            metrics.get("numeric_parse_failures"),
+            label="validation numeric parse failures",
+        )
+        if not 0 <= correct <= records or not 0 <= parse_failures <= records:
+            raise SelectionError(
+                f"candidate {candidate['id']} seed {seed} has invalid numeric counts"
+            )
+        expected_accuracy = float(correct) / float(records)
+        if not math.isclose(accuracy, expected_accuracy, rel_tol=0.0, abs_tol=1e-12):
+            raise SelectionError(
+                f"candidate {candidate['id']} seed {seed} numeric accuracy/count mismatch"
+            )
     embedded = status.get("validation")
     if not isinstance(embedded, dict):
         raise SelectionError(f"candidate {candidate['id']} seed {seed} status has no embedded validation result")
     embedded_loss = _finite_number(embedded.get("loss_mean"), label="embedded validation loss", minimum=0.0)
     if not math.isclose(loss, embedded_loss, rel_tol=0.0, abs_tol=1e-12):
         raise SelectionError(f"candidate {candidate['id']} seed {seed} embedded validation loss mismatch")
+    if accuracy is not None:
+        embedded_accuracy = _finite_number(
+            embedded.get("numeric_exact_accuracy"),
+            label="embedded validation numeric exact accuracy",
+            minimum=0.0,
+        )
+        if not math.isclose(accuracy, embedded_accuracy, rel_tol=0.0, abs_tol=1e-12):
+            raise SelectionError(
+                f"candidate {candidate['id']} seed {seed} embedded validation numeric accuracy mismatch"
+            )
     if embedded.get("manifest_sha256") != split_sha:
         raise SelectionError(f"candidate {candidate['id']} seed {seed} embedded validation split mismatch")
 
@@ -377,6 +419,8 @@ def _validate_run(
     return {
         "seed": seed,
         "loss": loss,
+        "accuracy": accuracy,
+        "selection_metric": protocol["selection_metric"],
         "epsilon_spent": spent,
         "split_manifest_sha256": split_sha,
         "config_fingerprint": status.get("config_fingerprint"),
@@ -386,19 +430,54 @@ def _validate_run(
 def _summary(candidate: Mapping[str, Any], runs: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     ordered = sorted(runs, key=lambda item: int(item["seed"]))
     losses = [float(item["loss"]) for item in ordered]
-    return {
+    metrics = {str(item["selection_metric"]) for item in ordered}
+    if len(metrics) != 1:
+        raise SelectionError(
+            f"candidate {candidate['id']} mixes selection metrics: {sorted(metrics)}"
+        )
+    selection_metric = next(iter(metrics))
+    result = {
         "candidate_id": candidate["id"],
         "family": candidate["family"],
         "method": candidate["method"],
         "params": candidate["params"],
+        "selection_metric": selection_metric,
         "seeds": [int(item["seed"]) for item in ordered],
         "loss_by_seed": {str(item["seed"]): float(item["loss"]) for item in ordered},
         "mean_validation_loss": math.fsum(losses) / len(losses),
     }
+    if selection_metric == NUMERIC_EXACT_METRIC:
+        accuracies = [float(item["accuracy"]) for item in ordered]
+        result["accuracy_by_seed"] = {
+            str(item["seed"]): float(item["accuracy"]) for item in ordered
+        }
+        result["mean_validation_accuracy"] = math.fsum(accuracies) / len(accuracies)
+    return result
 
 
 def _rank(summaries: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    ranked = sorted(summaries, key=lambda item: (float(item["mean_validation_loss"]), item["candidate_id"]))
+    summaries = list(summaries)
+    metrics = {str(item["selection_metric"]) for item in summaries}
+    if len(metrics) != 1:
+        raise SelectionError(f"cannot rank mixed selection metrics: {sorted(metrics)}")
+    selection_metric = next(iter(metrics))
+    if selection_metric == NUMERIC_EXACT_METRIC:
+        ranked = sorted(
+            summaries,
+            key=lambda item: (
+                -float(item["mean_validation_accuracy"]),
+                float(item["mean_validation_loss"]),
+                item["candidate_id"],
+            ),
+        )
+    else:
+        ranked = sorted(
+            summaries,
+            key=lambda item: (
+                float(item["mean_validation_loss"]),
+                item["candidate_id"],
+            ),
+        )
     return [{**item, "rank": index} for index, item in enumerate(ranked, start=1)]
 
 
@@ -420,7 +499,9 @@ def _selection_csv(payload: Mapping[str, Any]) -> str:
         "family",
         "method",
         "seeds",
+        "selection_metric",
         "mean_validation_loss",
+        "mean_validation_accuracy",
         "selected_role",
         "params_json",
         "split_manifest_sha256",
@@ -460,7 +541,13 @@ def _selection_csv(payload: Mapping[str, Any]) -> str:
                 "family": item["family"],
                 "method": item["method"],
                 "seeds": ",".join(str(seed) for seed in item["seeds"]),
+                "selection_metric": item["selection_metric"],
                 "mean_validation_loss": format(float(item["mean_validation_loss"]), ".17g"),
+                "mean_validation_accuracy": (
+                    format(float(item["mean_validation_accuracy"]), ".17g")
+                    if "mean_validation_accuracy" in item
+                    else ""
+                ),
                 "selected_role": "+".join(roles),
                 "params_json": _canonical_json_bytes(item["params"]).decode("utf-8"),
                 "split_manifest_sha256": payload["split_manifest_sha256"],
@@ -576,7 +663,12 @@ def select_candidates(
         payload: dict[str, Any] = {
             "schema_version": SELECTION_SCHEMA_VERSION,
             "stage": "stage1",
-            "ranking_rule": "ascending_validation_loss_then_ascending_candidate_id",
+            "ranking_rule": (
+                "descending_validation_numeric_exact_accuracy_then_ascending_validation_loss_"
+                "then_ascending_candidate_id"
+                if protocol["selection_metric"] == NUMERIC_EXACT_METRIC
+                else "ascending_validation_loss_then_ascending_candidate_id"
+            ),
             "registry_sha256": registry_sha,
             "selection_protocol_sha256": protocol_sha,
             "selection_protocol": protocol,
@@ -649,7 +741,12 @@ def select_candidates(
         payload = {
             "schema_version": SELECTION_SCHEMA_VERSION,
             "stage": "stage2",
-            "ranking_rule": "ascending_arithmetic_mean_validation_loss_then_ascending_candidate_id",
+            "ranking_rule": (
+                "descending_arithmetic_mean_validation_numeric_exact_accuracy_then_"
+                "ascending_arithmetic_mean_validation_loss_then_ascending_candidate_id"
+                if protocol["selection_metric"] == NUMERIC_EXACT_METRIC
+                else "ascending_arithmetic_mean_validation_loss_then_ascending_candidate_id"
+            ),
             "required_seeds": seeds,
             "registry_sha256": registry_sha,
             "selection_protocol_sha256": protocol_sha,

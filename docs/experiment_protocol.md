@@ -125,8 +125,10 @@ The implemented selection protocol is:
    `validation_seed` shared by every candidate and training seed;
 3. train selection arms with `--protocol_stage selection`,
    `--validation_data_is_public`, and `--run_eval false`;
-4. rank candidates only by response-only, per-record mean causal-LM validation
-   loss; exact raw clipping telemetry is diagnostic and is not a selector input;
+4. for Math-10K, rank candidates first by deterministic numeric exact-match on
+   the public holdout, then by response-only per-record causal-LM validation
+   loss as the declared tie-break; exact raw clipping telemetry is diagnostic
+   and is not a selector input;
 5. confirm the short list across the preregistered selection seeds and write an
    immutable selection record;
 6. after the record is locked, retrain with fresh seeds, `--protocol_stage final`,
@@ -140,6 +142,22 @@ data is explicitly acknowledged as public auxiliary data.  This public-benchmark
 workflow does not make exact validation release or validation-driven selection
 free for a genuinely private dataset; such a deployment needs its own privacy
 accounting or a separately public selection set.
+
+Selection runs can additionally set `--validation_eval_interval 50` to write
+response-only validation loss at steps `0, 50, ..., 300`, and
+`--validation_generate_numeric` to write endpoint public-holdout predictions,
+numeric exact accuracy, parse-failure counts, deterministic decoding settings,
+and artifact hashes.  These are public-data, non-DP selection measurements and
+remain distinct from exact `research_raw` training diagnostics.
+
+A replay trajectory is an intervention, not automatically a fresh
+single-budget DP result. The replay optimizer is the fixed-threshold Gaussian
+mechanism conditional on an immutable schedule, but a schedule constructed from
+earlier private-data-dependent SlaClip releases carries their privacy cost. Any
+end-to-end release must compose the source runs with every downstream replay or
+schedule-matched model. Development campaigns that also retain
+`research_raw` diagnostics are explicitly non-private artifact bundles
+regardless of those per-run accountant values.
 
 ## Loss definition
 
@@ -160,7 +178,9 @@ The Ubuntu/CPU unit and synthetic DP paths validate repository logic, but they d
 2. build the Python 3.11 environment and pass `pip check`;
 3. run `scripts/preflight_hpc.py` for package imports, data hashes, output paths, CUDA, and gated-model access as applicable;
 4. run `scripts/smoke_dp_path.py` on CPU and CUDA;
-5. run two update steps with the real Gemma checkpoint for `baseline`, `slaclip`, and any planned `slaclip_q` arm;
+5. run two update steps with the real Gemma checkpoint for `baseline`,
+   `slaclip`, and any planned replay arm, including a short deterministic
+   public-holdout generation smoke;
 6. confirm completed statuses, a fixed baseline `C`, finite adaptive trajectories, correct proxy targets/bounds, and expected telemetry fields;
 7. only then submit one sequential one-process/one-GPU allocation for the declared paired arms.
 

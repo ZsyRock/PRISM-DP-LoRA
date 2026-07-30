@@ -15,6 +15,8 @@ from prism_cli.trainers import (
     _deterministic_holdout_indices,
     _evaluate_validation_loss,
     _make_loader,
+    _required_curve_steps_before_resume,
+    _validation_curve_steps,
 )
 
 
@@ -279,13 +281,23 @@ def test_loader_tokenizes_validation_response_only_and_hashes_manifest(
         validation_batch_size=2,
         seed=42,
     )
-    train_loader, train_ds, validation_loader, metadata = _make_loader(cfg, object())
+    (
+        train_loader,
+        train_ds,
+        validation_loader,
+        validation_records,
+        metadata,
+    ) = _make_loader(cfg, object())
     assert len(train_ds) == 9
     assert len(train_loader.dataset) == 9
     assert validation_loader is not None
     assert len(validation_loader.dataset) == 3
     assert all(row['labels'] == [1, 2, 3] for row in train_ds)
     assert all(row['labels'] == [-100, 2, 3] for row in validation_loader.dataset)
+    assert [row['_source_index'] for row in validation_records] == metadata[
+        'validation_indices'
+    ]
+    assert all('instruction' in row for row in validation_records)
     assert metadata['source_content_sha256'] == 'f' * 64
     assert metadata['protocol_stage'] == 'selection'
     assert len(metadata['manifest_sha256']) == 64
@@ -293,8 +305,46 @@ def test_loader_tokenizes_validation_response_only_and_hashes_manifest(
     # Training seeds control model/sampler randomness but must not alter the
     # fixed public holdout shared by all paired seeds.
     other_seed_cfg = SimpleNamespace(**{**vars(cfg), 'seed': 43})
-    _, _, _, other_seed_metadata = _make_loader(other_seed_cfg, object())
+    _, _, _, _, other_seed_metadata = _make_loader(other_seed_cfg, object())
     assert other_seed_metadata == metadata
+
+
+def test_validation_curve_step_reader_is_strict_and_resume_safe(tmp_path) -> None:
+    curve = tmp_path / 'validation_curve.jsonl'
+    curve.write_text(
+        '{"step":0,"loss_mean":1.0}\n'
+        '{"step":50,"loss_mean":0.8}\n',
+        encoding='utf-8',
+    )
+    assert _validation_curve_steps(curve) == {0, 50}
+    curve.write_text('{"step":0}\n{"step":0}\n', encoding='utf-8')
+    with pytest.raises(RuntimeError, match='duplicate'):
+        _validation_curve_steps(curve)
+
+
+def test_required_curve_steps_do_not_backfill_historical_models() -> None:
+    assert _required_curve_steps_before_resume(
+        start_step=0,
+        total_update_steps=300,
+        interval=50,
+    ) == {0}
+    assert _required_curve_steps_before_resume(
+        start_step=75,
+        total_update_steps=300,
+        interval=50,
+    ) == {0, 50}
+    assert _required_curve_steps_before_resume(
+        start_step=100,
+        total_update_steps=300,
+        interval=50,
+    ) == {0, 50, 100}
+    # The final checkpoint precedes endpoint evaluation, so step 300 may be
+    # regenerated from that exact model state.
+    assert _required_curve_steps_before_resume(
+        start_step=300,
+        total_update_steps=300,
+        interval=50,
+    ) == {0, 50, 100, 150, 200, 250}
 
 
 def _write_config_data(tmp_path) -> object:
@@ -373,6 +423,20 @@ def test_any_holdout_requires_public_acknowledgement_and_no_test_eval(tmp_path) 
             run_eval=True,
             validation_data_is_public=True,
         )
+    with pytest.raises(ValueError, match='requires val_set_size'):
+        _config(
+            tmp_path,
+            validation_eval_interval=50,
+            val_set_size=0,
+            run_eval=False,
+        )
+    with pytest.raises(ValueError, match='requires val_set_size'):
+        _config(
+            tmp_path,
+            validation_generate_numeric=True,
+            val_set_size=0,
+            run_eval=False,
+        )
 
 
 def test_validation_cli_and_fingerprint_are_explicit(tmp_path) -> None:
@@ -386,6 +450,15 @@ def test_validation_cli_and_fingerprint_are_explicit(tmp_path) -> None:
             '1729',
             '--validation_batch_size',
             '16',
+            '--validation_eval_interval',
+            '50',
+            '--validation_generate_numeric',
+            '--validation_num_beams',
+            '1',
+            '--validation_max_new_tokens',
+            '128',
+            '--validation_max_input_length',
+            '512',
             '--protocol_stage',
             'selection',
             '--validation_data_is_public',
@@ -396,6 +469,11 @@ def test_validation_cli_and_fingerprint_are_explicit(tmp_path) -> None:
     assert args.val_set_size == 500
     assert args.validation_seed == 1729
     assert args.validation_batch_size == 16
+    assert args.validation_eval_interval == 50
+    assert args.validation_generate_numeric is True
+    assert args.validation_num_beams == 1
+    assert args.validation_max_new_tokens == 128
+    assert args.validation_max_input_length == 512
     assert args.protocol_stage == 'selection'
     assert args.validation_data_is_public is True
     assert args.run_eval is False
@@ -407,6 +485,11 @@ def test_validation_cli_and_fingerprint_are_explicit(tmp_path) -> None:
         val_set_size=2,
         validation_seed=1730,
         validation_batch_size=16,
+        validation_eval_interval=50,
+        validation_generate_numeric=True,
+        validation_num_beams=1,
+        validation_max_new_tokens=128,
+        validation_max_input_length=512,
         validation_data_is_public=True,
         run_eval=False,
     )
@@ -415,5 +498,10 @@ def test_validation_cli_and_fingerprint_are_explicit(tmp_path) -> None:
     payload = selected.fingerprint_payload()
     assert payload['validation_seed'] == 1730
     assert payload['validation_batch_size'] == 16
+    assert payload['validation_eval_interval'] == 50
+    assert payload['validation_generate_numeric'] is True
+    assert payload['validation_num_beams'] == 1
+    assert payload['validation_max_new_tokens'] == 128
+    assert payload['validation_max_input_length'] == 512
     assert payload['protocol_stage'] == 'selection'
     assert payload['validation_data_is_public'] is True

@@ -36,9 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--dataset', choices=['math10k', 'math', 'glue8', 'glue'], default=None)
     p.add_argument(
         '--method',
-        choices=['baseline', 'slaclip', 'slaclip_q'],
+        choices=['baseline', 'slaclip', 'slaclip_q', 'replay'],
         default='baseline',
-        help='Fixed PRISM, official full SlaClip+PRISM, or fixed-target SlaClip-Q+PRISM.',
+        help=(
+            'Fixed PRISM, official full SlaClip+PRISM, fixed-target '
+            'SlaClip-Q+PRISM, or a pre-committed deterministic C schedule.'
+        ),
     )
     p.add_argument('--privacy', choices=['dp', 'nondp', 'non-dp'], default='dp')
     p.add_argument('--epsilon', dest='dp_epsilon', type=float, default=6.0)
@@ -69,6 +72,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument('--validation_seed', type=int, default=1729)
     p.add_argument('--validation_batch_size', type=int, default=8)
+    p.add_argument(
+        '--validation_eval_interval',
+        type=int,
+        default=0,
+        help=(
+            'When positive, record deterministic public response-loss curves '
+            'at step 0, each interval, and the final update.'
+        ),
+    )
+    p.add_argument(
+        '--validation_generate_numeric',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            'Use deterministic public Math-10K numeric exact match as the '
+            'endpoint selection metric while retaining response-only loss.'
+        ),
+    )
+    p.add_argument('--validation_num_beams', type=int, default=1)
+    p.add_argument('--validation_max_new_tokens', type=int, default=128)
+    p.add_argument('--validation_max_input_length', type=int, default=512)
     p.add_argument('--protocol_stage', choices=['pilot', 'selection', 'final'], default='pilot')
     p.add_argument(
         '--validation_data_is_public',
@@ -114,6 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument('--slaclip_c_min', type=float, default=0.1)
     p.add_argument('--slaclip_c_max', type=float, default=50.0)
+    p.add_argument(
+        '--clip_schedule_path',
+        type=Path,
+        default=None,
+        help=(
+            'Required for method=replay. JSON array (or object with a '
+            'clip_thresholds array) containing exactly one positive finite C '
+            'per update.'
+        ),
+    )
     p.add_argument('--run_train', type=parse_bool, default=True)
     p.add_argument('--run_eval', type=parse_bool, default=True)
     p.add_argument('--force_train', action=argparse.BooleanOptionalAction, default=False)
@@ -162,7 +196,7 @@ def parse_cli_args(argv=None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.dataset is None:
         parser.error('--dataset is required either on the CLI or in --config')
-    for name in ('data_path', 'output_dir', 'result_dir'):
+    for name in ('data_path', 'output_dir', 'result_dir', 'clip_schedule_path'):
         value = getattr(args, name)
         if value is not None and not isinstance(value, Path):
             setattr(args, name, Path(value))

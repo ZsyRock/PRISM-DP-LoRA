@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from dataclasses import fields
@@ -9,7 +10,14 @@ import pytest
 
 import train_eval
 from prism_cli.experiment_identity import git_worktree_identity
-from prism_cli.trainers import RunConfig, validate_existing_run_identity
+from prism_cli.trainers import (
+    CHECKPOINT_SCHEMA_VERSION,
+    LOSS_DEFINITION,
+    RunConfig,
+    _status_common,
+    _validate_checkpoint_identity,
+    validate_existing_run_identity,
+)
 
 
 def _write_math_data(root: Path, text: str = '[{"instruction":"x","input":"","output":"y"}]') -> Path:
@@ -24,6 +32,13 @@ def _config(root: Path, **overrides) -> RunConfig:
     values = dict(dataset='math10k', method='slaclip', privacy='dp', root=root)
     values.update(overrides)
     return RunConfig(**values).finalize()
+
+
+def _write_schedule(path: Path, thresholds: list[float], **metadata) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {'clip_thresholds': thresholds, **metadata}
+    path.write_text(json.dumps(payload, sort_keys=True), encoding='utf-8')
+    return path
 
 
 def test_json_defaults_are_overridden_by_explicit_cli(tmp_path: Path) -> None:
@@ -88,6 +103,172 @@ def test_slaclip_q_cli_keeps_requested_clipped_fraction_unambiguous() -> None:
     assert args.slaclip_target_clip_fraction == pytest.approx(0.99)
     assert args.slaclip_c_min == pytest.approx(0.1)
     assert args.slaclip_c_max == pytest.approx(15.0)
+
+
+def test_replay_cli_accepts_schedule_path() -> None:
+    args = train_eval.parse_cli_args(
+        [
+            '--dataset',
+            'math10k',
+            '--method',
+            'replay',
+            '--clip_schedule_path',
+            '/tmp/locked-schedule.json',
+        ]
+    )
+    assert args.method == 'replay'
+    assert args.clip_schedule_path == Path('/tmp/locked-schedule.json')
+
+
+def test_replay_schedule_is_validated_hashed_and_path_independent(tmp_path: Path) -> None:
+    schedule_a = _write_schedule(
+        tmp_path / 'schedule-a.json',
+        [1.0, 1.25, 0.75],
+        source_campaign='development-v1',
+        source_arm='slaclip-beta99',
+        source_seed=42,
+        selection_rule='mean C_t by step over locked development seeds',
+    )
+    schedule_b = tmp_path / 'other-machine' / 'schedule-b.json'
+    schedule_b.parent.mkdir(parents=True)
+    schedule_b.write_bytes(schedule_a.read_bytes())
+    first = _config(
+        tmp_path / 'host-a',
+        method='replay',
+        total_update_steps=3,
+        dp_max_grad_norm=1.0,
+        clip_schedule_path=schedule_a,
+    )
+    second = _config(
+        tmp_path / 'host-b',
+        method='replay',
+        total_update_steps=3,
+        dp_max_grad_norm=1.0,
+        clip_schedule_path=schedule_b,
+    )
+
+    expected_sha = hashlib.sha256(schedule_a.read_bytes()).hexdigest()
+    assert first.clip_schedule_sha256 == expected_sha
+    assert first.clip_schedule_values == [1.0, 1.25, 0.75]
+    assert first.clip_schedule_metadata['source_campaign'] == 'development-v1'
+    assert first.clip_threshold_for_step(1) == pytest.approx(1.25)
+    assert first.fingerprint_payload()['clip_schedule_sha256'] == expected_sha
+    assert first.config_fingerprint == second.config_fingerprint
+    assert 'clip_schedule_path' not in first.fingerprint_payload()
+    status = _status_common(first)
+    assert status['clip_schedule'] == {
+        'sha256': expected_sha,
+        'steps': 3,
+        'metadata': first.clip_schedule_metadata,
+        'privacy_accounting_scope': (
+            'training_run_epsilon_is_conditional_on_the_locked_schedule'
+        ),
+        'schedule_privacy_class': 'UNSPECIFIED_PRECOMMITTED_SCHEDULE',
+        'end_to_end_privacy_requires_schedule_provenance_and_composition': True,
+    }
+
+
+@pytest.mark.parametrize(
+    ('thresholds', 'steps', 'initial_c', 'message'),
+    [
+        ([1.0, 2.0], 3, 1.0, 'length'),
+        ([1.0, 0.0, 2.0], 3, 1.0, 'finite and positive'),
+        ([1.0, float('inf'), 2.0], 3, 1.0, 'finite and positive'),
+        ([0.5, 1.0, 2.0], 3, 1.0, 'first value'),
+    ],
+)
+def test_replay_schedule_rejects_invalid_values(
+    tmp_path: Path,
+    thresholds: list[float],
+    steps: int,
+    initial_c: float,
+    message: str,
+) -> None:
+    schedule = _write_schedule(tmp_path / 'bad-schedule.json', thresholds)
+    _write_math_data(tmp_path)
+    with pytest.raises(ValueError, match=message):
+        RunConfig(
+            dataset='math10k',
+            method='replay',
+            privacy='dp',
+            root=tmp_path,
+            total_update_steps=steps,
+            dp_max_grad_norm=initial_c,
+            clip_schedule_path=schedule,
+        ).finalize()
+
+
+def test_replay_requires_schedule_and_schedule_is_replay_only(tmp_path: Path) -> None:
+    _write_math_data(tmp_path)
+    with pytest.raises(ValueError, match='requires --clip_schedule_path'):
+        RunConfig(
+            dataset='math10k',
+            method='replay',
+            privacy='dp',
+            root=tmp_path,
+            total_update_steps=1,
+        ).finalize()
+    schedule = _write_schedule(tmp_path / 'schedule.json', [1.0])
+    with pytest.raises(ValueError, match='only valid with method=replay'):
+        RunConfig(
+            dataset='math10k',
+            method='baseline',
+            privacy='dp',
+            root=tmp_path,
+            total_update_steps=1,
+            clip_schedule_path=schedule,
+        ).finalize()
+
+
+def test_checkpoint_identity_records_and_checks_schedule_sha(tmp_path: Path) -> None:
+    schedule = _write_schedule(tmp_path / 'schedule.json', [1.0, 1.1])
+    cfg = _config(
+        tmp_path,
+        method='replay',
+        total_update_steps=2,
+        clip_schedule_path=schedule,
+    )
+    checkpoint = {
+        'update_steps': 0,
+        'extra': {
+            'checkpoint_schema_version': CHECKPOINT_SCHEMA_VERSION,
+            'config_fingerprint': cfg.config_fingerprint,
+            'clip_schedule_sha256': cfg.clip_schedule_sha256,
+            'loss_definition': LOSS_DEFINITION,
+        },
+    }
+    assert _validate_checkpoint_identity(cfg, checkpoint)[
+        'clip_schedule_sha256'
+    ] == cfg.clip_schedule_sha256
+    checkpoint['extra']['clip_schedule_sha256'] = '0' * 64
+    with pytest.raises(RuntimeError, match='clip schedule SHA256 mismatch'):
+        _validate_checkpoint_identity(cfg, checkpoint)
+
+
+def test_checkpoint_identity_accepts_final_step_for_post_training_resume(
+    tmp_path: Path,
+) -> None:
+    schedule = _write_schedule(tmp_path / 'schedule.json', [1.0, 1.1])
+    cfg = _config(
+        tmp_path,
+        method='replay',
+        total_update_steps=2,
+        clip_schedule_path=schedule,
+    )
+    checkpoint = {
+        'update_steps': cfg.total_update_steps,
+        'extra': {
+            'checkpoint_schema_version': CHECKPOINT_SCHEMA_VERSION,
+            'config_fingerprint': cfg.config_fingerprint,
+            'clip_schedule_sha256': cfg.clip_schedule_sha256,
+            'loss_definition': LOSS_DEFINITION,
+        },
+    }
+
+    assert _validate_checkpoint_identity(cfg, checkpoint) is checkpoint['extra']
+    checkpoint['update_steps'] = cfg.total_update_steps + 1
+    with pytest.raises(RuntimeError, match=r'outside \[0, 2\]'):
+        _validate_checkpoint_identity(cfg, checkpoint)
 
 
 def test_unknown_json_field_is_rejected(tmp_path: Path) -> None:
