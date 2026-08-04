@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,6 +17,7 @@ from .modeling import (
     resolve_text_lora_target_modules,
     resolved_model_revision,
 )
+from .math_answers import parse_reference_number
 from .utils import JsonlLogger, adapter_is_complete, build_tokenizer, checkpoint_file, clean_output_dir, cleanup_cuda, collect_runtime_metadata, ensure_text_only_token_type_ids, freeze_vision_tower_params, generate_prompt, get_rng_state, iter_microbatches, llm_adapters_dir, load_resume_checkpoint_if_available, load_trainable_state_dict, save_resume_checkpoint, save_status, set_rng_state, set_seed, tokenize_prompt, truncate_jsonl_to_step, unwrap_for_save, write_json_atomic
 from .validation_math import evaluate_public_math_numeric_exact
 from .slaclip import resolve_full_slaclip_target
@@ -24,7 +26,28 @@ from .slaclip import resolve_full_slaclip_target
 CHECKPOINT_SCHEMA_VERSION = 4
 TELEMETRY_SCHEMA_VERSION = 5
 LOSS_DEFINITION = 'per_record_mean_of_nonignored_next_token_losses'
-VALIDATION_SPLIT_SCHEMA_VERSION = 1
+VALIDATION_SPLIT_SCHEMA_VERSION = 2
+PROMPT_GROUP_NORMALIZATION_ID = (
+    'instruction_input_nfkc_casefold_whitespace_collapse_v1'
+)
+
+
+def _normalize_prompt_group_field(value: Any) -> str:
+    """Return the conservative, versioned prompt-group representation."""
+    return ' '.join(unicodedata.normalize('NFKC', str(value)).casefold().split())
+
+
+def _prompt_group_payload(record: Dict[str, Any]) -> bytes:
+    """Canonicalize the two prompt fields without introducing join ambiguity."""
+    return json.dumps(
+        {
+            'instruction': _normalize_prompt_group_field(record.get('instruction', '')),
+            'input': _normalize_prompt_group_field(record.get('input', '')),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
 
 @dataclass
 class RunConfig:
@@ -624,6 +647,7 @@ def _deterministic_holdout_indices(
     seed: int,
     *,
     dataset: str,
+    require_numeric_reference: bool = False,
 ) -> tuple[list[int], list[int], Dict[str, Any]]:
     """Return a stable stratified prompt-group split and an audit manifest."""
     total_rows = int(len(records))
@@ -635,18 +659,22 @@ def _deterministic_holdout_indices(
         raise ValueError(
             f'val_set_size must satisfy 0 <= val_set_size < {total_rows}, got {holdout_size}'
         )
+    if require_numeric_reference and str(dataset) != 'math10k':
+        raise ValueError(
+            'numeric-reference validation eligibility is only defined for Math-10K'
+        )
     groups_by_stratum: Dict[str, Dict[str, list[int]]] = {}
     record_hashes: Dict[int, str] = {}
+    numeric_reference_by_index: Dict[int, bool] = {}
     for index in range(total_rows):
         record = dict(records[index])
         instruction = str(record.get('instruction', ''))
-        input_text = str(record.get('input', ''))
-        stratum = instruction if str(dataset) == 'glue8' else str(dataset)
-        prompt_payload = json.dumps(
-            [instruction, input_text],
-            ensure_ascii=False,
-            separators=(',', ':'),
-        ).encode('utf-8')
+        stratum = (
+            _normalize_prompt_group_field(instruction)
+            if str(dataset) == 'glue8'
+            else str(dataset)
+        )
+        prompt_payload = _prompt_group_payload(record)
         prompt_hash = hashlib.sha256(prompt_payload).hexdigest()
         groups_by_stratum.setdefault(stratum, {}).setdefault(prompt_hash, []).append(index)
         record_payload = json.dumps(
@@ -657,12 +685,47 @@ def _deterministic_holdout_indices(
             default=str,
         ).encode('utf-8')
         record_hashes[index] = hashlib.sha256(record_payload).hexdigest()
+        if require_numeric_reference:
+            numeric_reference_by_index[index] = (
+                parse_reference_number(record.get('answer')) is not None
+            )
 
-    stratum_sizes = {key: sum(len(group) for group in groups.values()) for key, groups in groups_by_stratum.items()}
-    raw_targets = {
-        key: float(holdout_size) * float(size) / float(total_rows)
-        for key, size in stratum_sizes.items()
+    prompt_group_count = sum(len(groups) for groups in groups_by_stratum.values())
+    duplicate_prompt_groups = [
+        indices
+        for groups in groups_by_stratum.values()
+        for indices in groups.values()
+        if len(indices) > 1
+    ]
+
+    eligible_groups_by_stratum = groups_by_stratum
+    ineligible_group_count = 0
+    if require_numeric_reference:
+        eligible_groups_by_stratum = {}
+        for stratum, groups in groups_by_stratum.items():
+            eligible_groups = {
+                prompt_hash: indices
+                for prompt_hash, indices in groups.items()
+                if all(numeric_reference_by_index[index] for index in indices)
+            }
+            eligible_groups_by_stratum[stratum] = eligible_groups
+            ineligible_group_count += len(groups) - len(eligible_groups)
+
+    stratum_sizes = {
+        key: sum(len(group) for group in groups.values())
+        for key, groups in eligible_groups_by_stratum.items()
     }
+    eligible_rows = sum(stratum_sizes.values())
+    if holdout_size > eligible_rows:
+        qualifier = ' numeric-reference-eligible' if require_numeric_reference else ''
+        raise ValueError(
+            f'val_set_size={holdout_size} exceeds the {eligible_rows}'
+            f'{qualifier} rows available for validation'
+        )
+    raw_targets = {
+        key: float(holdout_size) * float(size) / float(eligible_rows)
+        for key, size in stratum_sizes.items()
+    } if eligible_rows else {key: 0.0 for key in stratum_sizes}
     stratum_targets = {key: int(math.floor(value)) for key, value in raw_targets.items()}
     remainder = holdout_size - sum(stratum_targets.values())
     for key in sorted(
@@ -672,10 +735,10 @@ def _deterministic_holdout_indices(
         stratum_targets[key] += 1
 
     validation_indices: list[int] = []
-    for stratum in sorted(groups_by_stratum):
+    for stratum in sorted(eligible_groups_by_stratum):
         target = stratum_targets[stratum]
         ranked_groups = sorted(
-            groups_by_stratum[stratum].items(),
+            eligible_groups_by_stratum[stratum].items(),
             key=lambda item: (
                 hashlib.sha256(f'{seed}:{stratum}:{item[0]}'.encode('utf-8')).hexdigest(),
                 item[0],
@@ -709,7 +772,7 @@ def _deterministic_holdout_indices(
     ).encode('utf-8')
     metadata = {
         'schema_version': VALIDATION_SPLIT_SCHEMA_VERSION,
-        'algorithm': 'sha256_ranked_stratified_prompt_group_v1',
+        'algorithm': 'sha256_ranked_stratified_normalized_prompt_group_v2',
         'seed': seed,
         'source_rows': total_rows,
         'train_rows': len(train_indices),
@@ -720,7 +783,35 @@ def _deterministic_holdout_indices(
         'validation_indices_sha256': hashlib.sha256(index_bytes).hexdigest(),
         'train_record_hashes_sha256': hashlib.sha256(train_hash_bytes).hexdigest(),
         'validation_record_hashes_sha256': hashlib.sha256(validation_hash_bytes).hexdigest(),
+        'prompt_group_identity': {
+            'id': PROMPT_GROUP_NORMALIZATION_ID,
+            'fields': ['instruction', 'input'],
+            'unicode_normalization': 'NFKC',
+            'case_normalization': 'casefold',
+            'whitespace_rule': 'split then join with one ASCII space',
+            'canonical_serialization': 'sorted-key compact UTF-8 JSON object',
+        },
+        'normalized_prompt_groups': prompt_group_count,
+        'normalized_duplicate_prompt_groups': len(duplicate_prompt_groups),
+        'normalized_duplicate_prompt_rows': sum(
+            len(indices) for indices in duplicate_prompt_groups
+        ),
     }
+    if require_numeric_reference:
+        metadata.update({
+            'algorithm': (
+                'sha256_ranked_stratified_numeric_reference_normalized_prompt_group_v3'
+            ),
+            'validation_eligibility': (
+                'all_records_in_prompt_group_have_finite_numeric_answer'
+            ),
+            'validation_eligible_rows': eligible_rows,
+            'validation_ineligible_rows': total_rows - eligible_rows,
+            'validation_eligible_prompt_groups': sum(
+                len(groups) for groups in eligible_groups_by_stratum.values()
+            ),
+            'validation_ineligible_prompt_groups': ineligible_group_count,
+        })
     return train_indices, validation_indices, metadata
 
 
@@ -735,6 +826,10 @@ def _make_loader(cfg: RunConfig, tokenizer):
         int(cfg.val_set_size),
         int(cfg.validation_seed),
         dataset=cfg.dataset,
+        require_numeric_reference=bool(
+            cfg.dataset == 'math10k'
+            and getattr(cfg, 'validation_generate_numeric', False)
+        ),
     )
     split_metadata['source_content_sha256'] = cfg.data_content_sha256
     split_metadata['protocol_stage'] = cfg.protocol_stage

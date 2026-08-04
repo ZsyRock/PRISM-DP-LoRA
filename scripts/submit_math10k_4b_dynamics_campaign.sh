@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
-# Submit one portable two-H200 allocation for the 4B PRISM/SlaClip development
-# campaign.  This wrapper performs only submission-time validation and immutable
-# source staging.  All GPU smoke tests and experiment arms execute inside the
-# single allocation.
+# Submit one portable two-H200 allocation for the complete 4B PRISM/SlaClip
+# screening, lock, and fresh-seed confirmation campaign.  This wrapper performs
+# only submission-time validation and immutable source staging.  All GPU smoke
+# tests and experiment arms execute inside the single allocation.
 set -Eeuo pipefail
 umask 077
 
@@ -16,7 +16,8 @@ Usage:
 
 Run --test-only first. It asks Slurm to validate the exact allocation without
 queuing work. --submit creates one queued campaign containing all smoke,
-screening, confirmation, replay, and matched-fixed arms.
+screening, selection-seed confirmation, replay/matched-fixed controls, and
+fresh-seed full-data task evaluation arms.
 
 --resume-submit is accepted only after the campaign's previously receipted
 Slurm job has reached a failed/timeout terminal state. It resumes the same
@@ -103,7 +104,7 @@ PARTITION="${PRISM_SLURM_PARTITION:-quad_h200,dual_h200}"
 GPU_GRES="${PRISM_GPU_GRES:-gpu:h200:2}"
 CPUS_PER_TASK="${PRISM_CPUS_PER_TASK:-8}"
 HOST_MEMORY="${PRISM_HOST_MEMORY:-256G}"
-WALLTIME="${PRISM_WALLTIME:-1-16:00:00}"
+WALLTIME="${PRISM_WALLTIME:-2-12:00:00}"
 
 MODEL_ID="google/gemma-3-4b-pt"
 MODEL_REVISION="cc012e0a6d0787b4adcc0fa2c4da74402494554d"
@@ -447,7 +448,7 @@ echo "code_sha=${LOCKED_REPO_SHA}"
 echo "environment=${ENV_PREFIX}"
 echo "model=${MODEL_ID}@${MODEL_REVISION}"
 echo "resources=account:${ACCOUNT},qos:${QOS},partition:${PARTITION},2xH200,16cpu,${HOST_MEMORY},${WALLTIME}"
-echo "protocol=stage1_grid_then_multiseed_lock_then_replay_matched_fixed"
+echo "protocol=stage1_grid_then_multiseed_lock_then_fresh_seed_final_controls"
 echo "privacy_warning=research_raw artifacts are NON_PRIVATE and remain under scratch with umask 077"
 
 SUBMISSION_RC=0

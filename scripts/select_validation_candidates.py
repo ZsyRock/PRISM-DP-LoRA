@@ -532,6 +532,9 @@ def _selection_csv(payload: Mapping[str, Any]) -> str:
     writer.writeheader()
     best_fixed = (payload.get("best_fixed") or {}).get("candidate_id")
     top_ids = {item["candidate_id"] for item in payload.get("top_slaclip", [])}
+    top_fixed_ids = {
+        item["candidate_id"] for item in payload.get("top_fixed", [])
+    }
     selected = (payload.get("selected_slaclip") or {}).get("candidate_id")
     fixed_ranks = {
         item["candidate_id"]: item["rank"] for item in payload.get("fixed_ranking", [])
@@ -543,6 +546,8 @@ def _selection_csv(payload: Mapping[str, Any]) -> str:
         roles = []
         if item["candidate_id"] == best_fixed:
             roles.append("best_fixed")
+        if item["candidate_id"] in top_fixed_ids:
+            roles.append("top_fixed")
         if item["candidate_id"] in top_ids:
             roles.append("top_slaclip")
         if item["candidate_id"] == selected:
@@ -654,6 +659,7 @@ def select_candidates(
     output_path: Path,
     top_slaclip: int,
     stage1_selection_path: Path | None = None,
+    top_fixed: int = 2,
 ) -> dict[str, Any]:
     campaign_root = campaign_root.resolve(strict=True)
     registry_path = _resolve_screen_input(
@@ -667,6 +673,8 @@ def select_candidates(
     stage = stage.casefold()
     if top_slaclip <= 0:
         raise SelectionError("--top-slaclip must be positive")
+    if top_fixed <= 0:
+        raise SelectionError("--top-fixed must be positive")
 
     if stage == "stage1":
         seed = int(protocol["stage1_seed"])
@@ -681,6 +689,10 @@ def select_candidates(
         slaclip = _rank(item for item in summaries if item["family"] == "slaclip")
         if len(slaclip) < top_slaclip:
             raise SelectionError(f"requested top {top_slaclip} SlaClip candidates but only {len(slaclip)} exist")
+        if len(fixed) < top_fixed:
+            raise SelectionError(
+                f"requested top {top_fixed} fixed-C candidates but only {len(fixed)} exist"
+            )
         combined = _rank(summaries)
         payload: dict[str, Any] = {
             "schema_version": SELECTION_SCHEMA_VERSION,
@@ -699,6 +711,7 @@ def select_candidates(
             "fixed_ranking": fixed,
             "slaclip_ranking": slaclip,
             "best_fixed": fixed[0],
+            "top_fixed": fixed[:top_fixed],
             "top_slaclip": slaclip[:top_slaclip],
         }
     elif stage == "stage2":
@@ -719,6 +732,16 @@ def select_candidates(
         top_ids = [item.get("candidate_id") for item in top if isinstance(item, dict)]
         if len(top_ids) != top_slaclip or len(set(top_ids)) != top_slaclip:
             raise SelectionError("stage1 top_slaclip candidate identities are invalid")
+        top_fixed_items = stage1.get("top_fixed")
+        if not isinstance(top_fixed_items, list) or len(top_fixed_items) != top_fixed:
+            raise SelectionError("stage1 selection has an unexpected top_fixed set")
+        top_fixed_ids = [
+            item.get("candidate_id")
+            for item in top_fixed_items
+            if isinstance(item, dict)
+        ]
+        if len(top_fixed_ids) != top_fixed or len(set(top_fixed_ids)) != top_fixed:
+            raise SelectionError("stage1 top_fixed candidate identities are invalid")
         seeds = [int(seed) for seed in protocol["stage2_seeds"]]
         all_runs: list[dict[str, Any]] = []
         slaclip_summaries = []
@@ -730,10 +753,6 @@ def select_candidates(
             all_runs.extend(validated_runs)
             slaclip_summaries.append(_summary(candidate, validated_runs))
 
-        stage1_best_fixed = stage1.get("best_fixed")
-        if not isinstance(stage1_best_fixed, dict):
-            raise SelectionError("stage1 selection has no valid best_fixed candidate")
-        stage1_best_fixed_id = stage1_best_fixed.get("candidate_id")
         canonical_fixed_ids = [
             candidate_id
             for candidate_id, candidate in candidates.items()
@@ -745,7 +764,10 @@ def select_candidates(
                 "registry must identify exactly one canonical fixed-C=1 candidate using params.dp_max_grad_norm=1.0"
             )
         canonical_fixed_id = canonical_fixed_ids[0]
-        fixed_ids = list(dict.fromkeys([stage1_best_fixed_id, canonical_fixed_id]))
+        # Re-rank the top-two one-seed fixed candidates using all three
+        # selection seeds.  C=1 remains a preregistered paper anchor even when
+        # it did not survive the one-seed top-two filter.
+        fixed_ids = list(dict.fromkeys([*top_fixed_ids, canonical_fixed_id]))
         fixed_summaries = []
         for candidate_id in fixed_ids:
             candidate = candidates.get(candidate_id)
@@ -779,8 +801,10 @@ def select_candidates(
             "fixed_ranking": fixed_ranked,
             "slaclip_ranking": slaclip_ranked,
             "canonical_fixed_candidate_id": canonical_fixed_id,
-            "stage1_best_fixed_candidate_id": stage1_best_fixed_id,
+            "stage1_best_fixed_candidate_id": stage1["best_fixed"]["candidate_id"],
+            "stage1_top_fixed_candidate_ids": top_fixed_ids,
             "best_fixed": fixed_ranked[0],
+            "top_fixed": fixed_ranked,
             "top_slaclip": slaclip_ranked,
             "selected_slaclip": slaclip_ranked[0],
         }
@@ -811,6 +835,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage", type=str.lower, choices=("stage1", "stage2"), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--top-slaclip", type=int, default=2)
+    parser.add_argument("--top-fixed", type=int, default=2)
     parser.add_argument("--stage1-selection", type=Path, default=None)
     return parser
 
@@ -827,6 +852,7 @@ def main(argv: list[str] | None = None) -> int:
             stage=args.stage,
             output_path=output,
             top_slaclip=args.top_slaclip,
+            top_fixed=args.top_fixed,
             stage1_selection_path=args.stage1_selection,
         )
     except SelectionError as exc:

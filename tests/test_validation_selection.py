@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ from torch.utils.data import DataLoader
 import train_eval
 import prism_cli.trainers as trainers
 from prism_cli.losses import causal_lm_per_example_loss
+from prism_cli.math_answers import parse_reference_number
 from prism_cli.trainers import (
     RunConfig,
     _deterministic_holdout_indices,
@@ -67,7 +69,12 @@ def test_holdout_indices_are_stable_disjoint_and_hashed() -> None:
     assert len(first_validation) == 17
     assert set(first_train).isdisjoint(first_validation)
     assert sorted(first_train + first_validation) == list(range(100))
-    assert first_metadata['algorithm'] == 'sha256_ranked_stratified_prompt_group_v1'
+    assert first_metadata['algorithm'] == (
+        'sha256_ranked_stratified_normalized_prompt_group_v2'
+    )
+    assert first_metadata['prompt_group_identity']['id'] == (
+        'instruction_input_nfkc_casefold_whitespace_collapse_v1'
+    )
     assert first_metadata['validation_indices'] == first_validation
     for key in (
         'validation_indices_sha256',
@@ -125,6 +132,148 @@ def test_duplicate_prompts_never_cross_train_and_validation() -> None:
         train_set = set(train)
         validation_set = set(validation)
         assert duplicate_indices <= train_set or duplicate_indices <= validation_set
+
+
+def test_normalized_duplicate_prompts_never_cross_split() -> None:
+    records = _math_records(30)
+    records[0] = {
+        'instruction': 'Solve\u00a0Ａ + B',
+        'input': '  Value\tof B  ',
+        'output': 'first answer',
+    }
+    records[1] = {
+        'instruction': '  solve a + b  ',
+        'input': 'value of b',
+        'output': 'second answer',
+    }
+    duplicate_indices = {0, 1}
+    for seed in range(20):
+        train, validation, metadata = _deterministic_holdout_indices(
+            records,
+            7,
+            seed,
+            dataset='math10k',
+        )
+        assert duplicate_indices <= set(train) or duplicate_indices <= set(validation)
+        assert metadata['normalized_duplicate_prompt_groups'] == 1
+        assert metadata['normalized_duplicate_prompt_rows'] == 2
+
+
+def test_numeric_holdout_uses_only_fully_eligible_prompt_groups() -> None:
+    records = [
+        {
+            'instruction': f'numeric-question-{index}',
+            'input': '',
+            'output': f'The answer is {index}.',
+            'answer': str(index),
+        }
+        for index in range(10)
+    ]
+    records[1] = {
+        'instruction': records[0]['instruction'],
+        'input': records[0]['input'],
+        'output': 'The correct option is C.',
+        'answer': 'C',
+    }
+    records.extend([
+        {
+            'instruction': 'choice-question-a',
+            'input': '',
+            'output': 'The correct option is A.',
+            'answer': 'A',
+        },
+        {
+            'instruction': 'choice-question-b',
+            'input': '',
+            'output': 'The correct option is B.',
+            'answer': 'B',
+        },
+    ])
+
+    train, validation, metadata = _deterministic_holdout_indices(
+        records,
+        5,
+        1729,
+        dataset='math10k',
+        require_numeric_reference=True,
+    )
+
+    assert len(validation) == 5
+    assert all(
+        parse_reference_number(records[index]['answer']) is not None
+        for index in validation
+    )
+    # A mixed numeric/non-numeric duplicate-prompt group is wholly ineligible,
+    # so its numeric member cannot leak across the train/validation boundary.
+    assert {0, 1} <= set(train)
+    assert {10, 11} <= set(train)
+    assert set(train).isdisjoint(validation)
+    assert sorted(train + validation) == list(range(len(records)))
+    assert metadata['algorithm'] == (
+        'sha256_ranked_stratified_numeric_reference_normalized_prompt_group_v3'
+    )
+    assert metadata['validation_eligibility'] == (
+        'all_records_in_prompt_group_have_finite_numeric_answer'
+    )
+    assert metadata['validation_eligible_rows'] == 8
+    assert metadata['validation_ineligible_rows'] == 4
+    assert metadata['validation_eligible_prompt_groups'] == 8
+    assert metadata['validation_ineligible_prompt_groups'] == 3
+    assert metadata['normalized_duplicate_prompt_groups'] == 1
+
+
+def test_numeric_holdout_rejects_insufficient_eligible_rows() -> None:
+    records = [
+        {
+            'instruction': f'question-{index}',
+            'input': '',
+            'output': str(index),
+            'answer': str(index) if index < 3 else 'C',
+        }
+        for index in range(5)
+    ]
+    with pytest.raises(ValueError, match='numeric-reference-eligible'):
+        _deterministic_holdout_indices(
+            records,
+            4,
+            1729,
+            dataset='math10k',
+            require_numeric_reference=True,
+        )
+
+
+def test_repository_math10k_numeric_holdouts_are_exact_and_finite() -> None:
+    data_path = (
+        Path(__file__).resolve().parents[1]
+        / 'LLM-Adapters'
+        / 'ft-training_set'
+        / 'math_10k.json'
+    )
+    records = json.loads(data_path.read_text(encoding='utf-8'))
+
+    selected_by_size = {}
+    for holdout_size in (8, 500):
+        train, validation, metadata = _deterministic_holdout_indices(
+            records,
+            holdout_size,
+            1729,
+            dataset='math10k',
+            require_numeric_reference=True,
+        )
+        selected_by_size[holdout_size] = validation
+        assert len(validation) == holdout_size
+        assert len(train) == len(records) - holdout_size
+        assert set(train).isdisjoint(validation)
+        assert all(
+            parse_reference_number(records[index].get('answer')) is not None
+            for index in validation
+        )
+        assert metadata['validation_eligible_rows'] == 9206
+
+    assert selected_by_size[8] == [378, 2377, 3029, 3033, 6088, 6818, 6868, 9241]
+    assert metadata['normalized_prompt_groups'] == 9555
+    assert metadata['normalized_duplicate_prompt_groups'] == 296
+    assert metadata['normalized_duplicate_prompt_rows'] == 660
 
 
 def test_glue_holdout_is_stratified_by_task_instruction() -> None:

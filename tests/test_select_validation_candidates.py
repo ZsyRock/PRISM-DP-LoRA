@@ -36,8 +36,8 @@ def _write_json(path: Path, payload, *, allow_nan: bool = False) -> None:
 
 def _split_manifest(*, discriminator: str = "shared") -> dict:
     payload = {
-        "schema_version": 1,
-        "algorithm": "sha256_ranked_stratified_prompt_group_v1",
+        "schema_version": 2,
+        "algorithm": "sha256_ranked_stratified_normalized_prompt_group_v2",
         "seed": 1729,
         "source_rows": 9919,
         "train_rows": 8919,
@@ -48,6 +48,10 @@ def _split_manifest(*, discriminator: str = "shared") -> dict:
         "validation_indices_sha256": "1" * 64,
         "train_record_hashes_sha256": "2" * 64,
         "validation_record_hashes_sha256": hashlib.sha256(discriminator.encode()).hexdigest(),
+        "prompt_group_identity": {
+            "id": "instruction_input_nfkc_casefold_whitespace_collapse_v1",
+            "fields": ["instruction", "input"],
+        },
         "source_content_sha256": "3" * 64,
         "protocol_stage": "selection",
         "validation_data_is_public": True,
@@ -142,6 +146,7 @@ def _build_campaign(tmp_path: Path) -> tuple[Path, Path]:
     definitions = [
         ("fixed-c1", "fixed", {"dp_max_grad_norm": 1.0}, {42: 2.0, 43: 2.0, 44: 2.0}),
         ("fixed-c15", "fixed", {"dp_max_grad_norm": 1.5}, {42: 1.7, 43: 2.1, 44: 2.5}),
+        ("fixed-c2", "fixed", {"dp_max_grad_norm": 2.0}, {42: 1.8, 43: 2.2, 44: 2.6}),
         (
             "sla-a",
             "slaclip",
@@ -245,6 +250,10 @@ def test_stage1_and_stage2_are_deterministic_and_ignore_unselected_runs(tmp_path
     stage1_path = campaign / "selection" / "stage1-selection.json"
     stage1 = _select(campaign, registry, "stage1", stage1_path.name)
     assert stage1["best_fixed"]["candidate_id"] == "fixed-c15"
+    assert [item["candidate_id"] for item in stage1["top_fixed"]] == [
+        "fixed-c15",
+        "fixed-c2",
+    ]
     assert [item["candidate_id"] for item in stage1["top_slaclip"]] == ["sla-a", "sla-b"]
 
     # sla-c deliberately has no stage-2 seeds; stage2 must only inspect the
@@ -255,8 +264,13 @@ def test_stage1_and_stage2_are_deterministic_and_ignore_unselected_runs(tmp_path
     # Stage1 favored C=1.5, but the same three-seed evidence correctly locks
     # the canonical C=1 control as the stronger fixed threshold.
     assert stage2["stage1_best_fixed_candidate_id"] == "fixed-c15"
+    assert stage2["stage1_top_fixed_candidate_ids"] == ["fixed-c15", "fixed-c2"]
     assert stage2["canonical_fixed_candidate_id"] == "fixed-c1"
-    assert [item["candidate_id"] for item in stage2["fixed_ranking"]] == ["fixed-c1", "fixed-c15"]
+    assert [item["candidate_id"] for item in stage2["fixed_ranking"]] == [
+        "fixed-c1",
+        "fixed-c15",
+        "fixed-c2",
+    ]
     assert stage2["best_fixed"]["candidate_id"] == "fixed-c1"
     # Both arithmetic means are exactly 11/6; candidate id is the declared tie-break.
     assert stage2["selected_slaclip"]["candidate_id"] == "sla-a"
@@ -283,6 +297,7 @@ def test_numeric_exact_accuracy_is_primary_and_loss_breaks_ties(tmp_path: Path) 
     accuracy_by_candidate = {
         "fixed-c1": 0.55,
         "fixed-c15": 0.50,
+        "fixed-c2": 0.52,
         "sla-a": 0.80,
         "sla-b": 0.85,
         "sla-c": 0.80,

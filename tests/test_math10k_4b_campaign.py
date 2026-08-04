@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "slurm" / "math10k_4b_dynamics_campaign.sbatch"
@@ -19,7 +21,7 @@ SELECTOR_PATH = ROOT / "scripts" / "select_validation_candidates.py"
 def _embedded_python(function_name: str) -> str:
     text = WORKER.read_text(encoding="utf-8")
     start = text.index(f"{function_name}() {{")
-    match = re.search(r"<<'PY'\n(.*?)\nPY\n", text[start:], flags=re.DOTALL)
+    match = re.search(r"<<'PY'[^\n]*\n(.*?)\nPY\n", text[start:], flags=re.DOTALL)
     assert match is not None
     return match.group(1)
 
@@ -34,7 +36,7 @@ def test_campaign_shell_syntax_and_portability() -> None:
     assert "/iridisfs/scratch/" not in combined
     assert "--gres=gpu:h200:1" in worker
     assert "--gres=\"${GPU_GRES}\"" in wrapper
-    assert 'WALLTIME="${PRISM_WALLTIME:-1-16:00:00}"' in wrapper
+    assert 'WALLTIME="${PRISM_WALLTIME:-2-12:00:00}"' in wrapper
     assert 'HOST_MEMORY="${PRISM_HOST_MEMORY:-256G}"' in wrapper
     assert 'echo "the worker reserves two concurrent lanes of 128G each"' in wrapper
     assert "--resume-submit" in wrapper
@@ -54,8 +56,8 @@ def test_worker_uses_formal_selector_and_validation_smoke_contract() -> None:
     assert '!= [0, 1, 2]' in text
     assert 'int(split.get("validation_rows", -1)) != 8' in text
     assert 'for key in ("numeric_exact_correct", "numeric_parse_failures")' in text
-    assert 'locked_files = [Path(item).resolve() for item in sys.argv[3:8]]' in text
-    assert "output = Path(sys.argv[8]).resolve()" in text
+    assert 'locked_files = [Path(item).resolve() for item in sys.argv[3:9]]' in text
+    assert "output = Path(sys.argv[9]).resolve()" in text
     assert 'temporary="$(mktemp "${output}.tmp.XXXXXX")"' in text
     assert 'install_immutable_file "${temporary}" "${output}"' in text
     assert "environment_freeze.txt" in text
@@ -64,10 +66,36 @@ def test_worker_uses_formal_selector_and_validation_smoke_contract() -> None:
     assert "adapter_config.json" in text
     assert "adapter_model.safetensors" in text
     assert "run_index.csv" in text
-    assert '"schedule_privacy_class": "DP_DERIVED_FROM_3_SLACLIP_RUNS"' in text
-    assert '"epsilon": 54.0' in text
-    assert '"delta": 9e-5' in text
-    assert '"release_count": 9' in text
+    assert "paired_final_accuracy.csv" in text
+    assert "paired_final_mechanism.csv" in text
+    assert '"evaluation_config": arm_root / "results" / "evaluation_config.json"' in text
+    assert '"raw_training_loss_mean"' in text
+    assert '"step_level_source": "each_run/results/research_raw/telemetry_steps.csv"' in text
+    assert '"analysis_status": "LOCKED_FRESH_SEED_FINAL_COMPLETE"' in text
+    assert '"campaign_primary_metric": "clean_three_task_macro_accuracy"' in text
+    assert 'sum(row["is_primary"] is True for row in paired_rows) != 1' in text
+    assert '"confidence_interval": "two_sided_paired_t_95_df4"' in text
+    assert '--data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/math_10k.json"' in text
+    assert "lock_final_evaluation_assets" in text
+    assert text.index('run_formal_selector stage2 "${LOCKED_SELECTION}"') < text.index(
+        'create_plan schedule-source "${SCHEDULE_SOURCE_PLAN}"'
+    ) < text.index("build_replay_schedule_and_controls\n") < text.index(
+        "lock_final_evaluation_assets\n"
+    ) < text.index('create_plan final "${FINAL_PLAN}"')
+    assert 'root / "plans" / "schedule-source.tsv"' in text
+    assert 'root / "plans" / "final.tsv"' in text
+    assert '--top-slaclip 3' in text
+    assert '--top-fixed 2' in text
+    assert 'for seed in (17, 29, 71, 101, 137):' in text
+    assert '--protocol_stage final' in text
+    assert '--run_eval true' in text
+    assert 'campaign_worker_model_evaluation_begins_after_stage2_selection_lock' in text
+    assert 'test_assets_and_prior_test_results_were_accessed_before_campaign_design' in text
+    assert 'DP_DERIVED_VIA_' in text
+    assert 'screen_run_count' in text
+    assert 'all_screen_and_fresh_final_dp_outputs' in text
+    assert 'DP_DERIVED_FROM_3_SLACLIP_RUNS' not in text
+    assert '"epsilon": 78.0' not in text
 
 
 def test_all_embedded_python_compiles() -> None:
@@ -91,6 +119,229 @@ def test_all_embedded_python_compiles() -> None:
             compile(source, f"{path}:{line_number}", "exec")
 
 
+def _locked_evaluation_asset_manifest(tmp_path: Path) -> tuple[Path, dict]:
+    result = subprocess.run(
+        [sys.executable, "-", str(ROOT), str(ROOT / "README.md")],
+        input=_embedded_python("lock_final_evaluation_assets"),
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+    manifest_path = tmp_path / "final-evaluation-assets.json"
+    manifest_path.write_text(result.stdout, encoding="utf-8")
+    return manifest_path, json.loads(result.stdout)
+
+
+def test_locked_evaluation_assets_use_conservative_auditable_decontamination(
+    tmp_path: Path,
+) -> None:
+    _, manifest = _locked_evaluation_asset_manifest(tmp_path)
+    assert manifest["schema_version"] == 3
+    assert manifest["access_policy"] == (
+        "campaign_worker_model_evaluation_begins_after_stage2_selection_lock"
+    )
+    assert manifest["not_an_untouched_test_set"] is True
+    assert manifest["decontamination"]["normalization"]["id"] == (
+        "instruction_input_nfkc_casefold_whitespace_collapse_v1"
+    )
+    assets = {item["task"]: item for item in manifest["assets"]}
+    assert {
+        task: (
+            asset["prompt_overlap"]["overlap_count"],
+            asset["prompt_overlap"]["clean_count"],
+        )
+        for task, asset in assets.items()
+    } == {
+        "gsm8k": (0, 1319),
+        "AQuA": (0, 254),
+        "mawps": (53, 185),
+        "SVAMP": (0, 1000),
+    }
+    mawps_overlap = assets["mawps"]["prompt_overlap"]
+    assert mawps_overlap["answer_string_exact_overlap_count"] == 38
+    assert mawps_overlap["answer_evaluator_equivalent_overlap_count"] == 53
+    assert len(mawps_overlap["overlap_training_index_mapping"]) == 53
+    assert len(mawps_overlap["overlap_training_index_mapping_sha256"]) == 64
+
+
+def _make_final_validation_fixture(
+    tmp_path: Path,
+    *,
+    forge_summary: bool,
+) -> tuple[Path, Path]:
+    asset_manifest_path, manifest = _locked_evaluation_asset_manifest(tmp_path)
+    run_root = tmp_path / "final-run"
+    adapter = run_root / "adapter"
+    results = run_root / "results"
+    adapter.mkdir(parents=True)
+    results.mkdir(parents=True)
+    status = {
+        "state": "completed",
+        "update_steps": 300,
+        "config_fingerprint": "fixture-fingerprint",
+        "model_revision": "fixture-requested-revision",
+        "resolved_model_revision": "fixture-resolved-revision",
+        "config": {
+            "method": "baseline",
+            "seed": 17,
+            "protocol_stage": "final",
+            "val_set_size": 0,
+            "run_eval": True,
+        },
+        "privacy_accounting": {"epsilon_spent": 6.0},
+    }
+    adapter.joinpath("run_status.json").write_text(
+        json.dumps(status), encoding="utf-8"
+    )
+    assets = {item["task"]: item for item in manifest["assets"]}
+    evaluation_config = {
+        "dataset": "math10k",
+        "base_model": "google/gemma-3-4b-pt",
+        "batch_size": 8,
+        "num_beams": 4,
+        "max_new_tokens": 256,
+        "max_input_length": 1024,
+        "tasks": ["gsm8k", "AQuA", "mawps", "SVAMP"],
+        "config_fingerprint": status["config_fingerprint"],
+        "requested_model_revision": status["model_revision"],
+        "resolved_model_revision": status["resolved_model_revision"],
+        "test_assets": {
+            task: {"rows": asset["rows"], "sha256": asset["sha256"]}
+            for task, asset in assets.items()
+        },
+    }
+    results.joinpath("evaluation_config.json").write_text(
+        json.dumps(evaluation_config), encoding="utf-8"
+    )
+    for task, asset in assets.items():
+        source = ROOT / asset["path"]
+        rows = json.loads(source.read_text(encoding="utf-8"))
+        predictions = [
+            {**row, "output_pred": "", "pred": "", "flag": False}
+            for row in rows
+        ]
+        results.joinpath(f"{task}.json").write_text(
+            json.dumps(predictions), encoding="utf-8"
+        )
+    gsm8k_accuracy = 0.1 if forge_summary else 0.0
+    average = gsm8k_accuracy / 4.0
+    results.joinpath("summary.csv").write_text(
+        "gsm8k,AQuA,mawps,SVAMP,Average\n"
+        f"{gsm8k_accuracy},0.0,0.0,0.0,{average}\n",
+        encoding="utf-8",
+    )
+    detail_lines = ["dataset,accuracy,n,json"]
+    for task, asset in assets.items():
+        accuracy = gsm8k_accuracy if task == "gsm8k" else 0.0
+        detail_lines.append(
+            f"{task},{accuracy},{asset['rows']},{results / f'{task}.json'}"
+        )
+    results.joinpath("details.csv").write_text(
+        "\n".join(detail_lines) + "\n", encoding="utf-8"
+    )
+    return run_root, asset_manifest_path
+
+
+def test_final_validator_recomputes_complete_consistent_metrics(tmp_path: Path) -> None:
+    run_root, asset_manifest = _make_final_validation_fixture(
+        tmp_path, forge_summary=False
+    )
+    subprocess.run(
+        [sys.executable, "-", str(run_root), "baseline", "17", str(asset_manifest)],
+        input=_embedded_python("validate_final_run"),
+        text=True,
+        check=True,
+    )
+    metrics = json.loads(
+        (run_root / "results" / "decontaminated_metrics.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metrics["primary_metric"] == "clean_three_task_macro_accuracy"
+    assert metrics["clean_mawps_records"] == 185
+
+
+def test_final_validator_rejects_forged_summary_before_postprocessing(
+    tmp_path: Path,
+) -> None:
+    run_root, asset_manifest = _make_final_validation_fixture(
+        tmp_path, forge_summary=True
+    )
+    result = subprocess.run(
+        [sys.executable, "-", str(run_root), "baseline", "17", str(asset_manifest)],
+        input=_embedded_python("validate_final_run"),
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "does not match summary" in result.stderr
+    assert not (run_root / "results" / "decontaminated_metrics.json").exists()
+
+
+def test_schedule_source_validator_requires_full_data_split_and_no_test_outputs(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "schedule-source"
+    adapter = run_root / "adapter"
+    validation = run_root / "results" / "validation"
+    adapter.mkdir(parents=True)
+    validation.mkdir(parents=True)
+    split = {
+        "protocol_stage": "final",
+        "source_rows": 9919,
+        "train_rows": 9919,
+        "validation_rows": 0,
+        "validation_data_is_public": False,
+        "manifest_sha256": "a" * 64,
+    }
+    validation.joinpath("split_manifest.json").write_text(
+        json.dumps(split), encoding="utf-8"
+    )
+    adapter.joinpath("run_status.json").write_text(
+        json.dumps(
+            {
+                "state": "completed",
+                "update_steps": 300,
+                "config": {
+                    "method": "slaclip",
+                    "seed": 42,
+                    "protocol_stage": "final",
+                    "val_set_size": 0,
+                    "run_eval": False,
+                },
+                "privacy_accounting": {"epsilon_spent": 6.0},
+                "data_split": split,
+            }
+        ),
+        encoding="utf-8",
+    )
+    adapter.joinpath("train_log.jsonl").write_text(
+        "".join(
+            json.dumps({"step": step, "dp_clip_threshold": 1.0}) + "\n"
+            for step in range(1, 301)
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [sys.executable, "-", str(run_root), "42"],
+        input=_embedded_python("validate_schedule_source_run"),
+        text=True,
+        check=True,
+    )
+
+    run_root.joinpath("results", "summary.csv").write_text(
+        "forbidden\n", encoding="utf-8"
+    )
+    rejected = subprocess.run(
+        [sys.executable, "-", str(run_root), "42"],
+        input=_embedded_python("validate_schedule_source_run"),
+        text=True,
+        capture_output=True,
+    )
+    assert rejected.returncode != 0
+    assert "must not access" in rejected.stderr
+
+
 def test_generated_registry_matches_formal_selector_schema(tmp_path: Path) -> None:
     registry_path = tmp_path / "screen" / "candidate_registry.json"
     subprocess.run(
@@ -107,9 +358,33 @@ def test_generated_registry_matches_formal_selector_schema(tmp_path: Path) -> No
         check=True,
     )
     payload = json.loads(registry_path.read_text(encoding="utf-8"))
-    assert len(payload["candidates"]) == 26
+    assert len(payload["candidates"]) == 38
     assert sum(item["family"] == "fixed" for item in payload["candidates"]) == 8
-    assert sum(item["family"] == "slaclip" for item in payload["candidates"]) == 18
+    assert sum(item["family"] == "slaclip" for item in payload["candidates"]) == 30
+    assert {
+        item["params"]["slaclip_target_non_small_clip_fraction"]
+        for item in payload["candidates"]
+        if item["family"] == "slaclip"
+    } == {0.50, 0.90, 0.95, 0.99, 0.995}
+    assert {
+        item["params"]["slaclip_eta"]
+        for item in payload["candidates"]
+        if item["family"] == "slaclip"
+    } == {0.05, 0.15, 0.20}
+    assert {
+        item["params"]["dp_max_grad_norm"]
+        for item in payload["candidates"]
+        if item["family"] == "fixed"
+    } == {0.1, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 15.0}
+    canonical_full = [
+        item
+        for item in payload["candidates"]
+        if item["family"] == "slaclip"
+        and item["params"]["dp_max_grad_norm"] == 1.0
+        and item["params"]["slaclip_target_non_small_clip_fraction"] == 0.5
+        and item["params"]["slaclip_eta"] == 0.2
+    ]
+    assert len(canonical_full) == 1
     assert all(set(item["runs"]) == {"42", "43", "44"} for item in payload["candidates"])
     assert all(
         run["run_status"].startswith("screen/runs/")
@@ -123,7 +398,125 @@ def test_generated_registry_matches_formal_selector_schema(tmp_path: Path) -> No
     protocol = selector._validate_protocol(payload)
     candidates = selector._candidate_map(payload)
     assert protocol["selection_metric"] == selector.NUMERIC_EXACT_METRIC
-    assert len(candidates) == 26
+    assert len(candidates) == 38
+
+
+def test_plans_lock_three_stage_matrix_and_fresh_final_seeds(tmp_path: Path) -> None:
+    campaign = tmp_path / "campaign"
+    registry_path = campaign / "screen" / "candidate_registry.json"
+    subprocess.run(
+        [
+            sys.executable,
+            "-",
+            str(registry_path),
+            "google/gemma-3-4b-pt",
+            "c" * 40,
+            "d" * 40,
+        ],
+        input=_embedded_python("create_candidate_registry"),
+        text=True,
+        check=True,
+    )
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    fixed = [item for item in registry["candidates"] if item["family"] == "fixed"]
+    slaclip = [item for item in registry["candidates"] if item["family"] == "slaclip"]
+    canonical = next(item for item in fixed if item["params"]["dp_max_grad_norm"] == 1.0)
+    noncanonical = [item for item in fixed if item["id"] != canonical["id"]]
+    stage1_selection = campaign / "selection" / "stage1-selection.json"
+    locked_selection = campaign / "selection" / "selection.json"
+    control_manifest = campaign / "schedule" / "control_manifest.json"
+    replay_schedule = campaign / "schedule" / "replay_schedule.json"
+    stage1_selection.parent.mkdir(parents=True)
+    control_manifest.parent.mkdir(parents=True)
+    stage1_selection.write_text(
+        json.dumps(
+            {
+                "top_slaclip": [
+                    {"candidate_id": item["id"]} for item in slaclip[:3]
+                ],
+                # Exclude C=1 deliberately: stage2 must still add it as the
+                # preregistered paper anchor.
+                "top_fixed": [
+                    {"candidate_id": item["id"]} for item in noncanonical[:2]
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    locked_selection.write_text(
+        json.dumps(
+            {
+                "selected_slaclip": {
+                    "candidate_id": slaclip[0]["id"],
+                    "params": slaclip[0]["params"],
+                },
+                "best_fixed": {
+                    "candidate_id": noncanonical[0]["id"],
+                    "params": noncanonical[0]["params"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    control_manifest.write_text(
+        json.dumps(
+            {
+                "selected_slaclip_candidate_id": slaclip[0]["id"],
+                "schedule_initial_clip": slaclip[0]["params"]["dp_max_grad_norm"],
+                "matched_fixed_noise_rms_clip": 2.5,
+                "initial_c_matched_fixed_C": slaclip[0]["params"]["dp_max_grad_norm"],
+                "initial_c_matched_fixed_reference_role": "initial-C-matched-fixed",
+                "canonical_full_slaclip_reference_role": "canonical-full-slaclip",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def plan(mode: str) -> list[list[str]]:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-",
+                mode,
+                str(registry_path),
+                str(campaign),
+                str(stage1_selection),
+                str(locked_selection),
+                str(control_manifest),
+                str(replay_schedule),
+                "gemma-3-4b-pt",
+            ],
+            input=_embedded_python("create_plan"),
+            text=True,
+            check=True,
+            capture_output=True,
+        )
+        return [line.split("|") for line in result.stdout.splitlines() if line]
+
+    stage1 = plan("stage1")
+    stage2 = plan("stage2")
+    schedule_source = plan("schedule-source")
+    final = plan("final")
+    assert len(stage1) == 38
+    assert len(stage2) == 12
+    assert {int(fields[4]) for fields in stage2} == {43, 44}
+    assert canonical["id"] in {fields[2] for fields in stage2}
+    assert len(schedule_source) == 3
+    assert {int(fields[4]) for fields in schedule_source} == {42, 43, 44}
+    assert {fields[3] for fields in schedule_source} == {"schedule-source-full-data"}
+    assert all("/schedule-source/" in fields[10] for fields in schedule_source)
+    assert len(final) == 35
+    assert {int(fields[4]) for fields in final} == {17, 29, 71, 101, 137}
+    assert {fields[3] for fields in final} == {
+        "selected-slaclip",
+        "best-fixed",
+        "replay",
+        "matched-fixed-noise-energy",
+        "canonical-fixed-c1",
+        "initial-C-matched-fixed",
+        "canonical-full-slaclip",
+    }
+    assert all("/final/" in fields[10] for fields in final)
 
 
 def test_replay_schedule_averages_three_seed_trajectories(tmp_path: Path) -> None:
@@ -138,20 +531,40 @@ def test_replay_schedule_averages_three_seed_trajectories(tmp_path: Path) -> Non
             {
                 "selected_slaclip": {
                     "candidate_id": candidate_id,
-                    "params": {"dp_max_grad_norm": 1.0},
-                }
+                    "params": {
+                        "dp_max_grad_norm": 1.0,
+                        "slaclip_target_non_small_clip_fraction": 0.5,
+                        "slaclip_eta": 0.2,
+                    },
+                },
+                "best_fixed": {
+                    "candidate_id": "fixed-c0p5",
+                    "params": {"dp_max_grad_norm": 0.5},
+                },
             }
         ),
         encoding="utf-8",
     )
     for seed, offset in ((42, 0.0), (43, 0.3), (44, 0.6)):
-        root = campaign / "screen" / "runs" / candidate_id / f"seed-{seed}" / "adapter"
+        root = (
+            campaign
+            / "schedule-source"
+            / "runs"
+            / candidate_id
+            / f"seed-{seed}"
+            / "adapter"
+        )
         root.mkdir(parents=True)
         root.joinpath("run_status.json").write_text(
             json.dumps(
                 {
                     "state": "completed",
-                    "config": {"method": "slaclip"},
+                    "config": {
+                        "method": "slaclip",
+                        "protocol_stage": "final",
+                        "val_set_size": 0,
+                        "run_eval": False,
+                    },
                     "config_fingerprint": f"fp-{seed}",
                 }
             ),
@@ -166,7 +579,15 @@ def test_replay_schedule_averages_three_seed_trajectories(tmp_path: Path) -> Non
             encoding="utf-8",
         )
     subprocess.run(
-        [sys.executable, "-", str(campaign), str(selection), str(schedule), str(controls)],
+        [
+            sys.executable,
+            "-",
+            str(campaign),
+            str(selection),
+            str(schedule),
+            str(controls),
+            "12",
+        ],
         input=_embedded_python("build_replay_schedule_and_controls"),
         text=True,
         check=True,
@@ -188,14 +609,29 @@ def test_replay_schedule_averages_three_seed_trajectories(tmp_path: Path) -> Non
     assert math.isclose(
         control["schedule_geometric_mean_clip"], expected_geometric, abs_tol=1e-12
     )
-    assert control["schedule_privacy_class"] == "DP_DERIVED_FROM_3_SLACLIP_RUNS"
-    assert replay["schedule_privacy_class"] == "DP_DERIVED_FROM_3_SLACLIP_RUNS"
-    composition = replay["privacy_accounting"][
-        "schedule_plus_three_replay_plus_three_matched_fixed"
+    assert control["schedule_privacy_class"] == (
+        "DP_DERIVED_VIA_50_RUN_SELECTION_PLUS_3_FULL_DATA_SOURCES"
+    )
+    assert replay["schedule_privacy_class"] == (
+        "DP_DERIVED_VIA_50_RUN_SELECTION_PLUS_3_FULL_DATA_SOURCES"
+    )
+    privacy = replay["privacy_accounting"]
+    assert privacy["stage2_run_count"] == 12
+    assert privacy["screen_run_count"] == 50
+    assert privacy["pre_final_dp_run_count"] == 53
+    assert privacy["final_run_count"] == 25
+    replay_matched = privacy[
+        "selection_plus_five_replay_plus_five_matched_fixed"
     ]
-    assert composition == {"epsilon": 54.0, "delta": 9e-5, "release_count": 9,
-                           "derivation": composition["derivation"]}
-    assert composition["derivation"].startswith("3 schedule-source runs")
+    assert replay_matched["release_count"] == 63
+    assert replay_matched["epsilon"] == 378.0
+    assert replay_matched["delta"] == pytest.approx(63e-5)
+    full_bundle = privacy["all_screen_and_fresh_final_dp_outputs"]
+    assert full_bundle["release_count"] == 78
+    assert full_bundle["epsilon"] == 468.0
+    assert full_bundle["delta"] == pytest.approx(78e-5)
+    assert control["schedule_source_seeds"] == [42, 43, 44]
+    assert control["final_control_seeds"] == [17, 29, 71, 101, 137]
 
 
 def test_wrapper_receipt_blocks_duplicates_and_requires_explicit_resume(
@@ -322,7 +758,7 @@ printf '%s|TIMEOUT\n' "${wanted}"
     assert len(first["attempts"]) == 1
     assert first["resources"]["total_memory"] == "256G"
     assert first["resources"]["memory_per_lane"] == "128G"
-    assert first["resources"]["walltime"] == "1-16:00:00"
+    assert first["resources"]["walltime"] == "2-12:00:00"
 
     duplicate = invoke("--submit")
     assert duplicate.returncode != 0

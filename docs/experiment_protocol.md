@@ -49,6 +49,11 @@ For a paired run, keep every field identical except `method` and fields that onl
 
 Dynamic clipping necessarily changes the per-step absolute standard deviation because it is proportional to `noise_multiplier * C_t / expected_batch_size`. The noise multiplier, sampling schedule, and privacy accountant remain matched. This is the intended difference produced by adapting `C_t`, not an unmatched privacy target.
 
+For an adaptive-arm mechanism comparison, also include a seed-matched fixed
+control with `C=C_0`.  This control isolates threshold adaptation from the
+initial threshold; it is distinct from the validation-tuned best-fixed arm used
+in the campaign's primary comparison.
+
 The privacy analysis assumes Opacus Poisson subsampling and add/remove record adjacency. Under this convention, the clipped tangent plus K slack coordinates have joint norm at most `C_t`; independently generated Gaussian blocks are distributionally the same joint release. `C_{t+1}` is post-processing used only at the next update. Do not reinterpret the same sensitivity statement under replace-one adjacency without revising the bound and accountant.
 
 The intrinsic tangent-noise block uses the paper's exact full-rank thin-QR
@@ -158,30 +163,52 @@ target `rho`, but its global clipped target remains dynamic because it is
 the same public-validation budget as other tuned controller parameters, not
 from task-test results or private exact clipping telemetry.
 
+The candidate registry for this campaign must include the canonical
+paper-default-controller anchor `rho=0.5`, `eta=0.2`, `C_0=1`, `K=15`,
+`c_min=0.1`, and `c_max=15`. This anchors the literal `1/2` controller target
+and the repository's official default gain while keeping the campaign bounds
+and small-batch `K` explicit. It is a controller anchor, not a claim that this
+modified task, loss, validation, and evaluation pipeline is a verbatim
+reproduction of every original-paper experiment.
+
 The implemented selection protocol is:
 
 1. predeclare the complete fixed-`C` and full-SlaClip candidate registry;
 2. reserve one deterministic, prompt-grouped public holdout with a fixed
-   `validation_seed` shared by every candidate and training seed;
+   `validation_seed` shared by every candidate and training seed. Prompt groups
+   use the versioned `instruction_input_nfkc_casefold_whitespace_collapse_v1`
+   identity: normalize `instruction` and `input` separately with Unicode NFKC,
+   `casefold`, and split/join whitespace collapse, then compose the two fields
+   as canonical JSON; they are not grouped by raw bytes;
 3. train selection arms with `--protocol_stage selection`,
    `--validation_data_is_public`, and `--run_eval false`;
-4. for Math-10K, rank candidates first by deterministic numeric exact-match on
-   the public holdout, then by response-only per-record causal-LM validation
-   loss as the declared tie-break; exact raw clipping telemetry is diagnostic
-   and is not a selector input;
+4. for Math-10K numeric generation, only prompt groups for which every record
+   has a finite numeric `answer` are eligible for the public holdout. All
+   ineligible groups and every other unselected row, including nonnumeric-answer
+   rows, remain in training. Rank candidates first by deterministic numeric
+   exact-match on that holdout, then by response-only per-record causal-LM
+   validation loss as the declared tie-break; exact raw clipping telemetry is
+   diagnostic and is not a selector input;
 5. confirm the short list across the preregistered selection seeds and write an
    immutable selection record;
 6. after the record is locked, retrain with fresh seeds, `--protocol_stage final`,
-   and `--val_set_size 0`, then evaluate the task test sets.
+   and `--val_set_size 0`, then begin model inference on the task test sets.
 
-The split keeps all records with the same `(instruction, input)` prompt on the
-same side and stratifies GLUE8 by task instruction.  Its source hash, membership
-digests, indices, algorithm version, and manifest hash are stored with every run.
+The split keeps all records with the same normalized `(instruction, input)`
+prompt on the same side and stratifies GLUE8 by normalized task instruction.
+Its source hash, membership digests, indices, normalization and selection
+algorithm versions, and manifest hash are stored with every run.
 Any nonzero holdout fails closed unless task-test evaluation is disabled and the
 data is explicitly acknowledged as public auxiliary data.  This public-benchmark
 workflow does not make exact validation release or validation-driven selection
 free for a genuinely private dataset; such a deployment needs its own privacy
 accounting or a separately public selection set.
+
+These task test sets were accessed during earlier repository development, so
+they must not be described as untouched, pristine, or newly held out. This
+campaign guarantees only that its model evaluations start after the selection
+record is locked. Prior access limits confirmatory interpretation even when the
+current execution follows the lock mechanically.
 
 Selection runs can additionally set `--validation_eval_interval 50` to write
 response-only validation loss at steps `0, 50, ..., 300`, and
@@ -191,13 +218,32 @@ and artifact hashes.  These are public-data, non-DP selection measurements and
 remain distinct from exact `research_raw` training diagnostics.
 
 A replay trajectory is an intervention, not automatically a fresh
-single-budget DP result. The replay optimizer is the fixed-threshold Gaussian
-mechanism conditional on an immutable schedule, but a schedule constructed from
-earlier private-data-dependent SlaClip releases carries their privacy cost. Any
-end-to-end release must compose the source runs with every downstream replay or
-schedule-matched model. Development campaigns that also retain
-`research_raw` diagnostics are explicitly non-private artifact bundles
-regardless of those per-run accountant values.
+single-budget DP result. In this campaign, each schedule is obtained from three
+new full-data, no-test-evaluation SlaClip source seeds and is reported only as a
+**full-data schedule-transfer control**. The downstream optimizer is the
+fixed-threshold Gaussian mechanism conditional on that immutable schedule, but
+the schedule still carries the privacy cost of its private-data-dependent source
+runs. Any end-to-end provenance/accounting record must therefore include every
+screen/selection training mechanism that informed the locked choice, all three
+schedule-source mechanisms, and every released final run; a final run's
+standalone accountant value is not the campaign-level privacy cost. Because the
+campaign retains `research_raw` diagnostics, the complete artifact bundle is
+explicitly **NON_PRIVATE** regardless of those per-run accountant values.
+
+For this journal campaign, the sole primary endpoint is the fresh-seed paired
+comparison of selected full SlaClip against the validation-tuned best fixed
+threshold using `clean_three_task_macro_accuracy` (GSM8K, AQuA, and SVAMP).
+MAWPS is excluded from that primary macro because the locked decontamination
+audit finds normalized prompt overlap with Math-10K training data. If the
+canonical paper-default-controller anchor is not selected, it must nevertheless
+be run across all five fresh final seeds so that it remains distinguishable from
+the selected target-conditioned extension. That five-seed anchor, fixed
+`C=C_0`, canonical fixed `C=1`, schedule-transfer, matched-noise, individual-task,
+MAWPS, and four-task macro results are exploratory controls or secondary
+descriptions. Do not label the canonical controller arm as a verbatim
+original-paper task reproduction. Historical test-set access further limits any
+confirmatory claim; the lock supports an auditable comparison, not a claim that
+this is the first untouched evaluation of the hypothesis.
 
 ## Loss definition
 
