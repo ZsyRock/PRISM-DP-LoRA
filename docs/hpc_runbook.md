@@ -202,7 +202,7 @@ If this step runs out of memory, reduce `micro_batch_size` first. Changing the
 expected logical `batch_size`, update count, epsilon, or delta changes the noise
 calibration and is an experimental change, not merely a memory workaround.
 
-## 8. Submit paired arrays
+## 8. Submit paired arrays or one dynamics campaign
 
 The templates map array tasks as follows:
 
@@ -240,6 +240,29 @@ Both templates train only (`--run_eval false`) so generation evaluation cannot
 consume the training walltime. They use one GPU and one task, run preflight in
 the allocation, write to `PRISM_RUN_ROOT`, and give every method/seed a distinct
 directory. Slurm stdout is appended on requeue.
+
+The Math-10K 4B fixed-scan/SlaClip dynamics protocol should not use those
+arrays. Its portable wrapper stages one clean Git revision and submits the
+complete protocol as one two-H200 allocation:
+
+```bash
+bash scripts/submit_math10k_4b_dynamics_campaign.sh --test-only
+bash scripts/submit_math10k_4b_dynamics_campaign.sh --submit
+```
+
+Run `--test-only` first; it calls `sbatch --test-only` to validate the exact
+request without queuing a job. Then invoke `--submit` exactly once. Inside the allocation, the worker
+uses two independent one-task/one-GPU lanes for the eight-point fixed scan,
+locks the raw-telemetry-derived five-point target mapping, runs the two-by-five
+SlaClip screen, confirms the public-validation short list, and executes the
+fresh-seed final controls. This is one queued job, not an array and not one job
+per arm. The trainer remains single-GPU and is not converted to DDP merely
+because two independent arms share the allocation.
+
+This campaign retains exact `research_raw` artifacts under scratch and uses
+them to construct its exploratory target grid. The complete campaign is
+therefore `NON_PRIVATE`; see [the experiment protocol](experiment_protocol.md)
+before making any privacy or confirmatory claim.
 
 Useful environment overrides include:
 

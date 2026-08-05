@@ -31,7 +31,8 @@ Portable path overrides:
 
 Scheduler overrides:
   PRISM_SLURM_ACCOUNT, PRISM_SLURM_QOS, PRISM_SLURM_PARTITION,
-  PRISM_GPU_GRES, PRISM_CPUS_PER_TASK, PRISM_HOST_MEMORY, PRISM_WALLTIME.
+  PRISM_GPU_GRES, PRISM_CPUS_PER_TASK, PRISM_HOST_MEMORY, PRISM_WALLTIME,
+  PRISM_SLURM_EXCLUDE (optional comma-separated node expression).
 
 Model overrides are intentionally not accepted: this protocol is locked to the
 pinned Gemma-3-4B checkpoint declared below.
@@ -105,6 +106,7 @@ GPU_GRES="${PRISM_GPU_GRES:-gpu:h200:2}"
 CPUS_PER_TASK="${PRISM_CPUS_PER_TASK:-8}"
 HOST_MEMORY="${PRISM_HOST_MEMORY:-256G}"
 WALLTIME="${PRISM_WALLTIME:-2-12:00:00}"
+EXCLUDE_NODES="${PRISM_SLURM_EXCLUDE:-}"
 
 MODEL_ID="google/gemma-3-4b-pt"
 MODEL_REVISION="cc012e0a6d0787b4adcc0fa2c4da74402494554d"
@@ -131,6 +133,10 @@ if [[ "${HOST_MEMORY}" != "256G" ]]; then
   echo "the worker reserves two concurrent lanes of 128G each" >&2
   exit 2
 fi
+if [[ -n "${EXCLUDE_NODES}" && "${EXCLUDE_NODES}" == *[!A-Za-z0-9_.,\[\]-]* ]]; then
+  echo "error: PRISM_SLURM_EXCLUDE contains unsupported characters" >&2
+  exit 2
+fi
 if [[ ! -x "${ENV_PREFIX}/bin/python" ]]; then
   echo "error: Python environment is unavailable: ${ENV_PREFIX}" >&2
   exit 2
@@ -138,6 +144,8 @@ fi
 
 for tracked_file in \
   train_eval.py \
+  scripts/cuda_step_guard.py \
+  scripts/derive_slaclip_target_grid.py \
   scripts/preflight_hpc.py \
   scripts/smoke_dp_path.py \
   scripts/select_validation_candidates.py \
@@ -227,7 +235,7 @@ receipt_transition() {
     "${CAMPAIGN_ID}" "${CAMPAIGN_ROOT}" "${LOCKED_REPO_SHA}" \
     "${STAGED_REPO_ROOT}" "${ENV_PREFIX}" "${MODEL_ID}" "${MODEL_REVISION}" \
     "${ACCOUNT}" "${QOS}" "${PARTITION}" "${GPU_GRES}" \
-    "${CPUS_PER_TASK}" "${HOST_MEMORY}" "${WALLTIME}" <<'PY'
+    "${CPUS_PER_TASK}" "${HOST_MEMORY}" "${WALLTIME}" "${EXCLUDE_NODES}" <<'PY'
 import json
 import os
 import sys
@@ -257,9 +265,23 @@ from pathlib import Path
     cpus_per_task,
     host_memory,
     walltime,
+    exclude_nodes,
 ) = sys.argv[1:]
 target = Path(target_text)
 now = datetime.now(timezone.utc).isoformat()
+resource_snapshot = {
+    "account": account,
+    "qos": qos,
+    "partition": partition,
+    "gpu_gres": gpu_gres,
+    "nodes": 1,
+    "lanes": 2,
+    "cpus_per_lane": int(cpus_per_task),
+    "total_memory": host_memory,
+    "memory_per_lane": "128G",
+    "walltime": walltime,
+    "exclude_nodes": exclude_nodes or None,
+}
 if target.exists():
     payload = json.loads(target.read_text(encoding="utf-8"))
     if payload.get("campaign_id") != campaign_id or payload.get("code_sha") != code_sha:
@@ -274,18 +296,7 @@ else:
         "environment": environment,
         "model_id": model_id,
         "model_revision": model_revision,
-        "resources": {
-            "account": account,
-            "qos": qos,
-            "partition": partition,
-            "gpu_gres": gpu_gres,
-            "nodes": 1,
-            "lanes": 2,
-            "cpus_per_lane": int(cpus_per_task),
-            "total_memory": host_memory,
-            "memory_per_lane": "128G",
-            "walltime": walltime,
-        },
+        "resources": resource_snapshot,
         "attempts": [],
     }
 attempts = payload.get("attempts")
@@ -299,6 +310,7 @@ if action == "begin":
         "requested_at": now,
         "previous_job_id": previous_job_id or None,
         "previous_job_terminal_state": previous_job_state or None,
+        "resources": resource_snapshot,
     }
     attempts.append(attempt)
     payload["state"] = "submitting"
@@ -316,6 +328,7 @@ elif action in {"submitted", "submission_failed", "submission_unknown"}:
 else:
     raise SystemExit(f"unknown receipt transition: {action}")
 payload["updated_at"] = now
+payload["latest_resources"] = resource_snapshot
 encoded = (json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
 target.parent.mkdir(parents=True, exist_ok=True)
 descriptor, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
@@ -435,6 +448,9 @@ SBATCH_ARGS=(
   --output="${LOG_ROOT}/%x-%j.out"
   --error="${LOG_ROOT}/%x-%j.err"
 )
+if [[ -n "${EXCLUDE_NODES}" ]]; then
+  SBATCH_ARGS+=(--exclude="${EXCLUDE_NODES}")
+fi
 if [[ "${MODE}" == "--test-only" ]]; then
   SBATCH_ARGS+=(--test-only)
 fi
@@ -447,8 +463,8 @@ echo "staged_repo=${STAGED_REPO_ROOT}"
 echo "code_sha=${LOCKED_REPO_SHA}"
 echo "environment=${ENV_PREFIX}"
 echo "model=${MODEL_ID}@${MODEL_REVISION}"
-echo "resources=account:${ACCOUNT},qos:${QOS},partition:${PARTITION},2xH200,16cpu,${HOST_MEMORY},${WALLTIME}"
-echo "protocol=stage1_grid_then_multiseed_lock_then_fresh_seed_final_controls"
+echo "resources=account:${ACCOUNT},qos:${QOS},partition:${PARTITION},2xH200,16cpu,${HOST_MEMORY},${WALLTIME},exclude:${EXCLUDE_NODES:-none}"
+echo "protocol=fixed_scan_then_locked_target_grid_then_multiseed_selection_then_fresh_seed_final_controls"
 echo "privacy_warning=research_raw artifacts are NON_PRIVATE and remain under scratch with umask 077"
 
 SUBMISSION_RC=0

@@ -593,6 +593,88 @@ def test_research_raw_mode_is_explicitly_marked() -> None:
     assert 'raw_bias_noise_squared_error_proxy' in opt.last_raw_log
     assert 'raw_slack_indicator' not in opt.last_raw_log
     assert opt.last_raw_log['raw_realized_batch_size'] == 4
+    assert opt.last_raw_log['raw_reference_slaclip_num_slots'] == 3
+    assert opt.last_raw_log[
+        'raw_reference_expected_batch_size_normalization'
+    ] == pytest.approx(4.0)
+    assert opt.last_raw_log[
+        'raw_reference_conditional_clip_fraction_valid'
+    ] is True
+    assert opt.last_raw_log[
+        'raw_reference_remaining_mass_proxy'
+    ] == pytest.approx(
+        1.0 - opt.last_raw_log['raw_reference_small_gradient_proxy']
+    )
+    assert opt.last_raw_log[
+        'raw_reference_conditional_clip_fraction'
+    ] * opt.last_raw_log['raw_reference_remaining_mass_proxy'] == pytest.approx(
+        opt.last_raw_log['raw_clip_fraction']
+    )
+
+
+def test_fixed_reference_proxy_uses_expected_not_realized_batch_size() -> None:
+    grad_a = torch.randn(4, 2, 3, generator=torch.Generator().manual_seed(173))
+    grad_b = torch.randn(4, 4, 2, generator=torch.Generator().manual_seed(179))
+    references = []
+    for expected_batch_size in (4, 8):
+        opt, p_a, p_b = _make_optimizer('research_raw')
+        opt.dp_begin(
+            max_grad_norm=1.0,
+            expected_batch_size=expected_batch_size,
+            noise_multiplier=0.8,
+        )
+        _set_grad_samples(p_a, p_b, grad_a, grad_b)
+        opt.dp_accumulate()
+        torch.manual_seed(181)
+        opt.dp_finalize(noise_multiplier=0.8)
+        references.append(
+            (
+                opt.last_raw_log['raw_reference_slack_indicator_last'],
+                opt.last_raw_log[
+                    'raw_reference_expected_batch_size_normalization'
+                ],
+            )
+        )
+
+    assert references[0][1] == pytest.approx(4.0)
+    assert references[1][1] == pytest.approx(8.0)
+    assert references[1][0] == pytest.approx(references[0][0] / 2.0)
+
+
+def test_fixed_raw_reference_observer_does_not_change_mechanism_output() -> None:
+    grad_a = torch.randn(4, 2, 3, generator=torch.Generator().manual_seed(191))
+    grad_b = torch.randn(4, 4, 2, generator=torch.Generator().manual_seed(193))
+    results = []
+    for num_slots in (1, 15):
+        opt, p_a, p_b = _make_optimizer(
+            'research_raw',
+            clipping_method='baseline',
+            num_slots=num_slots,
+        )
+        opt.dp_begin(max_grad_norm=1.0, expected_batch_size=4, noise_multiplier=0.8)
+        _set_grad_samples(p_a, p_b, grad_a, grad_b)
+        opt.dp_accumulate()
+        torch.manual_seed(197)
+        opt.dp_finalize(noise_multiplier=0.8)
+        mechanism_raw = {
+            key: value
+            for key, value in opt.last_raw_log.items()
+            if not key.startswith('raw_reference_')
+        }
+        results.append(
+            (
+                p_a.detach().clone(),
+                p_b.detach().clone(),
+                dict(opt.last_log),
+                mechanism_raw,
+            )
+        )
+
+    first, second = results
+    assert torch.equal(first[0], second[0])
+    assert torch.equal(first[1], second[1])
+    assert first[2] == second[2]
+    assert first[3] == second[3]
 
 
 def test_research_raw_slaclip_records_exact_indicator_and_noise_residual() -> None:
@@ -618,6 +700,9 @@ def test_research_raw_slaclip_records_exact_indicator_and_noise_residual() -> No
     )
     assert raw_indicator.numel() == noisy_indicator.numel() == 3
     assert torch.allclose(noisy_indicator - raw_indicator, residual, atol=1e-6)
+    assert opt.last_raw_log[
+        'raw_reference_slack_indicator_last'
+    ] == pytest.approx(float(raw_indicator[-1]), rel=1e-6, abs=1e-7)
     assert opt.last_raw_log[
         'raw_slack_indicator_noise_residual_l2'
     ] == pytest.approx(float(torch.linalg.vector_norm(residual)), rel=1e-6)

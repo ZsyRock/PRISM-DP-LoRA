@@ -1439,6 +1439,63 @@ class PRISM(torch.optim.Optimizer):
                     'raw_global_norm_hist_edges': [float(x) for x in edges.tolist()],
                     'raw_global_norm_hist_overflow': int((norms > hist_max).sum().item()),
                 })
+                # Counterfactual full-SlaClip calibration for fixed-C scans.
+                # This is exact, access-controlled research telemetry only: it
+                # does not add slack coordinates to the DP query, alter the
+                # clipped gradient, consume controller output, or change the
+                # Gaussian release.  It mirrors the implemented full-SlaClip
+                # small-gradient proxy so a fixed run's whole-batch clipping
+                # rate is not incorrectly reused as the conditional rho.
+                reference_slots = int(self.slaclip_num_slots)
+                if reference_slots > 0:
+                    reference_slack, reference_lambda = build_slack_vectors(
+                        norms,
+                        float(C),
+                        reference_slots,
+                    )
+                    reference_indicator_last = float(
+                        (
+                            reference_slack[:, -1].sum()
+                            / (
+                                float(reference_lambda)
+                                * float(release_denom)
+                            )
+                        ).item()
+                    )
+                    reference_small_proxy = reference_indicator_last / (
+                        float(C) + 1e-6
+                    )
+                    reference_remaining_proxy = 1.0 - reference_small_proxy
+                    reference_valid = bool(
+                        math.isfinite(reference_remaining_proxy)
+                        and reference_remaining_proxy > 1e-12
+                    )
+                    reference_conditional = (
+                        float(clip_frac) / reference_remaining_proxy
+                        if reference_valid
+                        else None
+                    )
+                    raw.update({
+                        'raw_reference_slaclip_num_slots': reference_slots,
+                        'raw_reference_expected_batch_size_normalization': (
+                            float(release_denom)
+                        ),
+                        'raw_reference_slack_indicator_last': (
+                            reference_indicator_last
+                        ),
+                        'raw_reference_small_gradient_proxy': (
+                            reference_small_proxy
+                        ),
+                        'raw_reference_remaining_mass_proxy': (
+                            reference_remaining_proxy
+                        ),
+                        'raw_reference_conditional_clip_fraction': (
+                            reference_conditional
+                        ),
+                        'raw_reference_conditional_clip_fraction_valid': (
+                            reference_valid
+                        ),
+                    })
             self.last_raw_log = raw
         self._dp_state = None
         return total

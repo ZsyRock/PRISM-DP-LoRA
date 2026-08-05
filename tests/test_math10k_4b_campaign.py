@@ -26,6 +26,86 @@ def _embedded_python(function_name: str) -> str:
     return match.group(1)
 
 
+def _create_fixed_manifest(campaign: Path) -> tuple[Path, dict]:
+    manifest_path = campaign / "screen" / "fixed_scan_manifest.json"
+    subprocess.run(
+        [
+            sys.executable,
+            "-",
+            str(manifest_path),
+            "google/gemma-3-4b-pt",
+            "c" * 40,
+            "d" * 40,
+        ],
+        input=_embedded_python("create_fixed_scan_manifest"),
+        text=True,
+        check=True,
+    )
+    return manifest_path, json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def _standard_derived_registry(campaign: Path) -> tuple[Path, Path, dict]:
+    """Build the standard 8 fixed + 2 C0 x 5 rho selector fixture."""
+
+    fixed_manifest_path, fixed_manifest = _create_fixed_manifest(campaign)
+    rhos = (0.91, 0.93, 0.95, 0.97, 0.99)
+    slaclip = []
+    for c0 in (0.5, 1.5):
+        c_slug = format(c0, ".12g").replace(".", "p")
+        for rho in rhos:
+            rho_slug = format(rho, ".12g").replace(".", "p")
+            candidate_id = f"sla-c{c_slug}-r{rho_slug}-e0p15"
+            root = Path("screen") / "runs" / candidate_id
+            runs = {
+                str(seed): {
+                    "run_status": str(
+                        root / f"seed-{seed}" / "adapter" / "run_status.json"
+                    ),
+                    "validation_metrics": str(
+                        root
+                        / f"seed-{seed}"
+                        / "results"
+                        / "validation"
+                        / "validation_metrics.json"
+                    ),
+                    "split_manifest": str(
+                        root
+                        / f"seed-{seed}"
+                        / "results"
+                        / "validation"
+                        / "split_manifest.json"
+                    ),
+                }
+                for seed in (42, 43, 44)
+            }
+            slaclip.append(
+                {
+                    "id": candidate_id,
+                    "family": "slaclip",
+                    "method": "slaclip",
+                    "params": {
+                        "dp_max_grad_norm": c0,
+                        "slaclip_target_non_small_clip_fraction": rho,
+                        "slaclip_eta": 0.15,
+                        "slaclip_num_slots": 15,
+                        "slaclip_c_min": 0.1,
+                        "slaclip_c_max": 15.0,
+                    },
+                    "runs": runs,
+                }
+            )
+    registry = {
+        "schema_version": 1,
+        "selection_protocol": fixed_manifest["selection_protocol"],
+        "candidates": [*fixed_manifest["fixed_candidates"], *slaclip],
+    }
+    registry_path = campaign / "screen" / "candidate_registry.json"
+    registry_path.write_text(
+        json.dumps(registry, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return fixed_manifest_path, registry_path, registry
+
+
 def test_campaign_shell_syntax_and_portability() -> None:
     subprocess.run(["bash", "-n", str(WORKER), str(WRAPPER)], check=True)
     worker = WORKER.read_text(encoding="utf-8")
@@ -38,10 +118,18 @@ def test_campaign_shell_syntax_and_portability() -> None:
     assert "--gres=\"${GPU_GRES}\"" in wrapper
     assert 'WALLTIME="${PRISM_WALLTIME:-2-12:00:00}"' in wrapper
     assert 'HOST_MEMORY="${PRISM_HOST_MEMORY:-256G}"' in wrapper
+    assert 'EXCLUDE_NODES="${PRISM_SLURM_EXCLUDE:-}"' in wrapper
+    assert 'SBATCH_ARGS+=(--exclude="${EXCLUDE_NODES}")' in wrapper
     assert 'echo "the worker reserves two concurrent lanes of 128G each"' in wrapper
     assert "--resume-submit" in wrapper
     assert 'SUBMISSION_RECEIPT="${CAMPAIGN_ROOT}/submission_receipt.json"' in combined
     assert 'echo "submitted_job_id=${SUBMITTED_JOB_ID}"' in wrapper
+    assert "scripts/cuda_step_guard.py" in combined
+    assert "scripts/derive_slaclip_target_grid.py" in combined
+    assert "run_dual_cuda_guard_pair" in worker
+    assert "max_attempts=3" in worker
+    assert 'if [[ -e "${marker_path}" ]]' in worker
+    assert "must never be auto-repeated" in worker
 
 
 def test_worker_uses_formal_selector_and_validation_smoke_contract() -> None:
@@ -56,8 +144,8 @@ def test_worker_uses_formal_selector_and_validation_smoke_contract() -> None:
     assert '!= [0, 1, 2]' in text
     assert 'int(split.get("validation_rows", -1)) != 8' in text
     assert 'for key in ("numeric_exact_correct", "numeric_parse_failures")' in text
-    assert 'locked_files = [Path(item).resolve() for item in sys.argv[3:9]]' in text
-    assert "output = Path(sys.argv[9]).resolve()" in text
+    assert 'locked_files = [Path(item).resolve() for item in sys.argv[3:11]]' in text
+    assert "output = Path(sys.argv[11]).resolve()" in text
     assert 'temporary="$(mktemp "${output}.tmp.XXXXXX")"' in text
     assert 'install_immutable_file "${temporary}" "${output}"' in text
     assert "environment_freeze.txt" in text
@@ -77,15 +165,27 @@ def test_worker_uses_formal_selector_and_validation_smoke_contract() -> None:
     assert '"confidence_interval": "two_sided_paired_t_95_df4"' in text
     assert '--data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/math_10k.json"' in text
     assert "lock_final_evaluation_assets" in text
+    assert text.index("create_fixed_scan_manifest\n") < text.index(
+        'create_plan fixed-scan "${FIXED_SCAN_PLAN}"'
+    ) < text.index("derive_locked_slaclip_grid\n") < text.index(
+        'create_plan slaclip-screen "${SLACLIP_SCREEN_PLAN}"'
+    ) < text.index('run_formal_selector stage1 "${STAGE1_SELECTION}"')
     assert text.index('run_formal_selector stage2 "${LOCKED_SELECTION}"') < text.index(
         'create_plan schedule-source "${SCHEDULE_SOURCE_PLAN}"'
     ) < text.index("build_replay_schedule_and_controls\n") < text.index(
         "lock_final_evaluation_assets\n"
     ) < text.index('create_plan final "${FINAL_PLAN}"')
+    assert 'root / "plans" / "fixed-scan.tsv"' in text
+    assert 'root / "plans" / "slaclip-screen.tsv"' in text
     assert 'root / "plans" / "schedule-source.tsv"' in text
     assert 'root / "plans" / "final.tsv"' in text
     assert '--top-slaclip 3' in text
     assert '--top-fixed 2' in text
+    assert 'stage1_run_count = 18' in text
+    assert 'fixed_scan_run_count != 8' in text
+    assert 'slaclip_screen_run_count != 10' in text
+    assert '"NON_PRIVATE_data_dependent_fixed_scan_to_full_slaclip_grid;_"' in text
+    assert '"canonical-full-slaclip-paper-default"' in text
     assert 'for seed in (17, 29, 71, 101, 137):' in text
     assert '--protocol_stage final' in text
     assert '--run_eval true' in text
@@ -343,48 +443,46 @@ def test_schedule_source_validator_requires_full_data_split_and_no_test_outputs(
 
 
 def test_generated_registry_matches_formal_selector_schema(tmp_path: Path) -> None:
-    registry_path = tmp_path / "screen" / "candidate_registry.json"
-    subprocess.run(
-        [
-            sys.executable,
-            "-",
-            str(registry_path),
-            "google/gemma-3-4b-pt",
-            "c" * 40,
-            "d" * 40,
-        ],
-        input=_embedded_python("create_candidate_registry"),
-        text=True,
-        check=True,
+    fixed_manifest_path, registry_path, payload = _standard_derived_registry(
+        tmp_path / "campaign"
     )
-    payload = json.loads(registry_path.read_text(encoding="utf-8"))
-    assert len(payload["candidates"]) == 38
+    fixed_manifest = json.loads(fixed_manifest_path.read_text(encoding="utf-8"))
+    assert fixed_manifest["schema_version"] == 1
+    assert set(fixed_manifest) == {
+        "schema_version",
+        "selection_protocol",
+        "fixed_candidates",
+    }
+    assert len(fixed_manifest["fixed_candidates"]) == 8
+    assert len(payload["candidates"]) == 18
     assert sum(item["family"] == "fixed" for item in payload["candidates"]) == 8
-    assert sum(item["family"] == "slaclip" for item in payload["candidates"]) == 30
+    assert sum(item["family"] == "slaclip" for item in payload["candidates"]) == 10
     assert {
         item["params"]["slaclip_target_non_small_clip_fraction"]
         for item in payload["candidates"]
         if item["family"] == "slaclip"
-    } == {0.50, 0.90, 0.95, 0.99, 0.995}
+    } == {0.91, 0.93, 0.95, 0.97, 0.99}
     assert {
         item["params"]["slaclip_eta"]
         for item in payload["candidates"]
         if item["family"] == "slaclip"
-    } == {0.05, 0.15, 0.20}
+    } == {0.15}
+    assert {
+        item["params"]["dp_max_grad_norm"]
+        for item in payload["candidates"]
+        if item["family"] == "slaclip"
+    } == {0.5, 1.5}
     assert {
         item["params"]["dp_max_grad_norm"]
         for item in payload["candidates"]
         if item["family"] == "fixed"
     } == {0.1, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 15.0}
-    canonical_full = [
-        item
-        for item in payload["candidates"]
-        if item["family"] == "slaclip"
-        and item["params"]["dp_max_grad_norm"] == 1.0
+    assert not any(
+        item["family"] == "slaclip"
         and item["params"]["slaclip_target_non_small_clip_fraction"] == 0.5
         and item["params"]["slaclip_eta"] == 0.2
-    ]
-    assert len(canonical_full) == 1
+        for item in payload["candidates"]
+    )
     assert all(set(item["runs"]) == {"42", "43", "44"} for item in payload["candidates"])
     assert all(
         run["run_status"].startswith("screen/runs/")
@@ -398,26 +496,12 @@ def test_generated_registry_matches_formal_selector_schema(tmp_path: Path) -> No
     protocol = selector._validate_protocol(payload)
     candidates = selector._candidate_map(payload)
     assert protocol["selection_metric"] == selector.NUMERIC_EXACT_METRIC
-    assert len(candidates) == 38
+    assert len(candidates) == 18
 
 
 def test_plans_lock_three_stage_matrix_and_fresh_final_seeds(tmp_path: Path) -> None:
     campaign = tmp_path / "campaign"
-    registry_path = campaign / "screen" / "candidate_registry.json"
-    subprocess.run(
-        [
-            sys.executable,
-            "-",
-            str(registry_path),
-            "google/gemma-3-4b-pt",
-            "c" * 40,
-            "d" * 40,
-        ],
-        input=_embedded_python("create_candidate_registry"),
-        text=True,
-        check=True,
-    )
-    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    fixed_manifest_path, registry_path, registry = _standard_derived_registry(campaign)
     fixed = [item for item in registry["candidates"] if item["family"] == "fixed"]
     slaclip = [item for item in registry["candidates"] if item["family"] == "slaclip"]
     canonical = next(item for item in fixed if item["params"]["dp_max_grad_norm"] == 1.0)
@@ -443,42 +527,56 @@ def test_plans_lock_three_stage_matrix_and_fresh_final_seeds(tmp_path: Path) -> 
         ),
         encoding="utf-8",
     )
-    locked_selection.write_text(
-        json.dumps(
-            {
-                "selected_slaclip": {
-                    "candidate_id": slaclip[0]["id"],
-                    "params": slaclip[0]["params"],
-                },
-                "best_fixed": {
-                    "candidate_id": noncanonical[0]["id"],
-                    "params": noncanonical[0]["params"],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    control_manifest.write_text(
-        json.dumps(
-            {
-                "selected_slaclip_candidate_id": slaclip[0]["id"],
-                "schedule_initial_clip": slaclip[0]["params"]["dp_max_grad_norm"],
-                "matched_fixed_noise_rms_clip": 2.5,
-                "initial_c_matched_fixed_C": slaclip[0]["params"]["dp_max_grad_norm"],
-                "initial_c_matched_fixed_reference_role": "initial-C-matched-fixed",
-                "canonical_full_slaclip_reference_role": "canonical-full-slaclip",
-            }
-        ),
-        encoding="utf-8",
-    )
+    def lock_final_choices(selected: dict, best_fixed: dict) -> None:
+        selected_c0 = float(selected["params"]["dp_max_grad_norm"])
+        best_c = float(best_fixed["params"]["dp_max_grad_norm"])
+        if math.isclose(selected_c0, best_c, abs_tol=1e-12):
+            initial_role = "best-fixed"
+        elif math.isclose(selected_c0, 1.0, abs_tol=1e-12):
+            initial_role = "canonical-fixed-c1"
+        else:
+            initial_role = "initial-C-matched-fixed"
+        locked_selection.write_text(
+            json.dumps(
+                {
+                    "selected_slaclip": {
+                        "candidate_id": selected["id"],
+                        "params": selected["params"],
+                    },
+                    "best_fixed": {
+                        "candidate_id": best_fixed["id"],
+                        "params": best_fixed["params"],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        control_manifest.write_text(
+            json.dumps(
+                {
+                    "selected_slaclip_candidate_id": selected["id"],
+                    "schedule_initial_clip": selected_c0,
+                    "matched_fixed_noise_rms_clip": 2.5,
+                    "initial_c_matched_fixed_C": selected_c0,
+                    "initial_c_matched_fixed_reference_role": initial_role,
+                    "canonical_full_slaclip_reference_role": (
+                        "canonical-full-slaclip"
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    lock_final_choices(slaclip[0], noncanonical[0])
 
     def plan(mode: str) -> list[list[str]]:
+        source_manifest = fixed_manifest_path if mode == "fixed-scan" else registry_path
         result = subprocess.run(
             [
                 sys.executable,
                 "-",
                 mode,
-                str(registry_path),
+                str(source_manifest),
                 str(campaign),
                 str(stage1_selection),
                 str(locked_selection),
@@ -493,11 +591,17 @@ def test_plans_lock_three_stage_matrix_and_fresh_final_seeds(tmp_path: Path) -> 
         )
         return [line.split("|") for line in result.stdout.splitlines() if line]
 
-    stage1 = plan("stage1")
+    fixed_scan = plan("fixed-scan")
+    slaclip_screen = plan("slaclip-screen")
     stage2 = plan("stage2")
     schedule_source = plan("schedule-source")
     final = plan("final")
-    assert len(stage1) == 38
+    assert len(fixed_scan) == 8
+    assert {fields[1] for fields in fixed_scan} == {"fixed-scan"}
+    assert {int(fields[4]) for fields in fixed_scan} == {42}
+    assert len(slaclip_screen) == 10
+    assert {fields[1] for fields in slaclip_screen} == {"slaclip-screen"}
+    assert {int(fields[4]) for fields in slaclip_screen} == {42}
     assert len(stage2) == 12
     assert {int(fields[4]) for fields in stage2} == {43, 44}
     assert canonical["id"] in {fields[2] for fields in stage2}
@@ -517,6 +621,40 @@ def test_plans_lock_three_stage_matrix_and_fresh_final_seeds(tmp_path: Path) -> 
         "canonical-full-slaclip",
     }
     assert all("/final/" in fields[10] for fields in final)
+    assert "canonical-full-slaclip-paper-default" in {
+        fields[2] for fields in final
+    }
+    assert "canonical-full-slaclip-paper-default" not in {
+        item["id"] for item in registry["candidates"]
+    }
+
+    # Dynamic controls collapse to six or five roles when best fixed and/or
+    # the selected initial C already supply the corresponding references.
+    lock_final_choices(slaclip[0], canonical)
+    final_30 = plan("final")
+    assert len(final_30) == 30
+    assert "canonical-fixed-c1" not in {fields[3] for fields in final_30}
+
+    selected_c1 = {
+        **slaclip[0],
+        "id": "sla-fixture-c1-r0p95-e0p15",
+        "params": {
+            **slaclip[0]["params"],
+            "dp_max_grad_norm": 1.0,
+        },
+    }
+    registry["candidates"].append(selected_c1)
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    lock_final_choices(selected_c1, canonical)
+    final_25 = plan("final")
+    assert len(final_25) == 25
+    assert {fields[3] for fields in final_25} == {
+        "selected-slaclip",
+        "best-fixed",
+        "replay",
+        "matched-fixed-noise-energy",
+        "canonical-full-slaclip",
+    }
 
 
 def test_replay_schedule_averages_three_seed_trajectories(tmp_path: Path) -> None:
@@ -610,26 +748,27 @@ def test_replay_schedule_averages_three_seed_trajectories(tmp_path: Path) -> Non
         control["schedule_geometric_mean_clip"], expected_geometric, abs_tol=1e-12
     )
     assert control["schedule_privacy_class"] == (
-        "DP_DERIVED_VIA_50_RUN_SELECTION_PLUS_3_FULL_DATA_SOURCES"
+        "DP_DERIVED_VIA_30_RUN_SELECTION_PLUS_3_FULL_DATA_SOURCES"
     )
     assert replay["schedule_privacy_class"] == (
-        "DP_DERIVED_VIA_50_RUN_SELECTION_PLUS_3_FULL_DATA_SOURCES"
+        "DP_DERIVED_VIA_30_RUN_SELECTION_PLUS_3_FULL_DATA_SOURCES"
     )
     privacy = replay["privacy_accounting"]
+    assert privacy["stage1_run_count"] == 18
     assert privacy["stage2_run_count"] == 12
-    assert privacy["screen_run_count"] == 50
-    assert privacy["pre_final_dp_run_count"] == 53
+    assert privacy["screen_run_count"] == 30
+    assert privacy["pre_final_dp_run_count"] == 33
     assert privacy["final_run_count"] == 25
     replay_matched = privacy[
         "selection_plus_five_replay_plus_five_matched_fixed"
     ]
-    assert replay_matched["release_count"] == 63
-    assert replay_matched["epsilon"] == 378.0
-    assert replay_matched["delta"] == pytest.approx(63e-5)
+    assert replay_matched["release_count"] == 43
+    assert replay_matched["epsilon"] == 258.0
+    assert replay_matched["delta"] == pytest.approx(43e-5)
     full_bundle = privacy["all_screen_and_fresh_final_dp_outputs"]
-    assert full_bundle["release_count"] == 78
-    assert full_bundle["epsilon"] == 468.0
-    assert full_bundle["delta"] == pytest.approx(78e-5)
+    assert full_bundle["release_count"] == 58
+    assert full_bundle["epsilon"] == 348.0
+    assert full_bundle["delta"] == pytest.approx(58e-5)
     assert control["schedule_source_seeds"] == [42, 43, 44]
     assert control["final_control_seeds"] == [17, 29, 71, 101, 137]
 
@@ -641,6 +780,8 @@ def test_wrapper_receipt_blocks_duplicates_and_requires_explicit_resume(
     repo.mkdir()
     required_files = (
         "train_eval.py",
+        "scripts/cuda_step_guard.py",
+        "scripts/derive_slaclip_target_grid.py",
         "scripts/preflight_hpc.py",
         "scripts/smoke_dp_path.py",
         "scripts/select_validation_candidates.py",
@@ -662,9 +803,11 @@ def test_wrapper_receipt_blocks_duplicates_and_requires_explicit_resume(
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     state = tmp_path / "fake-slurm-state"
+    sbatch_arguments = tmp_path / "fake-sbatch-arguments"
     commands = {
         "sbatch": """#!/usr/bin/env bash
 set -euo pipefail
+printf '%s\n' "$*" >>"${FAKE_SBATCH_ARGUMENTS:?}"
 for argument in "$@"; do
   if [[ "${argument}" == "--test-only" ]]; then
     echo "test-only accepted"
@@ -722,6 +865,7 @@ printf '%s|TIMEOUT\n' "${wanted}"
         {
             "PATH": f"{fake_bin}:{env['PATH']}",
             "FAKE_SLURM_STATE": str(state),
+            "FAKE_SBATCH_ARGUMENTS": str(sbatch_arguments),
             "PRISM_USER_NAME": subprocess.check_output(
                 ["id", "-un"], text=True
             ).strip(),
@@ -732,6 +876,7 @@ printf '%s|TIMEOUT\n' "${wanted}"
             "PRISM_RUN_ROOT": str(run_root),
             "PRISM_HF_HOME": str(hf_home),
             "PRISM_CAMPAIGN_ID": campaign_id,
+            "PRISM_SLURM_EXCLUDE": "blossom03",
         }
     )
 
@@ -759,6 +904,9 @@ printf '%s|TIMEOUT\n' "${wanted}"
     assert first["resources"]["total_memory"] == "256G"
     assert first["resources"]["memory_per_lane"] == "128G"
     assert first["resources"]["walltime"] == "2-12:00:00"
+    assert first["resources"]["exclude_nodes"] == "blossom03"
+    assert first["latest_resources"]["exclude_nodes"] == "blossom03"
+    assert first["attempts"][0]["resources"]["exclude_nodes"] == "blossom03"
 
     duplicate = invoke("--submit")
     assert duplicate.returncode != 0
@@ -773,3 +921,7 @@ printf '%s|TIMEOUT\n' "${wanted}"
     assert len(second["attempts"]) == 2
     assert second["attempts"][1]["previous_job_id"] == "810001"
     assert second["attempts"][1]["previous_job_terminal_state"] == "TIMEOUT"
+    assert second["attempts"][1]["resources"]["exclude_nodes"] == "blossom03"
+    submitted_argument_lines = sbatch_arguments.read_text(encoding="utf-8").splitlines()
+    assert len(submitted_argument_lines) == 3
+    assert all("--exclude=blossom03" in line for line in submitted_argument_lines)

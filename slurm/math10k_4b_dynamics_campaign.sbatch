@@ -26,8 +26,10 @@ JOB_TMP="${SLURM_TMPDIR:-${SCRATCH_ROOT}/tmp/prism-4b-dynamics-${JOB_ID}}"
 STATUS_ROOT="${CAMPAIGN_ROOT}/status"
 PLAN_ROOT="${CAMPAIGN_ROOT}/plans"
 REGISTRY_ROOT="${CAMPAIGN_ROOT}/screen"
+FIXED_MANIFEST="${REGISTRY_ROOT}/fixed_scan_manifest.json"
 REGISTRY_FILE="${REGISTRY_ROOT}/candidate_registry.json"
 SELECTION_ROOT="${CAMPAIGN_ROOT}/selection"
+TARGET_GRID_FILE="${SELECTION_ROOT}/slaclip_target_grid.json"
 STAGE1_SELECTION="${SELECTION_ROOT}/stage1-selection.json"
 LOCKED_SELECTION="${SELECTION_ROOT}/selection.json"
 SCHEDULE_ROOT="${CAMPAIGN_ROOT}/schedule"
@@ -271,6 +273,8 @@ for required_file in \
   train_eval.py \
   configs/math10k_paper.json \
   scripts/preflight_hpc.py \
+  scripts/cuda_step_guard.py \
+  scripts/derive_slaclip_target_grid.py \
   scripts/smoke_dp_path.py \
   scripts/select_validation_candidates.py \
   scripts/summarize_telemetry.py; do
@@ -367,45 +371,89 @@ lane_srun() {
     "${cache_root}/cuda" \
     "${cache_root}/pycache" \
     "${tmp_root}"
-  srun \
-    --export=ALL \
-    --exclusive \
-    --exact \
-    --nodes=1 \
-    --ntasks=1 \
-    --cpus-per-task=8 \
-    --mem=128G \
-    --gres=gpu:h200:1 \
-    --kill-on-bad-exit=1 \
-    --output="${arm_root}/logs/${log_stem}-${JOB_ID}.out" \
-    --error="${arm_root}/logs/${log_stem}-${JOB_ID}.err" \
-    env \
-      PRISM_REPO_ROOT="${REPO_ROOT}" \
-      PRISM_RUN_ROOT="${RUN_ROOT}" \
-      HF_HOME="${cache_root}/huggingface" \
-      HF_HUB_CACHE="${SHARED_HF_HOME}/hub" \
-      HUGGINGFACE_HUB_CACHE="${SHARED_HF_HOME}/hub" \
-      HF_DATASETS_CACHE="${cache_root}/datasets" \
-      HF_HUB_OFFLINE=1 \
-      TRANSFORMERS_OFFLINE=1 \
-      HF_HUB_DISABLE_XET=1 \
-      TORCH_HOME="${cache_root}/torch" \
-      TORCH_EXTENSIONS_DIR="${cache_root}/torch-extensions" \
-      TRITON_CACHE_DIR="${cache_root}/triton" \
-      XDG_CACHE_HOME="${cache_root}/xdg" \
-      CUDA_CACHE_PATH="${cache_root}/cuda" \
-      PYTHONPYCACHEPREFIX="${cache_root}/pycache" \
-      TMPDIR="${tmp_root}" \
-      TOKENIZERS_PARALLELISM=false \
-      PYTHONUNBUFFERED=1 \
-      OMP_NUM_THREADS=8 \
-      MKL_NUM_THREADS=8 \
-      "$@" &
-  LANE_SRUN_PID=$!
-  local lane_rc=0
-  wait "${LANE_SRUN_PID}" || lane_rc=$?
-  LANE_SRUN_PID=""
+  local guard_root="${arm_root}/cuda-guards"
+  local max_attempts=3
+  local attempt lane_rc marker_path
+  mkdir -p "${guard_root}"
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    marker_path="${guard_root}/${log_stem}-${JOB_ID}-attempt-${attempt}.json"
+    lane_rc=0
+    srun \
+      --export=ALL \
+      --exclusive \
+      --exact \
+      --nodes=1 \
+      --ntasks=1 \
+      --cpus-per-task=8 \
+      --mem=128G \
+      --gres=gpu:h200:1 \
+      --kill-on-bad-exit=1 \
+      --output="${arm_root}/logs/${log_stem}-${JOB_ID}-attempt-${attempt}.out" \
+      --error="${arm_root}/logs/${log_stem}-${JOB_ID}-attempt-${attempt}.err" \
+      env \
+        PRISM_REPO_ROOT="${REPO_ROOT}" \
+        PRISM_RUN_ROOT="${RUN_ROOT}" \
+        HF_HOME="${cache_root}/huggingface" \
+        HF_HUB_CACHE="${SHARED_HF_HOME}/hub" \
+        HUGGINGFACE_HUB_CACHE="${SHARED_HF_HOME}/hub" \
+        HF_DATASETS_CACHE="${cache_root}/datasets" \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        HF_HUB_DISABLE_XET=1 \
+        TORCH_HOME="${cache_root}/torch" \
+        TORCH_EXTENSIONS_DIR="${cache_root}/torch-extensions" \
+        TRITON_CACHE_DIR="${cache_root}/triton" \
+        XDG_CACHE_HOME="${cache_root}/xdg" \
+        CUDA_CACHE_PATH="${cache_root}/cuda" \
+        PYTHONPYCACHEPREFIX="${cache_root}/pycache" \
+        TMPDIR="${tmp_root}" \
+        TOKENIZERS_PARALLELISM=false \
+        PYTHONUNBUFFERED=1 \
+        OMP_NUM_THREADS=8 \
+        MKL_NUM_THREADS=8 \
+        "${PYTHON_BIN}" -u scripts/cuda_step_guard.py \
+          --marker "${marker_path}" -- "$@" &
+    LANE_SRUN_PID=$!
+    wait "${LANE_SRUN_PID}" || lane_rc=$?
+    LANE_SRUN_PID=""
+    if [[ "${lane_rc}" == "0" ]]; then
+      return 0
+    fi
+    # A marker is created immediately before exec.  Once it exists, any
+    # nonzero result belongs to the workload and must never be auto-repeated.
+    if [[ -e "${marker_path}" ]]; then
+      return "${lane_rc}"
+    fi
+    echo "warning: retry-safe CUDA/Slurm step startup failure " \
+      "attempt=${attempt}/${max_attempts} arm=${arm_root} rc=${lane_rc}" >&2
+    if (( attempt < max_attempts )); then
+      sleep $((5 * attempt))
+    fi
+  done
   return "${lane_rc}"
+}
+
+run_dual_cuda_guard_pair() {
+  local first_pid second_pid first_rc=0 second_rc=0
+  lane_srun \
+    "${CAMPAIGN_ROOT}/preflight/cuda-lane-0" \
+    cuda-lane-0 \
+    "${PYTHON_BIN}" -c \
+      'import torch; print(f"guarded_lane_device={torch.cuda.get_device_name(0)}", flush=True)' &
+  first_pid=$!
+  lane_srun \
+    "${CAMPAIGN_ROOT}/preflight/cuda-lane-1" \
+    cuda-lane-1 \
+    "${PYTHON_BIN}" -c \
+      'import torch; print(f"guarded_lane_device={torch.cuda.get_device_name(0)}", flush=True)' &
+  second_pid=$!
+  wait "${first_pid}" || first_rc=$?
+  wait "${second_pid}" || second_rc=$?
+  if [[ "${first_rc}" != "0" || "${second_rc}" != "0" ]]; then
+    echo "error: concurrent CUDA lane guard failed " \
+      "lane0_rc=${first_rc} lane1_rc=${second_rc}" >&2
+    return 86
+  fi
 }
 
 validate_selection_run() {
@@ -997,7 +1045,7 @@ run_training_spec() {
     echo "clip_schedule_path=${schedule_path}"
     echo "code_sha=${EXPECTED_REPO_SHA}"
     if [[ "${phase}" == "final" ]]; then
-      local screen_run_count=$((38 + stage2_count))
+      local screen_run_count=$((18 + stage2_count))
       local total_dp_run_count=$((screen_run_count + 3 + final_count))
       echo "selection_sha256=$(sha256sum "${LOCKED_SELECTION}" | awk '{print $1}')"
       echo "primary_metric=clean_three_task_macro_accuracy"
@@ -1015,7 +1063,7 @@ run_training_spec() {
       echo "conditional_privacy_warning=does_not_apply_if_selection_or_other_screen_outputs_are_released"
       echo "dp_only_full_campaign_basic_composition=epsilon$((6 * total_dp_run_count))_delta${total_dp_run_count}e-5_release_count${total_dp_run_count}"
     elif [[ "${phase}" == "schedule-source" ]]; then
-      local screen_run_count=$((38 + stage2_count))
+      local screen_run_count=$((18 + stage2_count))
       echo "selection_sha256=$(sha256sum "${LOCKED_SELECTION}" | awk '{print $1}')"
       echo "data_scope=full_math10k_9919_rows"
       echo "model_evaluation=false"
@@ -1072,6 +1120,7 @@ run_training_spec() {
     --allow_non_private_telemetry
     --raw_hist_bins 128
     --raw_hist_max 30.0
+    --slaclip_num_slots 15
     --require_cuda
     --resume
     --checkpoint_every 25
@@ -1117,7 +1166,6 @@ run_training_spec() {
       train_args+=(
         --slaclip_target_non_small_clip_fraction "${rho}"
         --slaclip_eta "${eta}"
-        --slaclip_num_slots 15
         --slaclip_c_min 0.1
         --slaclip_c_max 15.0
       )
@@ -1379,8 +1427,8 @@ run_plan() {
   exec 3<&-
 }
 
-create_candidate_registry() {
-  "${PYTHON_BIN}" - "${REGISTRY_FILE}" "${MODEL_ID}" "${MODEL_REVISION}" "${EXPECTED_REPO_SHA}" <<'PY'
+create_fixed_scan_manifest() {
+  "${PYTHON_BIN}" - "${FIXED_MANIFEST}" "${MODEL_ID}" "${MODEL_REVISION}" "${EXPECTED_REPO_SHA}" <<'PY'
 import hashlib
 import json
 import math
@@ -1391,9 +1439,6 @@ from pathlib import Path
 
 target = Path(sys.argv[1])
 fixed_values = (0.1, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 15.0)
-c0_values = (0.5, 1.0)
-rhos = (0.50, 0.90, 0.95, 0.99, 0.995)
-etas = (0.05, 0.15, 0.20)
 
 def slug(value):
     text = format(float(value), ".12g").replace(".", "p")
@@ -1407,24 +1452,8 @@ for clip in fixed_values:
         "method": "baseline",
         "params": {"dp_max_grad_norm": clip},
     })
-for c0 in c0_values:
-    for rho in rhos:
-        for eta in etas:
-            candidates.append({
-                "id": f"sla-c{slug(c0)}-r{slug(rho)}-e{slug(eta)}",
-                "family": "slaclip",
-                "method": "slaclip",
-                "params": {
-                    "dp_max_grad_norm": c0,
-                    "slaclip_target_non_small_clip_fraction": rho,
-                    "slaclip_eta": eta,
-                    "slaclip_num_slots": 15,
-                    "slaclip_c_min": 0.1,
-                    "slaclip_c_max": 15.0,
-                },
-            })
-if len(candidates) != 38 or len({item["id"] for item in candidates}) != 38:
-    raise SystemExit("candidate grid must contain exactly 8 fixed and 30 SlaClip arms")
+if len(candidates) != 8 or len({item["id"] for item in candidates}) != 8:
+    raise SystemExit("fixed scan must contain exactly eight unique candidates")
 for candidate in candidates:
     runs = {}
     for seed in (42, 43, 44):
@@ -1438,7 +1467,7 @@ for candidate in candidates:
 payload = {
     "schema_version": 1,
     "selection_protocol": {
-        "name": "math10k_4b_dynamics_numeric_selection_fresh_final_v2",
+        "name": "math10k_4b_fixed_derived_targets_numeric_selection_fresh_final_v3",
         "protocol_stage": "selection",
         "validation_data_is_public": True,
         "selection_metric": "public_math10k_numeric_exact_match_accuracy",
@@ -1493,7 +1522,7 @@ payload = {
         "max_update_norm": 0.0,
         },
     },
-    "candidates": candidates,
+    "fixed_candidates": candidates,
 }
 encoded = (json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
 target.parent.mkdir(parents=True, exist_ok=True)
@@ -1513,6 +1542,18 @@ else:
         temporary.unlink(missing_ok=True)
 os.chmod(target, 0o600)
 PY
+  atomic_sha256_sidecar "${FIXED_MANIFEST}"
+}
+
+derive_locked_slaclip_grid() {
+  "${PYTHON_BIN}" scripts/derive_slaclip_target_grid.py \
+    --campaign-root "${CAMPAIGN_ROOT}" \
+    --fixed-manifest "${FIXED_MANIFEST}" \
+    --output "${TARGET_GRID_FILE}" \
+    --registry-out "${REGISTRY_FILE}" \
+    >"${SELECTION_ROOT}/target-grid-${JOB_ID}.out" \
+    2>"${SELECTION_ROOT}/target-grid-${JOB_ID}.err"
+  atomic_sha256_sidecar "${TARGET_GRID_FILE}"
   atomic_sha256_sidecar "${REGISTRY_FILE}"
 }
 
@@ -1523,7 +1564,8 @@ create_campaign_manifest() {
   "${PYTHON_BIN}" - \
     "${manifest}" "${REGISTRY_FILE}" "${EXPECTED_REPO_SHA}" "${JOB_ID}" \
     "${MODEL_ID}" "${MODEL_REVISION}" "${ENV_PREFIX}" \
-    "${ENVIRONMENT_FREEZE}" "${stage2_runs}" "${final_runs}" <<'PY'
+    "${ENVIRONMENT_FREEZE}" "${stage2_runs}" "${final_runs}" \
+    "${FIXED_MANIFEST}" "${TARGET_GRID_FILE}" <<'PY'
 import hashlib
 import json
 import os
@@ -1533,7 +1575,7 @@ from pathlib import Path
 
 target = Path(sys.argv[1])
 registry = Path(sys.argv[2])
-stage1_run_count = 38
+stage1_run_count = 18
 stage2_run_count = int(sys.argv[9])
 final_run_count = int(sys.argv[10])
 if stage2_run_count not in (10, 12) or final_run_count not in (20, 25, 30, 35):
@@ -1552,7 +1594,7 @@ def basic_composition(release_count):
 
 payload = {
     "schema_version": 1,
-    "protocol": "math10k_4b_dynamics_numeric_selection_fresh_final_v2",
+    "protocol": "math10k_4b_fixed_derived_target_selection_fresh_final_v3",
     "code_sha": sys.argv[3],
     "job_id": sys.argv[4],
     "model_id": sys.argv[5],
@@ -1563,6 +1605,8 @@ payload = {
         "sha256": hashlib.sha256(Path(sys.argv[8]).read_bytes()).hexdigest(),
     },
     "candidate_registry_sha256": hashlib.sha256(registry.read_bytes()).hexdigest(),
+    "fixed_scan_manifest_sha256": hashlib.sha256(Path(sys.argv[11]).read_bytes()).hexdigest(),
+    "slaclip_target_grid_sha256": hashlib.sha256(Path(sys.argv[12]).read_bytes()).hexdigest(),
     "resources": {
         "allocation": "one Slurm job",
         "gpu": "2xh200",
@@ -1576,6 +1620,10 @@ payload = {
             "delta": 1e-5,
         },
         "telemetry": "research_raw_NON_PRIVATE",
+        "target_calibration": (
+            "NON_PRIVATE_data_dependent_fixed_scan_to_full_slaclip_grid;_"
+            "not_an_end_to_end_DP_protocol"
+        ),
         "stage1_run_count": stage1_run_count,
         "stage2_run_count": stage2_run_count,
         "screen_run_count": screen_run_count,
@@ -1651,10 +1699,14 @@ PY
 create_plan() {
   local mode="$1"
   local output="$2"
+  local source_manifest="${REGISTRY_FILE}"
+  if [[ "${mode}" == "fixed-scan" ]]; then
+    source_manifest="${FIXED_MANIFEST}"
+  fi
   local temporary create_rc=0
   temporary="$(mktemp "${output}.tmp.XXXXXX")"
   "${PYTHON_BIN}" - \
-    "${mode}" "${REGISTRY_FILE}" "${CAMPAIGN_ROOT}" "${STAGE1_SELECTION}" \
+    "${mode}" "${source_manifest}" "${CAMPAIGN_ROOT}" "${STAGE1_SELECTION}" \
     "${LOCKED_SELECTION}" "${CONTROL_MANIFEST}" "${REPLAY_SCHEDULE}" "${MODEL_SLUG}" \
     >"${temporary}" <<'PY' || create_rc=$?
 import json
@@ -1669,7 +1721,10 @@ locked_selection = Path(sys.argv[5])
 control_manifest = Path(sys.argv[6])
 replay_schedule = Path(sys.argv[7])
 model_slug = sys.argv[8]
-candidates = {item["id"]: item for item in registry["candidates"]}
+candidate_rows = (
+    registry["fixed_candidates"] if mode == "fixed-scan" else registry["candidates"]
+)
+candidates = {item["id"]: item for item in candidate_rows}
 
 def emit(phase, candidate, role, seed, arm_root, schedule="NA"):
     params = candidate["params"]
@@ -1687,12 +1742,24 @@ def emit(phase, candidate, role, seed, arm_root, schedule="NA"):
         schedule, arm_root,
     )))
 
-if mode == "stage1":
-    for candidate in registry["candidates"]:
+if mode == "fixed-scan":
+    for candidate in candidate_rows:
         emit(
-            "stage1",
+            "fixed-scan",
             candidate,
-            "grid",
+            "fixed-grid-calibration",
+            42,
+            campaign_root / "screen" / "runs" / candidate["id"] / "seed-42",
+        )
+elif mode == "slaclip-screen":
+    slaclip = [item for item in candidate_rows if item["family"] == "slaclip"]
+    if len(slaclip) != 10:
+        raise SystemExit("derived registry must contain exactly ten SlaClip candidates")
+    for candidate in slaclip:
+        emit(
+            "slaclip-screen",
+            candidate,
+            "derived-target-grid",
             42,
             campaign_root / "screen" / "runs" / candidate["id"] / "seed-42",
         )
@@ -1757,17 +1824,19 @@ elif mode == "final":
     if len(canonical_ids) != 1:
         raise SystemExit("registry must contain exactly one canonical fixed C=1 candidate")
     canonical = candidates[canonical_ids[0]]
-    canonical_full_ids = [
-        candidate_id
-        for candidate_id, candidate in candidates.items()
-        if candidate["family"] == "slaclip"
-        and abs(float(candidate["params"]["dp_max_grad_norm"]) - 1.0) <= 1e-12
-        and abs(float(candidate["params"]["slaclip_target_non_small_clip_fraction"]) - 0.5) <= 1e-12
-        and abs(float(candidate["params"]["slaclip_eta"]) - 0.2) <= 1e-12
-    ]
-    if len(canonical_full_ids) != 1:
-        raise SystemExit("registry must contain exactly one canonical full-SlaClip anchor")
-    canonical_full = candidates[canonical_full_ids[0]]
+    canonical_full = {
+        "id": "canonical-full-slaclip-paper-default",
+        "family": "slaclip-control",
+        "method": "slaclip",
+        "params": {
+            "dp_max_grad_norm": 1.0,
+            "slaclip_target_non_small_clip_fraction": 0.5,
+            "slaclip_eta": 0.2,
+            "slaclip_num_slots": 15,
+            "slaclip_c_min": 0.1,
+            "slaclip_c_max": 15.0,
+        },
+    }
     replay = {
         "id": "replay-selected-shared-schedule",
         "family": "replay",
@@ -1807,7 +1876,12 @@ elif mode == "final":
         raise SystemExit("control manifest initial-C reference role is inconsistent")
     if abs(float(controls.get("initial_c_matched_fixed_C")) - selected_c0) > 1e-12:
         raise SystemExit("control manifest initial-C reference threshold is inconsistent")
-    if canonical_full["id"] == selected["id"]:
+    selected_is_canonical_full = (
+        abs(selected_c0 - 1.0) <= 1e-12
+        and abs(float(selected["params"]["slaclip_target_non_small_clip_fraction"]) - 0.5) <= 1e-12
+        and abs(float(selected["params"]["slaclip_eta"]) - 0.2) <= 1e-12
+    )
+    if selected_is_canonical_full:
         canonical_full_reference_role = "selected-slaclip"
     else:
         canonical_full_reference_role = "canonical-full-slaclip"
@@ -2099,7 +2173,7 @@ control_path = Path(sys.argv[4])
 stage2_run_count = int(sys.argv[5])
 if stage2_run_count not in (10, 12):
     raise SystemExit(f"unexpected stage2 run count: {stage2_run_count}")
-stage1_run_count = 38
+stage1_run_count = 18
 screen_run_count = stage1_run_count + stage2_run_count
 selection = json.loads(selection_path.read_text(encoding="utf-8"))
 selected = selection["selected_slaclip"]
@@ -2328,7 +2402,8 @@ PY
 write_artifact_manifest() {
   local output="${CAMPAIGN_ROOT}/artifacts/manifest.json"
   "${PYTHON_BIN}" - \
-    "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${REGISTRY_FILE}" "${STAGE1_SELECTION}" \
+    "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${FIXED_MANIFEST}" "${TARGET_GRID_FILE}" \
+    "${REGISTRY_FILE}" "${STAGE1_SELECTION}" \
     "${LOCKED_SELECTION}" "${REPLAY_SCHEDULE}" "${CONTROL_MANIFEST}" \
     "${FINAL_EVAL_ASSET_MANIFEST}" "${output}" <<'PY'
 import csv
@@ -2344,10 +2419,11 @@ from pathlib import Path
 
 root = Path(sys.argv[1]).resolve()
 code_sha = sys.argv[2]
-locked_files = [Path(item).resolve() for item in sys.argv[3:9]]
-output = Path(sys.argv[9]).resolve()
+locked_files = [Path(item).resolve() for item in sys.argv[3:11]]
+output = Path(sys.argv[11]).resolve()
 plan_files = [
-    root / "plans" / "stage1.tsv",
+    root / "plans" / "fixed-scan.tsv",
+    root / "plans" / "slaclip-screen.tsv",
     root / "plans" / "stage2.tsv",
     root / "plans" / "schedule-source.tsv",
     root / "plans" / "final.tsv",
@@ -2369,7 +2445,7 @@ def specs(path):
     return result
 
 all_specs = [item for path in plan_files for item in specs(path)]
-if len(all_specs) not in {71, 73, 76, 78, 81, 83, 86, 88}:
+if len(all_specs) not in {56, 58, 61, 63, 66, 68}:
     raise SystemExit(
         "unexpected formal experiment-arm count after full-data schedule sources: "
         f"{len(all_specs)}"
@@ -2377,18 +2453,24 @@ if len(all_specs) not in {71, 73, 76, 78, 81, 83, 86, 88}:
 arm_roots = [Path(fields[10]).resolve() for fields in all_specs]
 if len(set(arm_roots)) != len(arm_roots):
     raise SystemExit("plans reuse an arm output directory")
-stage1_run_count = sum(fields[1] == "stage1" for fields in all_specs)
+fixed_scan_run_count = sum(fields[1] == "fixed-scan" for fields in all_specs)
+slaclip_screen_run_count = sum(
+    fields[1] == "slaclip-screen" for fields in all_specs
+)
+stage1_run_count = fixed_scan_run_count + slaclip_screen_run_count
 stage2_run_count = sum(fields[1] == "stage2" for fields in all_specs)
 final_run_count = sum(fields[1] == "final" for fields in all_specs)
 schedule_source_run_count = sum(fields[1] == "schedule-source" for fields in all_specs)
 if (
-    stage1_run_count != 38
+    fixed_scan_run_count != 8
+    or slaclip_screen_run_count != 10
     or stage2_run_count not in (10, 12)
     or schedule_source_run_count != 3
-    or final_run_count not in (20, 25, 30, 35)
+    or final_run_count not in (25, 30, 35)
 ):
     raise SystemExit(
         "invalid dynamic phase counts: "
+        f"fixed_scan={fixed_scan_run_count} slaclip_screen={slaclip_screen_run_count} "
         f"stage1={stage1_run_count} stage2={stage2_run_count} "
         f"schedule_source={schedule_source_run_count} final={final_run_count}"
     )
@@ -2779,7 +2861,7 @@ required_roles = {
     "matched-fixed-noise-energy",
 }
 observed_roles = {str(row["role"]) for row in final_rows}
-control_manifest = json.loads(locked_files[4].read_text(encoding="utf-8"))
+control_manifest = json.loads(locked_files[6].read_text(encoding="utf-8"))
 initial_c_reference_role = control_manifest["initial_c_matched_fixed_reference_role"]
 canonical_full_reference_role = control_manifest["canonical_full_slaclip_reference_role"]
 if not required_roles.issubset(observed_roles):
@@ -3039,13 +3121,14 @@ campaign_snapshot_files = [
     root / "submission_receipt.json",
     root / "artifacts" / "environment_freeze.txt",
     *sorted((root / "artifacts").glob("allocation-*.txt")),
+    *sorted(root.glob("preflight/**/cuda-guards/*.json")),
     *sorted(root.glob("preflight/**/logs/preflight-*.out")),
     *sorted(root.glob("preflight/**/logs/preflight-*.err")),
 ]
 for path in campaign_snapshot_files:
     if not path.is_file():
         raise SystemExit(f"missing campaign/environment/preflight snapshot: {path}")
-evaluation_asset_manifest = json.loads(locked_files[5].read_text(encoding="utf-8"))
+evaluation_asset_manifest = json.loads(locked_files[7].read_text(encoding="utf-8"))
 decontamination_protocol = evaluation_asset_manifest.get("decontamination") or {}
 payload = {
     "schema_version": 1,
@@ -3059,7 +3142,17 @@ payload = {
     ),
     "code_sha": code_sha,
     "raw_exact_telemetry_is_non_private": True,
+    "target_calibration": {
+        "classification": "NON_PRIVATE_data_dependent_exploratory_calibration",
+        "fixed_scan_manifest_path": str(locked_files[0].relative_to(root)),
+        "fixed_scan_manifest_sha256": sha(locked_files[0]),
+        "slaclip_target_grid_path": str(locked_files[1].relative_to(root)),
+        "slaclip_target_grid_sha256": sha(locked_files[1]),
+        "mapping": "p=rho*(1-z_reference)",
+    },
     "privacy_accounting": {
+        "fixed_scan_run_count": fixed_scan_run_count,
+        "slaclip_screen_run_count": slaclip_screen_run_count,
         "stage1_run_count": stage1_run_count,
         "stage2_run_count": stage2_run_count,
         "screen_run_count": screen_run_count,
@@ -3107,8 +3200,8 @@ payload = {
         "sensitivity_metric": "decontaminated_four_task_macro_accuracy",
         "paper_comparability_metric": "raw_four_task_macro_accuracy",
         "decontamination_normalization": decontamination_protocol["normalization"],
-        "decontamination_asset_manifest_path": str(locked_files[5].relative_to(root)),
-        "decontamination_asset_manifest_sha256": sha(locked_files[5]),
+        "decontamination_asset_manifest_path": str(locked_files[7].relative_to(root)),
+        "decontamination_asset_manifest_sha256": sha(locked_files[7]),
         "mawps_raw_records": 238,
         "mawps_conservative_clean_records": 185,
         "mawps_conservative_overlap_records": 53,
@@ -3212,14 +3305,26 @@ write_job_status running 0
 echo "job_id=${JOB_ID} campaign=${CAMPAIGN_ID} host=$(hostname)"
 echo "code_sha=${EXPECTED_REPO_SHA} environment=${ENV_PREFIX}"
 nvidia-smi
-gpu_count="$("${PYTHON_BIN}" -c 'import torch; print(torch.cuda.device_count())')"
-if [[ "${gpu_count}" != "2" ]]; then
-  echo "error: expected exactly two visible GPUs, found ${gpu_count}" >&2
-  exit 2
-fi
+"${PYTHON_BIN}" - <<'PY'
+import torch
+
+torch.cuda.init()
+count = torch.cuda.device_count()
+if count != 2:
+    raise SystemExit(f"expected exactly two visible allocation GPUs, found {count}")
+for index in range(count):
+    with torch.cuda.device(index):
+        value = torch.ones((16, 16), device=f"cuda:{index}")
+        result = value @ value
+        if float(result.sum().item()) != 4096.0:
+            raise SystemExit(f"unexpected CUDA checksum on allocation GPU {index}")
+        torch.cuda.synchronize(index)
+        print(f"allocation_gpu[{index}]={torch.cuda.get_device_name(index)}")
+PY
 "${PYTHON_BIN}" -m pip check
 "${PYTHON_BIN}" -m compileall -q train_eval.py src scripts
 create_environment_and_allocation_snapshots
+run_dual_cuda_guard_pair
 lane_srun \
   "${CAMPAIGN_ROOT}/preflight/${MODEL_SLUG}" \
   preflight \
@@ -3238,19 +3343,33 @@ run_parallel_pair "synthetic|baseline" "synthetic|slaclip"
 run_parallel_pair "real-smoke|baseline" "real-smoke|slaclip"
 run_parallel_pair "real-smoke|replay"
 
-CURRENT_PHASE="registry"
+CURRENT_PHASE="fixed-scan-manifest"
 write_job_status running 0
-create_candidate_registry
+create_fixed_scan_manifest
 
-CURRENT_PHASE="stage1"
+CURRENT_PHASE="fixed-scan"
 write_job_status running 0
-STAGE1_PLAN="${PLAN_ROOT}/stage1.tsv"
-create_plan stage1 "${STAGE1_PLAN}"
-if [[ "$(wc -l <"${STAGE1_PLAN}")" != "38" ]]; then
-  echo "error: stage1 plan must contain exactly 38 arms" >&2
+FIXED_SCAN_PLAN="${PLAN_ROOT}/fixed-scan.tsv"
+create_plan fixed-scan "${FIXED_SCAN_PLAN}"
+if [[ "$(wc -l <"${FIXED_SCAN_PLAN}")" != "8" ]]; then
+  echo "error: fixed scan plan must contain exactly eight arms" >&2
   exit 2
 fi
-run_plan "${STAGE1_PLAN}"
+run_plan "${FIXED_SCAN_PLAN}"
+
+CURRENT_PHASE="target-grid-lock"
+write_job_status running 0
+derive_locked_slaclip_grid
+
+CURRENT_PHASE="slaclip-screen"
+write_job_status running 0
+SLACLIP_SCREEN_PLAN="${PLAN_ROOT}/slaclip-screen.tsv"
+create_plan slaclip-screen "${SLACLIP_SCREEN_PLAN}"
+if [[ "$(wc -l <"${SLACLIP_SCREEN_PLAN}")" != "10" ]]; then
+  echo "error: SlaClip screen plan must contain exactly ten arms" >&2
+  exit 2
+fi
+run_plan "${SLACLIP_SCREEN_PLAN}"
 
 CURRENT_PHASE="stage1-selection"
 write_job_status running 0
@@ -3295,8 +3414,8 @@ write_job_status running 0
 FINAL_PLAN="${PLAN_ROOT}/final.tsv"
 create_plan final "${FINAL_PLAN}"
 final_count="$(wc -l <"${FINAL_PLAN}")"
-if [[ "${final_count}" != "20" && "${final_count}" != "25" && "${final_count}" != "30" && "${final_count}" != "35" ]]; then
-  echo "error: locked final plan must contain 20, 25, 30, or 35 arms, found ${final_count}" >&2
+if [[ "${final_count}" != "25" && "${final_count}" != "30" && "${final_count}" != "35" ]]; then
+  echo "error: locked final plan must contain 25, 30, or 35 arms, found ${final_count}" >&2
   exit 2
 fi
 create_campaign_manifest "${stage2_count}" "${final_count}"

@@ -145,7 +145,8 @@ separate from SlaClip-Q.
 
 ### Validation-budget-matched comparison
 
-If tuning is part of the research question:
+For a release-oriented or confirmatory comparison in which the search space is
+fixed independently of the private training data:
 
 - predeclare the candidate space, for example baseline `C in {0.25, 0.5, 1, 2, 4}`;
 - give each method the same validation-driven selection budget;
@@ -153,46 +154,96 @@ If tuning is part of the research question:
 - never choose configurations or stopping points using the test set;
 - state whether the privacy cost of data-dependent selection is included in the final claim.
 
-For the journal-extension campaign, use a fixed public Math-10K holdout rather
-than choosing a controller from exact clipping telemetry.  A baseline clipping
-fraction of 100% is a censored statistic: its median contains no information
-about how far the gradient norms lie above `C`, so it must not be converted
-mechanically into a full-SlaClip `rho`. Full SlaClip predeclares a conditional
-target `rho`, but its global clipped target remains dynamic because it is
-`rho*(1-z_t)` before projection. Candidate `rho` values must be selected under
-the same public-validation budget as other tuned controller parameters, not
-from task-test results or private exact clipping telemetry.
+The 4B training-dynamics campaign is deliberately a different, exploratory
+protocol: it uses access-controlled exact `research_raw` statistics from a
+fixed-threshold scan to construct a narrower full-SlaClip screen. It must not be
+described as end-to-end DP or as a validation-budget-matched comparison. A
+formal privacy claim requires either an independently predeclared grid or a new
+independent confirmation whose privacy analysis composes every mechanism that
+informed the grid and every released result.
 
-The candidate registry for this campaign must include the canonical
+Full SlaClip's target semantics are essential to this calibration. Let
+
+```text
+p*_t = rho * (1 - z_t),     z_t = s_hat_K / C_t
+```
+
+before projection. Here `p*_t` is the dynamic global clipped proxy, whereas
+`rho` is conditional on the residual/non-small proxy mass. Therefore the exact
+fixed-run `raw_clip_fraction` cannot be copied directly into `rho`; doing so
+would ignore `z_t`. A saturated 100% fixed-run clipping median is also censored
+and does not reveal how far the norms lie beyond `C`.
+
+The exploratory campaign locks the following sequence before task-test
+evaluation:
+
+1. Run fixed PRISM at `C in {0.1, 0.5, 1, 1.5, 2, 3, 5, 15}`, all with training
+   seed 42, the same deterministic public Math-10K holdout, 300 updates, and
+   exact `NON_PRIVATE` `research_raw` telemetry. Record each step's clipping
+   fraction, norm distribution, bias/noise diagnostics, and the telemetry-only
+   `K=15` counterfactual small-gradient proxy. This counterfactual calculation
+   does not add Slack coordinates to the fixed arm's DP query or alter its
+   clipping, Gaussian noise, optimizer update, or accountant.
+2. Lock `C_best` by public validation numeric exact-match, with public
+   response-only validation loss as the deterministic tie-break. Independently
+   lock `C_transition` as the smallest scanned `C` whose 10th percentile of the
+   300 exact clipping fractions is below 0.99. If none meets that criterion but
+   at least one observed step is below 100%, use `C=15` as an explicitly recorded
+   fallback; if all eight trajectories are 100% throughout, fail closed instead
+   of inventing a target grid.
+3. Use `C_best` and `C_transition` as the two `C_0` values. If they coincide,
+   replace the duplicate with the best distinct fixed candidate under the same
+   public-validation ordering.
+4. On the `C_transition` trajectory, form a narrow five-point global-target
+   grid `p_i` between the clipped-fraction 10th and 90th percentiles, bounded to
+   `[0.50, 0.99]` and widened to at least 0.04 when necessary. With
+   `z_ref` equal to the median exact telemetry-only small-gradient proxy, map
+   each point to the conditional full-SlaClip target
+   `rho_i=clip(p_i/(1-z_ref), 0.50, 0.995)`. Require five finite, strictly
+   increasing targets; record both `p_i` and `rho_i` plus their source hashes in
+   the immutable calibration artifact. This median-proxy conversion is an
+   exploratory calibration approximation, not an exact per-step inverse replay
+   of the fixed trajectory.
+5. Screen the Cartesian product of the two locked `C_0` values and five locked
+   `rho` values. These ten full-SlaClip arms fix `eta=0.15`, `K=15`,
+   `c_min=0.1`, and `c_max=15`; only `C_0` and `rho` vary.
+6. Rank all fixed and SlaClip screen arms only with the common public holdout,
+   then confirm the selected short list with the additional selection seeds in
+   stage 2. Lock the selection record before any task-test inference.
+7. Retrain the selected SlaClip and validation-tuned fixed control on the full
+   training set with fresh, independent final seeds. Retain the replay and
+   matched-noise controls required by the campaign, and never reuse seed 42 or a
+   stage-2 seed as a fresh final seed.
+
+The final control plan for this campaign must include the canonical
 paper-default-controller anchor `rho=0.5`, `eta=0.2`, `C_0=1`, `K=15`,
 `c_min=0.1`, and `c_max=15`. This anchors the literal `1/2` controller target
 and the repository's official default gain while keeping the campaign bounds
 and small-batch `K` explicit. It is a controller anchor, not a claim that this
 modified task, loss, validation, and evaluation pipeline is a verbatim
-reproduction of every original-paper experiment.
+reproduction of every original-paper experiment. It is a final control outside
+the data-derived two-by-five SlaClip screen, whose gain is fixed at 0.15.
 
-The implemented selection protocol is:
+Every screen and selection stage reserves one deterministic, prompt-grouped
+public holdout with a fixed `validation_seed` shared by every candidate and
+training seed. Prompt groups use the versioned
+`instruction_input_nfkc_casefold_whitespace_collapse_v1` identity: normalize
+`instruction` and `input` separately with Unicode NFKC, `casefold`, and
+split/join whitespace collapse, then compose the two fields as canonical JSON;
+they are not grouped by raw bytes. Selection arms train with
+`--protocol_stage selection`, `--validation_data_is_public`, and
+`--run_eval false`.
 
-1. predeclare the complete fixed-`C` and full-SlaClip candidate registry;
-2. reserve one deterministic, prompt-grouped public holdout with a fixed
-   `validation_seed` shared by every candidate and training seed. Prompt groups
-   use the versioned `instruction_input_nfkc_casefold_whitespace_collapse_v1`
-   identity: normalize `instruction` and `input` separately with Unicode NFKC,
-   `casefold`, and split/join whitespace collapse, then compose the two fields
-   as canonical JSON; they are not grouped by raw bytes;
-3. train selection arms with `--protocol_stage selection`,
-   `--validation_data_is_public`, and `--run_eval false`;
-4. for Math-10K numeric generation, only prompt groups for which every record
-   has a finite numeric `answer` are eligible for the public holdout. All
-   ineligible groups and every other unselected row, including nonnumeric-answer
-   rows, remain in training. Rank candidates first by deterministic numeric
-   exact-match on that holdout, then by response-only per-record causal-LM
-   validation loss as the declared tie-break; exact raw clipping telemetry is
-   diagnostic and is not a selector input;
-5. confirm the short list across the preregistered selection seeds and write an
-   immutable selection record;
-6. after the record is locked, retrain with fresh seeds, `--protocol_stage final`,
-   and `--val_set_size 0`, then begin model inference on the task test sets.
+For Math-10K numeric generation, only prompt groups for which every record has
+a finite numeric `answer` are eligible for the public holdout. All ineligible
+groups and every other unselected row, including nonnumeric-answer rows, remain
+in training. Rank candidates first by deterministic numeric exact-match on that
+holdout, then by response-only per-record causal-LM
+validation loss as the declared tie-break. Exact raw clipping telemetry
+constructs and audits the exploratory grid but is not a utility-ranking metric.
+After the selection record is locked, final arms retrain with fresh seeds,
+`--protocol_stage final`, and `--val_set_size 0`, then begin model inference on
+the task test sets.
 
 The split keeps all records with the same normalized `(instruction, input)`
 prompt on the same side and stratifies GLUE8 by normalized task instruction.
@@ -202,7 +253,9 @@ Any nonzero holdout fails closed unless task-test evaluation is disabled and the
 data is explicitly acknowledged as public auxiliary data.  This public-benchmark
 workflow does not make exact validation release or validation-driven selection
 free for a genuinely private dataset; such a deployment needs its own privacy
-accounting or a separately public selection set.
+accounting or a separately public selection set. Nor does a public validation
+set protect the fixed-scan `research_raw` artifact: the grid remains dependent
+on exact private-training statistics.
 
 These task test sets were accessed during earlier repository development, so
 they must not be described as untouched, pristine, or newly held out. This
@@ -268,7 +321,10 @@ The Ubuntu/CPU unit and synthetic DP paths validate repository logic, but they d
    `slaclip`, and any planned replay arm, including a short deterministic
    public-holdout generation smoke;
 6. confirm completed statuses, a fixed baseline `C`, finite adaptive trajectories, correct proxy targets/bounds, and expected telemetry fields;
-7. only then submit one sequential one-process/one-GPU allocation for the declared paired arms.
+7. only then submit the complete campaign as one two-GPU allocation, using one
+   Python process and one Slurm task per GPU. The two independent one-GPU lanes
+   may run paired arms concurrently inside that allocation; do not split the
+   campaign into arrays or separate queued jobs.
 
 A synthetic smoke pass is necessary but does not prove GPU memory fit. If the Gemma smoke runs out of memory, reduce physical `micro_batch_size` first. Changing expected `batch_size`, update count, epsilon, delta, or clipping settings changes the experiment and must be treated as such.
 
@@ -304,7 +360,12 @@ Consequently:
 - if raw telemetry influences checkpoint, hyperparameter, seed, or model selection for release, account for that data-dependent selection or avoid making an end-to-end DP claim.
 - treat interrupted resume checkpoints as controlled training state because they contain sampler and RNG state; never publish them as DP outputs.
 
-The raw files may be used for internal mechanistic analysis without entering reported accuracy. That intended use does not change their privacy classification. See [telemetry_schema.md](telemetry_schema.md) for the field-level boundary.
+The raw files may be used for internal mechanistic analysis. In this exploratory
+campaign they also determine the `C_transition`/target grid, while public
+validation—not raw telemetry—ranks utility. Neither use changes the raw files'
+privacy classification, and their influence on the grid prevents an end-to-end
+DP claim without composition or independent confirmation. See
+[telemetry_schema.md](telemetry_schema.md) for the field-level boundary.
 
 ## Run identity and resume protocol
 

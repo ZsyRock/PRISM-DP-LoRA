@@ -157,23 +157,31 @@ DP-valid but can exceed the paper's high-probability CDF-monotonicity bound, so
 experiments must label it as the journal policy rather than a paper-bound
 choice.
 
-Journal hyperparameter selection uses a deterministic prompt-grouped public
-holdout, never the task test sets or exact raw clipping telemetry.  Selection
-runs must pass `--protocol_stage selection`, `--validation_data_is_public`, and
-`--run_eval false` with a nonzero `--val_set_size`; configuration locking is
-performed by `scripts/select_validation_candidates.py`.  Math-10K screens can
-add `--validation_generate_numeric` so public-holdout numeric exact accuracy is
-the primary utility signal and response-only loss is the deterministic
-tie-break. `--validation_eval_interval 50` records the public response-loss
-curve at steps `0, 50, ..., 300`; endpoint predictions, parse-failure counts,
-decoding settings, and hashes are stored with the run. Once locked, formal
-arms use fresh seeds, `--protocol_stage final`, and `--val_set_size 0` to retrain
-on the complete training set before evaluation. In particular, a saturated
-100% baseline clipping median is not mechanically equated with full SlaClip's
-conditional `rho`; candidate `rho` values are predeclared and selected only
-with the public validation protocol. See
-[the experiment protocol](docs/experiment_protocol.md) for the leakage guards
-and public-data privacy boundary.
+The exploratory Math-10K 4B dynamics campaign first scans fixed PRISM at
+`C in {0.1, 0.5, 1, 1.5, 2, 3, 5, 15}` with seed 42. It uses exact,
+access-controlled `NON_PRIVATE` telemetry to lock a validation-best `C_best`, a
+clipping-transition `C_transition`, and a five-point global-target interval.
+Because full SlaClip targets `p*_t=rho*(1-z_t)`, fixed-run clipping fractions
+are not copied directly into `rho`: the locked mapping adjusts each target by a
+reference `z_t`. The resulting screen crosses two `C_0` values with five `rho`
+values while fixing `eta=0.15`, `K=15`, `c_min=0.1`, and `c_max=15`.
+
+Public-holdout numeric exact accuracy, with response-only loss as the
+deterministic tie-break, ranks the screen and stage-2 confirmation arms; task
+test sets do not participate in selection. After the selection record is
+locked, final arms use fresh independent seeds, `--protocol_stage final`, and
+`--val_set_size 0`. The literal paper-default controller
+`C_0=1, rho=0.5, eta=0.2, K=15` remains a separately labelled final control.
+The raw-statistic-dependent calibration is exploratory and is not end-to-end
+DP; a formal privacy claim needs an independently predeclared/confirmed grid or
+privacy composition covering the selection. See
+[the experiment protocol](docs/experiment_protocol.md) for the exact mapping,
+leakage guards, and public-data privacy boundary.
+
+On Slurm, the full campaign is submitted once as one two-H200 allocation. Each
+GPU runs one independent Python process; the fixed scan, calibration lock,
+SlaClip screen, stage-2 confirmation, and final controls advance inside that
+single queued job rather than through an array of separately queued jobs.
 
 The noise multiplier is calibrated for the requested update count. Each Poisson batch is normalized by Opacus's fixed expected batch size, not by the randomly realized batch size. Dynamic clipping changes the absolute noise scale with `C_t`, while the matched noise multiplier and accountant determine the same privacy schedule. The sensitivity statement uses Poisson subsampling and add/remove record adjacency; replace-one adjacency must not be substituted without changing the analysis.
 
@@ -229,6 +237,13 @@ target before and after projection, the observed `s_hat_1` proxy, and the
 controller error. These proxy fields are post-processing of the jointly noised
 DP-safe Slack Indicator release; they are not `research_raw` measurements.
 The raw file is self-contained and marked `NON_PRIVATE_TELEMETRY`.
+
+When a fixed arm is configured with reference `K=15`, its raw observer also
+records a counterfactual final Slack coordinate, exact `z_t`, residual mass, and
+conditional clipping ratio. These fields exist only to calibrate the
+exploratory target grid: they do not add Slack coordinates to the baseline DP
+query, alter gradient clipping or Gaussian noise, or drive a baseline optimizer
+update.
 
 For SlaClip-Q-99 dynamics, use `scripts/run_math10k_q99_analysis_pair.sh` (or
 the GLUE counterpart). Its summary separates the requested global clipped-rate

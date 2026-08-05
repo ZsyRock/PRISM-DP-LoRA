@@ -122,15 +122,33 @@ Every raw record is marked `NON_PRIVATE_TELEMETRY: true` and adds:
 | `raw_global_norm_quantiles` | exact quantiles at 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, and 0.99 |
 | `raw_global_norm_hist_counts` / `raw_global_norm_hist_edges` | fixed-edge norm histogram |
 | `raw_global_norm_hist_overflow` | records above the histogram's upper edge |
+| `raw_reference_slaclip_num_slots` | telemetry-only `K` used to evaluate the full-SlaClip small-gradient proxy from exact norms; present when a positive reference `K` is configured, including fixed arms in the exploratory scan |
+| `raw_reference_expected_batch_size_normalization` | fixed expected-batch denominator used by the corresponding SlaClip DP release (not the randomly realized Poisson batch size) |
+| `raw_reference_slack_indicator_last` | exact unnoised final coordinate of the telemetry-only reference Slack Indicator |
+| `raw_reference_small_gradient_proxy` | exact reference `z_t=raw_reference_slack_indicator_last/(C_t+1e-6)` matching the implemented full-SlaClip normalization |
+| `raw_reference_remaining_mass_proxy` | exact reference residual proxy `1-z_t` |
+| `raw_reference_conditional_clip_fraction` | telemetry-only ratio `raw_clip_fraction/(1-z_t)` when the residual proxy is finite and positive; not itself a controller target and not clipped to `[0,1]` |
+| `raw_reference_conditional_clip_fraction_valid` | whether that conditional ratio has a finite, strictly positive denominator |
 
 By default the histogram upper edge is `4 * C_0`, fixed for the run, and `raw_hist_bins` defaults to 32. A fixed edge makes distributions comparable across adaptive steps. `raw_hist_max` can set another predeclared fixed edge. Histogram resolution is independent of SlaClip's `K`.
+
+The `raw_reference_*` fields are observer-only counterfactuals. On a fixed arm
+they are computed from exact norms after the mechanism's clipping decision;
+they do not append Slack coordinates to the DP query, affect the clipped
+gradient or Gaussian noise, update `C`, or change accounting. They support the
+exploratory mapping from a global target `p` to full SlaClip's conditional
+target: since `p*_t=rho*(1-z_t)`, a fixed arm's `raw_clip_fraction` cannot be
+used directly as `rho`.
 
 `replay` loads exactly one positive finite threshold per update from
 `--clip_schedule_path`. The file-byte SHA256 and provenance metadata are stored
 in status, and the SHA participates in the experiment fingerprint and resume
 checkpoint identity. Replay uses the baseline gradient mechanism with `C_t`
-supplied before each update; it never constructs Slack coordinates. Consequently
-the exact Slack/CDF fields are absent from replay and baseline raw logs.
+supplied before each update; it never constructs Slack coordinates for the DP
+query. Consequently replay has no controller Slack/CDF fields. A baseline raw
+log can contain the explicitly named telemetry-only `raw_reference_*`
+counterfactuals when a positive reference `K` is configured; these are not a
+Slack release or controller state.
 
 The replay run's accountant is conditional on that locked schedule. If the
 schedule was derived from private-data-dependent releases (for example, one or
@@ -151,6 +169,15 @@ For release-oriented plots, use only `train_log.jsonl` from a run whose status s
 
 For internal mechanistic analysis, raw fields can be plotted against `step`, `dp_clip_threshold`, or `dp_next_clip_threshold` to study gradient norms, clipping bias, and SNR. Store those analyses with the same access controls as the raw JSONL. Aggregating, plotting, or paraphrasing an exact raw statistic does not automatically make it DP.
 
-Do not use the raw trajectory to choose a releasable checkpoint, threshold, seed, or model unless that data-dependent selection is explicitly included in the privacy analysis. The configured DP mechanism protects the adapter update; it does not retroactively protect a separate observer or a selection rule driven by that observer.
+Do not use the raw trajectory to choose a releasable checkpoint, threshold,
+seed, or model unless that data-dependent selection is explicitly included in
+the privacy analysis. The exploratory 4B campaign intentionally uses fixed-arm
+raw trajectories to lock `C_transition` and a five-point `p`/`rho` grid, so the
+resulting campaign bundle is `NON_PRIVATE` and cannot support a standalone
+end-to-end DP claim. A formal claim needs an independently predeclared or
+independently confirmed grid, or privacy composition covering the calibration.
+The configured DP mechanism protects each adapter update; it does not
+retroactively protect a separate observer or a selection rule driven by that
+observer.
 
 Before release, follow the checklist in [experiment_protocol.md](experiment_protocol.md).
