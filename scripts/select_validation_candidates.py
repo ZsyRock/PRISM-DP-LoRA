@@ -191,8 +191,20 @@ def _validate_protocol(registry: Mapping[str, Any]) -> dict[str, Any]:
     if stage1_seed < 0:
         raise SelectionError("stage1_seed must be non-negative")
     stage2_seeds = protocol.get("stage2_seeds")
-    if stage2_seeds != [42, 43, 44]:
-        raise SelectionError("stage2_seeds must be preregistered exactly as [42, 43, 44]")
+    if not isinstance(stage2_seeds, list):
+        raise SelectionError("stage2_seeds must be a preregistered list of integers")
+    if len(stage2_seeds) < 3:
+        raise SelectionError("stage2_seeds must contain at least three seeds")
+    validated_stage2_seeds = [
+        _integer(seed, label=f"stage2_seeds[{index}]")
+        for index, seed in enumerate(stage2_seeds)
+    ]
+    if any(seed < 0 for seed in validated_stage2_seeds):
+        raise SelectionError("stage2_seeds must contain only non-negative seeds")
+    if len(set(validated_stage2_seeds)) != len(validated_stage2_seeds):
+        raise SelectionError("stage2_seeds must contain unique seeds")
+    if validated_stage2_seeds != sorted(validated_stage2_seeds):
+        raise SelectionError("stage2_seeds must be strictly increasing")
     if stage1_seed not in stage2_seeds:
         raise SelectionError("stage1_seed must also be present in stage2_seeds")
     common_config = protocol.get("common_config")
@@ -764,9 +776,9 @@ def select_candidates(
                 "registry must identify exactly one canonical fixed-C=1 candidate using params.dp_max_grad_norm=1.0"
             )
         canonical_fixed_id = canonical_fixed_ids[0]
-        # Re-rank the top-two one-seed fixed candidates using all three
-        # selection seeds.  C=1 remains a preregistered paper anchor even when
-        # it did not survive the one-seed top-two filter.
+        # Re-rank the top one-seed fixed candidates using every preregistered
+        # selection seed.  C=1 remains a paper anchor even when it did not
+        # survive the one-seed fixed-candidate filter.
         fixed_ids = list(dict.fromkeys([*top_fixed_ids, canonical_fixed_id]))
         fixed_summaries = []
         for candidate_id in fixed_ids:

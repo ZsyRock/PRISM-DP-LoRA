@@ -185,6 +185,9 @@ def _make_campaign(
             if method == "slaclip":
                 config.update(
                     {
+                        # A controller's initial C is intentionally allowed to
+                        # differ from the paired fixed-C reference.
+                        "dp_max_grad_norm": 1.5,
                         "slaclip_beta": 0.99,
                         "slaclip_eta": 0.15,
                         "slaclip_num_slots": 2,

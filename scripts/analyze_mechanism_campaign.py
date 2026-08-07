@@ -46,6 +46,9 @@ TASK_COLUMN_ALIASES = {
 }
 PAIR_CONFIG_EXCLUSIONS = {
     "config_fingerprint",
+    # The clipping threshold is part of the controller under comparison: a
+    # tuned SlaClip C0 need not equal the fixed-C reference threshold.
+    "dp_max_grad_norm",
     "force_eval",
     "force_train",
     "method",

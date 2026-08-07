@@ -290,6 +290,79 @@ def test_stage1_and_stage2_are_deterministic_and_ignore_unselected_runs(tmp_path
     assert stage2_path.read_bytes() == before
 
 
+def test_stage2_supports_five_preregistered_selection_seeds(tmp_path: Path) -> None:
+    campaign, registry_path = _build_campaign(tmp_path)
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["selection_protocol"]["stage2_seeds"] = [42, 43, 44, 45, 46]
+    common_config = registry["selection_protocol"]["common_config"]
+    extra_losses = {
+        "fixed-c1": (2.0, 2.0),
+        "fixed-c15": (2.3, 2.4),
+        "fixed-c2": (2.4, 2.5),
+        "sla-a": (1.8, 1.7),
+        "sla-b": (2.0, 2.1),
+        "sla-c": (2.2, 2.3),
+    }
+    for candidate in registry["candidates"]:
+        split = json.loads(
+            (campaign / candidate["runs"]["42"]["split_manifest"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        for seed, loss in zip((45, 46), extra_losses[candidate["id"]], strict=True):
+            candidate["runs"][str(seed)] = _make_run(
+                campaign,
+                candidate_id=candidate["id"],
+                family=candidate["family"],
+                params=candidate["params"],
+                seed=seed,
+                loss=loss,
+                split=split,
+                common_config=common_config,
+            )
+    _write_json(registry_path, registry)
+
+    stage1_path = campaign / "selection" / "five-seed-stage1.json"
+    _select(campaign, registry_path, "stage1", stage1_path.name)
+    stage2 = _select(
+        campaign,
+        registry_path,
+        "stage2",
+        "five-seed-selection.json",
+        stage1=stage1_path,
+    )
+
+    assert stage2["required_seeds"] == [42, 43, 44, 45, 46]
+    assert stage2["selected_slaclip"]["candidate_id"] == "sla-a"
+    assert stage2["selected_slaclip"]["seeds"] == [42, 43, 44, 45, 46]
+    assert all(item["seeds"] == [42, 43, 44, 45, 46] for item in stage2["ranking"])
+
+
+@pytest.mark.parametrize(
+    ("stage2_seeds", "message"),
+    [
+        ((42, 43, 44), "preregistered list"),
+        ([42, 43], "at least three"),
+        ([42, 43, 43], "unique"),
+        ([42, 44, 43], "strictly increasing"),
+        ([42, -1, 43], "non-negative"),
+        ([43, 44, 45], "stage1_seed"),
+        ([42, True, 44], "must be an integer"),
+    ],
+)
+def test_rejects_invalid_stage2_seed_protocols(
+    tmp_path: Path,
+    stage2_seeds,
+    message: str,
+) -> None:
+    _campaign, registry_path = _build_campaign(tmp_path)
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["selection_protocol"]["stage2_seeds"] = stage2_seeds
+
+    with pytest.raises(selector.SelectionError, match=message):
+        selector._validate_protocol(registry)
+
+
 def test_numeric_exact_accuracy_is_primary_and_loss_breaks_ties(tmp_path: Path) -> None:
     campaign, registry_path = _build_campaign(tmp_path)
     registry = json.loads(registry_path.read_text())
