@@ -264,6 +264,39 @@ them to construct its exploratory target grid. The complete campaign is
 therefore `NON_PRIVATE`; see [the experiment protocol](experiment_protocol.md)
 before making any privacy or confirmatory claim.
 
+### One-A100 dense fixed-C follow-up
+
+After the locked `math10k-4b-c1-c2-refinement` campaign, use the dedicated
+follow-up wrapper to test whether an apparent SlaClip gain is only the result
+of moving between fixed C=1 and C=2:
+
+```bash
+bash scripts/submit_math10k_4b_dense_fixed_followup.sh --test-only
+bash scripts/submit_math10k_4b_dense_fixed_followup.sh --submit
+```
+
+The wrapper submits exactly one dependent Slurm job requesting one A100, one
+task, eight CPUs, 128G host memory, and the cluster's 60-hour A100 maximum.
+Inside that allocation, all arms run sequentially. The worker first resumes
+any incomplete locked fresh-seed arms from the source campaign using its
+original immutable training commit. It then evaluates fixed
+`C={1.25,1.5,1.75}` on seeds 42--46, combines those public-validation results
+with the already locked C=1 and C=2 runs, and locks one dense-best fixed
+control. Fresh full evaluation is enabled only if the selected SlaClip beats
+that control by at least 0.5 percentage points on average, wins at least three
+of five paired validation seeds, and passes the trajectory-integrity audit.
+Final-test measurements never select C or change this gate.
+
+The default dependency and source paths can be replaced for another account
+or resumed source campaign with `PRISM_REFERENCE_JOB_ID` and
+`PRISM_REFERENCE_CAMPAIGN_ROOT`. User, home, scratch, environment, cache, run,
+and repository paths are discovered or supplied through the portable
+`PRISM_*` overrides documented by `--help`; no username is embedded in the
+worker. The new receipt records both the follow-up orchestration revision and
+the frozen experiment-mechanism revision. Use `--resume-submit` only after a
+failed or timed-out follow-up allocation; completed arms are validated and
+skipped, while partial arms use their fingerprinted checkpoints.
+
 Useful environment overrides include:
 
 ```text
