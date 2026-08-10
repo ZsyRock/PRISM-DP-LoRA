@@ -297,6 +297,52 @@ the frozen experiment-mechanism revision. Use `--resume-submit` only after a
 failed or timed-out follow-up allocation; completed arms are validated and
 skipped, while partial arms use their fingerprinted checkpoints.
 
+### One-A100 low-target paired confirmation
+
+Use the low-target wrapper to test conditional Full-SlaClip targets
+`rho={0.8,0.9}` against the predeclared strongest established fixed `C=2`
+baseline:
+
+```bash
+bash scripts/submit_math10k_4b_low_target_campaign.sh --test-only
+bash scripts/submit_math10k_4b_low_target_campaign.sh --submit
+```
+
+This is one non-array allocation with one A100, one task, eight CPUs, 128G
+host memory, and the 60-hour partition maximum. The worker runs every arm
+sequentially on that allocation. A four-arm, 150-step public-validation pilot
+chooses between `C_0={2,3}` separately for each conditional target. The locked
+final phase then trains both selected Full-SlaClip configurations and fixed
+`C=2` on the same five previously unused seeds for 300 steps
+and evaluates all three arms with the same decoding settings. Neither test
+accuracy nor test assets participate in candidate selection.
+
+The primary locked comparison is `rho=0.9` versus fixed `C=2`; `rho=0.8` is
+secondary. `C=2` was predeclared because the complete earlier
+five-seed sweep made it the strongest established fixed threshold before this
+campaign was designed; this is not a claim that every possible fixed threshold
+has been exhaustively optimized. The analyzer reports paired five-seed accuracy
+differences and a two-sided 95% paired-t interval. Endpoint accuracy standard
+deviation and trajectory metrics are descriptive stability evidence, not a
+formal variance-superiority test. Here `rho` is conditional on the noisy
+non-small proxy mass: the realized whole-batch clipped target is
+`Proj_[0,1](rho*(1-z_t))`, where `z_t=s_hat[t,K]/C_t`. Report `rho`, the
+dynamic target, and the realized clipping rate separately.
+
+The benchmark's test results were inspected by earlier campaigns. This run is
+therefore a locked internal paired confirmation, not an untouched external
+replication. A positive result should be replicated on an independent dataset
+or otherwise untouched evaluation before being presented as definitive
+journal evidence.
+
+The wrapper discovers the current user, home, and scratch paths and supports
+the portable `PRISM_*` overrides printed by `--help`. It stages a clean,
+detached Git revision, pins the model revision, places caches/logs/checkpoints
+under scratch, validates the exact Slurm request with `--test-only`, and
+supports `--resume-submit` only after a terminally unsuccessful allocation.
+The exact per-step research telemetry is `NON_PRIVATE` even though model
+training follows the configured DP mechanism.
+
 Useful environment overrides include:
 
 ```text
