@@ -183,6 +183,26 @@ GPU runs one independent Python process; the fixed scan, calibration lock,
 SlaClip screen, stage-2 confirmation, and final controls advance inside that
 single queued job rather than through an array of separately queued jobs.
 
+The separate paper-coverage breadth screen extends beyond the heavily sampled
+Math-10K/Gemma-3-4B/rank-16 setting. It covers GLUE8 at both paper DP budgets
+(`epsilon=6` and `epsilon=3`), Math-10K on Gemma-2-9B, and the rank-8/rank-32
+Math-10K ablations. Every setting runs paper fixed `C=1` plus Full SlaClip at
+conditional `rho in {0.90, 0.98}`, `eta=0.05`, `K=15`, and bounds `[0.1,15]`.
+This is a seed-42 breadth screen: task-test scores are descriptive and any
+positive setting must be confirmed on locked fresh seeds before a journal
+claim. Submit all 15 arms as one portable two-H200 allocation with:
+
+```bash
+bash scripts/submit_paper_coverage_campaign.sh --test-only
+bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+The wrapper resolves the account-specific home/scratch paths, pins both model
+revisions and the Git SHA, stages immutable source, uses offline shared model
+snapshots, and writes the receipt, Slurm logs, adapters, evaluation summaries,
+step telemetry, and aggregate CSV/JSON below one SHA-qualified scratch
+campaign directory.
+
 The noise multiplier is calibrated for the requested update count. Each Poisson batch is normalized by Opacus's fixed expected batch size, not by the randomly realized batch size. Dynamic clipping changes the absolute noise scale with `C_t`, while the matched noise multiplier and accountant determine the same privacy schedule. The sensitivity statement uses Poisson subsampling and add/remove record adjacency; replace-one adjacency must not be substituted without changing the analysis.
 
 For `method=replay`, the reported per-run accountant is conditional on the
