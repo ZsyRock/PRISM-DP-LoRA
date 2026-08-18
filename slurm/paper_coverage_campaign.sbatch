@@ -109,13 +109,25 @@ print([torch.cuda.get_device_name(i) for i in range(2)])
 PY
 "${PYTHON_BIN}" -m pip check
 "${PYTHON_BIN}" -m compileall -q train_eval.py src scripts
-"${PYTHON_BIN}" scripts/preflight_hpc.py \
+
+# The parent allocation deliberately has two tasks so it can host two
+# independent one-GPU lanes.  The repository preflight is single-process-aware
+# and must therefore run inside an exact one-task Slurm step; otherwise the
+# inherited parent SLURM_NTASKS=2 is correctly rejected as distributed
+# execution before any training starts.
+single_gpu_step() {
+  srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
+    --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres=gpu:h200:1 \
+    "$@"
+}
+
+single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
   --dataset glue8 \
   --data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/glue8_1250.json" \
   --expected-data-sha256 281bad3305e8be7a7660b64b22704a9462f983b90df5d6f0c1c4abb649d6d091 \
   --output-root "${CAMPAIGN_ROOT}/preflight/glue8" \
   --require-cuda --model-id google/gemma-3-4b-pt --model-revision "${MODEL_4B_REVISION}"
-"${PYTHON_BIN}" scripts/preflight_hpc.py \
+single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
   --dataset math10k \
   --data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/math_10k.json" \
   --expected-data-sha256 0342d0d860ad8592b579329337c90e42eefd3d9f2898043140cbd120630418b8 \
@@ -124,7 +136,7 @@ PY
 
 CURRENT_PHASE=synthetic-smoke
 write_status running 0
-"${PYTHON_BIN}" scripts/smoke_dp_path.py \
+single_gpu_step "${PYTHON_BIN}" scripts/smoke_dp_path.py \
   --device cuda --method both --steps 2 --clip-norm 1.0 \
   --slaclip-target-non-small-clip-fraction 0.9 --slaclip-eta 0.05 \
   --slaclip-num-slots 15 --slaclip-c-min 0.1 --slaclip-c-max 15 \
