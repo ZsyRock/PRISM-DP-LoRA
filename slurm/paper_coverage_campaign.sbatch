@@ -18,6 +18,7 @@ MODEL_9B_REVISION="${10:?missing Gemma-2-9B revision}"
 GLUE_EVAL_ROOT="${11:?missing pinned GLUE evaluation assets}"
 COVERAGE_PROFILE="${12:?missing coverage profile}"
 MODEL_12B_REVISION="${13:?missing Gemma-3-12B revision}"
+STEP_GRES="${14:?missing per-lane GPU GRES}"
 
 PYTHON_BIN="${ENV_PREFIX}/bin/python"
 CAMPAIGN_ROOT="${RUN_ROOT}/campaigns/${CAMPAIGN_ID}"
@@ -132,7 +133,7 @@ PY
 # execution before any training starts.
 single_gpu_step() {
   srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
-    --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres=gpu:h200:1 \
+    --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres="${STEP_GRES}" \
     "$@"
 }
 
@@ -173,13 +174,13 @@ CURRENT_PHASE=parallel-paper-coverage
 write_status running 0
 LANE_SCRIPT="${REPO_ROOT}/slurm/paper_coverage_lane.sh"
 srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
-  --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres=gpu:h200:1 \
+  --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres="${STEP_GRES}" \
   "${LANE_SCRIPT}" 0 "${CAMPAIGN_ROOT}/plans/lane-0.tsv" "${REPO_ROOT}" \
   "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
   "${GLUE_EVAL_ROOT}" "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" &
 PID0=$!
 srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
-  --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres=gpu:h200:1 \
+  --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres="${STEP_GRES}" \
   "${LANE_SCRIPT}" 1 "${CAMPAIGN_ROOT}/plans/lane-1.tsv" "${REPO_ROOT}" \
   "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
   "${GLUE_EVAL_ROOT}" "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" &
