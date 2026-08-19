@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-# Submit one two-H200 allocation for all paper-coverage subexperiments.  There
-# are no arrays, dependencies, child sbatch calls, or requeue attempts.
+# Submit one allocation containing one or two GPU lanes for all paper-coverage
+# subexperiments.  There are no arrays, dependencies, child sbatch calls, or
+# requeue attempts.
 set -Eeuo pipefail
 umask 077
 

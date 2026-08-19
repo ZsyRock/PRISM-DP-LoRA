@@ -131,7 +131,7 @@ for index in range(expected):
     if float((x @ x).sum().item()) != 4096.0:
         raise SystemExit(f"CUDA checksum failed on device {index}")
     torch.cuda.synchronize(index)
-print([torch.cuda.get_device_name(i) for i in range(2)])
+print([torch.cuda.get_device_name(i) for i in range(expected)])
 PY
 "${PYTHON_BIN}" -m pip check
 "${PYTHON_BIN}" -m compileall -q train_eval.py src scripts
