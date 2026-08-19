@@ -19,6 +19,9 @@ GLUE_EVAL_ROOT="${11:?missing pinned GLUE evaluation assets}"
 COVERAGE_PROFILE="${12:?missing coverage profile}"
 MODEL_12B_REVISION="${13:?missing Gemma-3-12B revision}"
 STEP_GRES="${14:?missing per-lane GPU GRES}"
+ALLOCATION_LANES="${15:?missing GPU lane count}"
+STEP_MEMORY="${16:?missing per-lane host memory}"
+EXPECTED_CPUS_PER_TASK="${17:?missing CPUs per task}"
 
 PYTHON_BIN="${ENV_PREFIX}/bin/python"
 CAMPAIGN_ROOT="${RUN_ROOT}/campaigns/${CAMPAIGN_ID}"
@@ -64,8 +67,13 @@ if [[ "$(git -C "${REPO_ROOT}" rev-parse HEAD)" != "${EXPECTED_REPO_SHA}" ]] \
   echo "error: immutable repository is dirty or at the wrong SHA" >&2
   exit 2
 fi
-if [[ "${SLURM_NTASKS:-2}" != 2 || "${SLURM_CPUS_PER_TASK:-12}" != 12 ]]; then
-  echo "error: campaign requires two tasks with 12 CPUs per task" >&2
+if [[ "${ALLOCATION_LANES}" != 1 && "${ALLOCATION_LANES}" != 2 ]]; then
+  echo "error: allocation lane count must be 1 or 2" >&2
+  exit 2
+fi
+if [[ "${SLURM_NTASKS:-${ALLOCATION_LANES}}" != "${ALLOCATION_LANES}" \
+    || "${SLURM_CPUS_PER_TASK:-${EXPECTED_CPUS_PER_TASK}}" != "${EXPECTED_CPUS_PER_TASK}" ]]; then
+  echo "error: allocation task/CPU shape differs from the submission lock" >&2
   exit 2
 fi
 for required in \
@@ -110,13 +118,15 @@ CURRENT_PHASE=preflight
 write_status running 0
 echo "job=${JOB_ID} campaign=${CAMPAIGN_ID} host=$(hostname) code=${EXPECTED_REPO_SHA}"
 nvidia-smi
-"${PYTHON_BIN}" - <<'PY'
+"${PYTHON_BIN}" - "${ALLOCATION_LANES}" <<'PY'
+import sys
 import torch
 
 torch.cuda.init()
-if not torch.cuda.is_available() or torch.cuda.device_count() != 2:
-    raise SystemExit(f"expected exactly two visible CUDA GPUs, got {torch.cuda.device_count()}")
-for index in range(2):
+expected = int(sys.argv[1])
+if not torch.cuda.is_available() or torch.cuda.device_count() != expected:
+    raise SystemExit(f"expected exactly {expected} visible CUDA GPU(s), got {torch.cuda.device_count()}")
+for index in range(expected):
     x = torch.ones((16, 16), device=f"cuda:{index}")
     if float((x @ x).sum().item()) != 4096.0:
         raise SystemExit(f"CUDA checksum failed on device {index}")
@@ -133,7 +143,8 @@ PY
 # execution before any training starts.
 single_gpu_step() {
   srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
-    --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres="${STEP_GRES}" \
+    --nodes=1 --ntasks=1 --cpus-per-task="${EXPECTED_CPUS_PER_TASK}" \
+    --mem="${STEP_MEMORY}" --gres="${STEP_GRES}" \
     "$@"
 }
 
@@ -173,24 +184,38 @@ write_status running 0
 CURRENT_PHASE=parallel-paper-coverage
 write_status running 0
 LANE_SCRIPT="${REPO_ROOT}/slurm/paper_coverage_lane.sh"
-srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
-  --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres="${STEP_GRES}" \
-  "${LANE_SCRIPT}" 0 "${CAMPAIGN_ROOT}/plans/lane-0.tsv" "${REPO_ROOT}" \
-  "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
-  "${GLUE_EVAL_ROOT}" "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" &
-PID0=$!
-srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
-  --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres="${STEP_GRES}" \
-  "${LANE_SCRIPT}" 1 "${CAMPAIGN_ROOT}/plans/lane-1.tsv" "${REPO_ROOT}" \
-  "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
-  "${GLUE_EVAL_ROOT}" "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" &
-PID1=$!
-LANE_CODE=0
-wait "${PID0}" || LANE_CODE=$?
-wait "${PID1}" || LANE_CODE=$?
-if [[ "${LANE_CODE}" != 0 ]]; then
-  echo "error: at least one GPU lane failed with exit ${LANE_CODE}" >&2
-  exit "${LANE_CODE}"
+if [[ "${ALLOCATION_LANES}" == 1 ]]; then
+  srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
+    --nodes=1 --ntasks=1 --cpus-per-task="${EXPECTED_CPUS_PER_TASK}" \
+    --mem="${STEP_MEMORY}" --gres="${STEP_GRES}" \
+    "${LANE_SCRIPT}" 0 "${CAMPAIGN_ROOT}/plans/sequential.tsv" "${REPO_ROOT}" \
+    "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
+    "${GLUE_EVAL_ROOT}" "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" \
+    "${EXPECTED_CPUS_PER_TASK}"
+else
+  srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
+    --nodes=1 --ntasks=1 --cpus-per-task="${EXPECTED_CPUS_PER_TASK}" \
+    --mem="${STEP_MEMORY}" --gres="${STEP_GRES}" \
+    "${LANE_SCRIPT}" 0 "${CAMPAIGN_ROOT}/plans/lane-0.tsv" "${REPO_ROOT}" \
+    "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
+    "${GLUE_EVAL_ROOT}" "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" \
+    "${EXPECTED_CPUS_PER_TASK}" &
+  PID0=$!
+  srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
+    --nodes=1 --ntasks=1 --cpus-per-task="${EXPECTED_CPUS_PER_TASK}" \
+    --mem="${STEP_MEMORY}" --gres="${STEP_GRES}" \
+    "${LANE_SCRIPT}" 1 "${CAMPAIGN_ROOT}/plans/lane-1.tsv" "${REPO_ROOT}" \
+    "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
+    "${GLUE_EVAL_ROOT}" "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" \
+    "${EXPECTED_CPUS_PER_TASK}" &
+  PID1=$!
+  LANE_CODE=0
+  wait "${PID0}" || LANE_CODE=$?
+  wait "${PID1}" || LANE_CODE=$?
+  if [[ "${LANE_CODE}" != 0 ]]; then
+    echo "error: at least one GPU lane failed with exit ${LANE_CODE}" >&2
+    exit "${LANE_CODE}"
+  fi
 fi
 
 CURRENT_PHASE=analysis

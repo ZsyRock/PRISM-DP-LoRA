@@ -15,6 +15,7 @@ JOB_TMP_ROOT="${7:?missing job temporary root}"
 GLUE_EVAL_ROOT="${8:?missing pinned GLUE evaluation assets}"
 COVERAGE_PROFILE="${9:?missing coverage profile}"
 MODEL_12B_REVISION="${10:?missing Gemma-3-12B revision}"
+EXPECTED_CPUS_PER_TASK="${11:?missing CPUs per task}"
 
 PYTHON_BIN="${ENV_PREFIX}/bin/python"
 JOB_ID="${SLURM_JOB_ID:-manual}"
@@ -60,8 +61,8 @@ if [[ "$(git -C "${REPO_ROOT}" rev-parse HEAD)" != "${EXPECTED_REPO_SHA}" ]] \
   echo "error: staged source is dirty or at the wrong SHA" >&2
   exit 2
 fi
-if [[ "${SLURM_CPUS_PER_TASK:-12}" != 12 ]]; then
-  echo "error: each lane requires 12 CPUs" >&2
+if [[ "${SLURM_CPUS_PER_TASK:-${EXPECTED_CPUS_PER_TASK}}" != "${EXPECTED_CPUS_PER_TASK}" ]]; then
+  echo "error: lane CPU allocation differs from its submission lock" >&2
   exit 2
 fi
 
@@ -72,8 +73,8 @@ export HF_DATASETS_CACHE="${LANE_TMP}/datasets"
 export TRITON_CACHE_DIR="${LANE_TMP}/triton"
 export TORCH_EXTENSIONS_DIR="${LANE_TMP}/torch-extensions"
 export PYTHONPYCACHEPREFIX="${LANE_TMP}/pycache"
-export OMP_NUM_THREADS=12
-export MKL_NUM_THREADS=12
+export OMP_NUM_THREADS="${EXPECTED_CPUS_PER_TASK}"
+export MKL_NUM_THREADS="${EXPECTED_CPUS_PER_TASK}"
 mkdir -p "${TMPDIR}" "${HF_DATASETS_CACHE}" "${TRITON_CACHE_DIR}" "${TORCH_EXTENSIONS_DIR}"
 
 run_training() {
@@ -239,7 +240,19 @@ run_one_real_smoke() {
 }
 
 run_real_smoke() {
-  if [[ "${LANE}" == 0 ]]; then
+  if [[ "$(basename -- "${PLAN}")" == sequential.tsv ]]; then
+    run_one_real_smoke \
+      glue8 gemma-3-4b-pt google/gemma-3-4b-pt \
+      cc012e0a6d0787b4adcc0fa2c4da74402494554d configs/glue8_paper.json
+    run_one_real_smoke \
+      math10k gemma-2-9b google/gemma-2-9b \
+      33c193028431c2fde6c6e51f29e6f17b60cbfac6 configs/math10k_paper.json
+    if [[ "${COVERAGE_PROFILE}" == baseline-reproduction ]]; then
+      run_one_real_smoke \
+        math10k gemma-3-12b-pt google/gemma-3-12b-pt \
+        "${MODEL_12B_REVISION}" configs/math10k_paper.json
+    fi
+  elif [[ "${LANE}" == 0 ]]; then
     run_one_real_smoke \
       math10k gemma-2-9b google/gemma-2-9b \
       33c193028431c2fde6c6e51f29e6f17b60cbfac6 configs/math10k_paper.json

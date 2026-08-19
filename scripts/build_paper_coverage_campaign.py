@@ -393,14 +393,34 @@ PLAN_FIELDS = (
     "seed", "eval_limit", "relative_root",
 )
 
+SEQUENTIAL_SETTING_ORDER = (
+    "glue8-4b-eps6-r16",
+    "math10k-4b-eps6-r16",
+    "math10k-9b-eps6-r16",
+    "math10k-12b-eps6-r16",
+    "glue8-4b-eps3-r16",
+    "math10k-4b-eps3-r16",
+    "glue8-4b-eps6-r8",
+    "math10k-4b-eps6-r8",
+    "glue8-4b-eps6-r32",
+    "math10k-4b-eps6-r32",
+)
 
-def _plan_bytes(manifest: dict[str, Any], lane: int) -> bytes:
+
+def _plan_bytes(manifest: dict[str, Any], lane: int, include_all: bool = False) -> bytes:
     rows = []
-    for arm in manifest["arms"]:
-        if arm["lane"] != lane:
+    arms = manifest["arms"]
+    if include_all:
+        priority = {setting: index for index, setting in enumerate(SEQUENTIAL_SETTING_ORDER)}
+        arms = sorted(
+            arms,
+            key=lambda arm: (priority.get(arm["setting_id"], len(priority)), arm["arm_id"]),
+        )
+    for arm in arms:
+        if not include_all and arm["lane"] != lane:
             continue
         values = {
-            "lane": lane,
+            "lane": 0 if include_all else lane,
             "arm_id": arm["arm_id"],
             "setting_id": arm["setting_id"],
             "dataset": arm["dataset"],
@@ -436,6 +456,7 @@ def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision
     _with_sha(root / "plans" / "manifest.json", _json_bytes(manifest))
     _with_sha(root / "plans" / "lane-0.tsv", _plan_bytes(manifest, 0))
     _with_sha(root / "plans" / "lane-1.tsv", _plan_bytes(manifest, 1))
+    _with_sha(root / "plans" / "sequential.tsv", _plan_bytes(manifest, 0, include_all=True))
     lane0 = sum(arm['lane'] == 0 for arm in manifest['arms'])
     lane1 = sum(arm['lane'] == 1 for arm in manifest['arms'])
     print(f"prepared_arms={len(manifest['arms'])} lane0={lane0} lane1={lane1} profile={profile}")

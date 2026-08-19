@@ -49,9 +49,13 @@ ACCOUNT="${PRISM_SLURM_ACCOUNT:-normal}"
 QOS="${PRISM_SLURM_QOS:-normal}"
 PARTITION="${PRISM_SLURM_PARTITION:-quad_h200}"
 EXCLUDE_NODES="${PRISM_SLURM_EXCLUDE:-}"
-WALLTIME="2-12:00:00"
+WALLTIME="${PRISM_SLURM_WALLTIME:-2-12:00:00}"
 GPU_TYPE="${PRISM_GPU_TYPE:-h200}"
-GPU_GRES="${PRISM_SLURM_GRES:-gpu:${GPU_TYPE}:2}"
+GPU_LANES="${PRISM_GPU_LANES:-2}"
+CPUS_PER_TASK="${PRISM_CPUS_PER_TASK:-12}"
+HOST_MEMORY="${PRISM_SLURM_MEMORY:-320G}"
+STEP_MEMORY="${PRISM_STEP_MEMORY:-150G}"
+GPU_GRES="${PRISM_SLURM_GRES:-gpu:${GPU_TYPE}:${GPU_LANES}}"
 STEP_GRES="${PRISM_SLURM_STEP_GRES:-gpu:${GPU_TYPE}:1}"
 
 if [[ "${COVERAGE_PROFILE}" != paper-breadth \
@@ -61,6 +65,13 @@ if [[ "${COVERAGE_PROFILE}" != paper-breadth \
   echo "error: unsupported PRISM_COVERAGE_PROFILE" >&2
   exit 2
 fi
+if [[ "${GPU_LANES}" != 1 && "${GPU_LANES}" != 2 ]]; then
+  echo "error: PRISM_GPU_LANES must be 1 or 2" >&2
+  exit 2
+fi
+for numeric in "${CPUS_PER_TASK}"; do
+  [[ "${numeric}" =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid CPU count" >&2; exit 2; }
+done
 if [[ ! "${CAMPAIGN_ID}" =~ ^paper-coverage-${SHORT_SHA}-[A-Za-z0-9._-]+$ ]]; then
   echo "error: campaign ID must include locked SHA ${SHORT_SHA}" >&2
   exit 2
@@ -143,9 +154,9 @@ SBATCH_ARGS=(
   --qos="${QOS}"
   --partition="${PARTITION}"
   --nodes=1
-  --ntasks=2
-  --cpus-per-task=12
-  --mem=320G
+  --ntasks="${GPU_LANES}"
+  --cpus-per-task="${CPUS_PER_TASK}"
+  --mem="${HOST_MEMORY}"
   --time="${WALLTIME}"
   --gres="${GPU_GRES}"
   --job-name=prism-paper-cover
@@ -164,11 +175,14 @@ WORKER_ARGS=(
   "${COVERAGE_PROFILE}"
   "${MODEL_12B_REVISION}"
   "${STEP_GRES}"
+  "${GPU_LANES}"
+  "${STEP_MEMORY}"
+  "${CPUS_PER_TASK}"
 )
 
 if [[ "${MODE}" == --test-only ]]; then
   sbatch --test-only "${SBATCH_ARGS[@]}" "${WORKER}" "${WORKER_ARGS[@]}"
-  echo "scheduler_test=accepted resources=${GPU_GRES},24cpu,320G,60h campaign=${CAMPAIGN_ID}"
+  echo "scheduler_test=accepted resources=${GPU_GRES},tasks=${GPU_LANES},cpus_per_task=${CPUS_PER_TASK},mem=${HOST_MEMORY},time=${WALLTIME} campaign=${CAMPAIGN_ID}"
   exit 0
 fi
 
@@ -206,14 +220,15 @@ job_id="${submitted%%;*}"
 "${ENV_PREFIX}/bin/python" - "${RECEIPT}" "${job_id}" "${old_job}" "${old_state}" \
   "${CAMPAIGN_ID}" "${CAMPAIGN_ROOT}" "${LOCKED_REPO_SHA}" "${STAGED_REPO_ROOT}" \
   "${ENV_PREFIX}" "${ACCOUNT}" "${QOS}" "${PARTITION}" "${GLUE_EVAL_ROOT}" \
-  "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" "${GPU_GRES}" <<'PY'
+  "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" "${GPU_GRES}" \
+  "${GPU_LANES}" "${CPUS_PER_TASK}" "${HOST_MEMORY}" "${WALLTIME}" <<'PY'
 import json, os, sys, tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 (target, job, previous, previous_state, campaign, root, sha, source, env,
  account, qos, partition, glue_eval_root, coverage_profile, model_12b_revision,
- gpu_gres) = sys.argv[1:]
+ gpu_gres, gpu_lanes, cpus_per_task, host_memory, walltime) = sys.argv[1:]
 payload = {
     "schema_version": 1,
     "campaign_id": campaign,
@@ -234,8 +249,9 @@ payload = {
     "coverage_profile": coverage_profile,
     "resources": {
         "account": account, "qos": qos, "partition": partition,
-        "nodes": 1, "tasks": 2, "cpus_per_task": 12, "memory": "320G",
-        "gpus": gpu_gres, "walltime": "2-12:00:00",
+        "nodes": 1, "tasks": int(gpu_lanes),
+        "cpus_per_task": int(cpus_per_task), "memory": host_memory,
+        "gpus": gpu_gres, "walltime": walltime,
         "single_allocation": True, "array": False, "requeue": False,
     },
 }
@@ -254,4 +270,4 @@ echo "submitted_job_id=${job_id}"
 echo "campaign_root=${CAMPAIGN_ROOT}"
 echo "slurm_stdout=${LOG_ROOT}/prism-paper-cover-${job_id}.out"
 echo "slurm_stderr=${LOG_ROOT}/prism-paper-cover-${job_id}.err"
-echo "resources=${GPU_GRES},24cpu,320G,60h one_allocation two_parallel_lanes"
+echo "resources=${GPU_GRES},tasks=${GPU_LANES},cpus_per_task=${CPUS_PER_TASK},mem=${HOST_MEMORY},time=${WALLTIME},one_allocation"

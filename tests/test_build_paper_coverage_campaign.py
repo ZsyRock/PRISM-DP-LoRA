@@ -55,6 +55,11 @@ def test_prepare_is_immutable_and_writes_exact_lane_counts(tmp_path: Path) -> No
     campaign.prepare(tmp_path, CODE_SHA, REV_4B, REV_9B, "paper-breadth")
     assert len((tmp_path / "plans" / "lane-0.tsv").read_text().splitlines()) == 6
     assert len((tmp_path / "plans" / "lane-1.tsv").read_text().splitlines()) == 9
+    assert len((tmp_path / "plans" / "sequential.tsv").read_text().splitlines()) == 15
+    assert all(
+        line.startswith("0|")
+        for line in (tmp_path / "plans" / "sequential.tsv").read_text().splitlines()
+    )
     assert (tmp_path / "plans" / "manifest.json.sha256").is_file()
     with pytest.raises(campaign.CampaignError, match="refusing to overwrite"):
         campaign.prepare(tmp_path, "4" * 40, REV_4B, REV_9B, "paper-breadth")
@@ -140,6 +145,14 @@ def test_cached_baseline_profile_is_explicitly_incomplete() -> None:
     assert manifest["baseline_reproduction"]["covered_settings"] == 9
     assert "12B" in manifest["baseline_reproduction"]["excluded_setting"]
     assert campaign.MODEL_12B not in {arm["model_id"] for arm in manifest["arms"]}
+    sequential = campaign._plan_bytes(manifest, 0, include_all=True).decode().splitlines()
+    settings = [line.split("|")[2] for line in sequential]
+    assert settings[:3] == [
+        "glue8-4b-eps6-r16",
+        "math10k-4b-eps6-r16",
+        "math10k-9b-eps6-r16",
+    ]
+    assert all(line.startswith("0|") for line in sequential)
 
 
 def test_full_baseline_profile_requires_pinned_12b_revision() -> None:
