@@ -17,6 +17,7 @@ MODEL_4B_REVISION="${9:?missing Gemma-3-4B revision}"
 MODEL_9B_REVISION="${10:?missing Gemma-2-9B revision}"
 GLUE_EVAL_ROOT="${11:?missing pinned GLUE evaluation assets}"
 COVERAGE_PROFILE="${12:?missing coverage profile}"
+MODEL_12B_REVISION="${13:?missing Gemma-3-12B revision}"
 
 PYTHON_BIN="${ENV_PREFIX}/bin/python"
 CAMPAIGN_ROOT="${RUN_ROOT}/campaigns/${CAMPAIGN_ID}"
@@ -163,6 +164,7 @@ write_status running 0
   --code-sha "${EXPECTED_REPO_SHA}" \
   --model-4b-revision "${MODEL_4B_REVISION}" \
   --model-9b-revision "${MODEL_9B_REVISION}" \
+  --model-12b-revision "${MODEL_12B_REVISION}" \
   --profile "${COVERAGE_PROFILE}" \
   >"${CAMPAIGN_ROOT}/plans/prepare-${JOB_ID}.out" \
   2>"${CAMPAIGN_ROOT}/plans/prepare-${JOB_ID}.err"
@@ -174,13 +176,13 @@ srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
   --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres=gpu:h200:1 \
   "${LANE_SCRIPT}" 0 "${CAMPAIGN_ROOT}/plans/lane-0.tsv" "${REPO_ROOT}" \
   "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
-  "${GLUE_EVAL_ROOT}" &
+  "${GLUE_EVAL_ROOT}" "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" &
 PID0=$!
 srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
   --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres=gpu:h200:1 \
   "${LANE_SCRIPT}" 1 "${CAMPAIGN_ROOT}/plans/lane-1.tsv" "${REPO_ROOT}" \
   "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
-  "${GLUE_EVAL_ROOT}" &
+  "${GLUE_EVAL_ROOT}" "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" &
 PID1=$!
 LANE_CODE=0
 wait "${PID0}" || LANE_CODE=$?

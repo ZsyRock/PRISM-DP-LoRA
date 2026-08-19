@@ -212,6 +212,34 @@ bash scripts/submit_paper_coverage_campaign.sh --submit
 Set `PRISM_COVERAGE_PROFILE=paper-breadth` only to reproduce the smaller
 historical plan.
 
+For fixed-C baseline reproduction and target-rate calibration, use
+`baseline-reproduction`. It runs the ten distinct DP-PRISM settings obtained
+by deduplicating Tables 2--4: four GLUE8 settings and six Math-10K settings,
+covering Gemma-3-4B-pt, Gemma-2-9B, Gemma-3-12B-pt, `epsilon in {3,6}`, and
+`rank in {8,16,32}` where the paper reports them. Every arm uses the paper
+default fixed `C=1`, seed 42, full update count, full official evaluation, and
+otherwise the exact task defaults in Table 7. No SlaClip controller or slack
+coordinate is added to the DP query. The access-controlled research log does
+compute an exact telemetry-only `K=15` reference CDF from already available
+per-record norms; it cannot alter clipping, noise, or optimization.
+
+```bash
+PRISM_COVERAGE_PROFILE=baseline-reproduction \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=baseline-reproduction \
+  bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+The full profile fails closed unless the pinned manual-gated 12B checkpoint is
+already staged. `baseline-reproduction-cached` is an explicitly incomplete
+nine-setting profile for accounts that currently have only the pinned 4B and
+9B checkpoints; its manifest records the missing 12B row and must not be
+reported as complete paper model coverage. The analyzer writes a combined
+`baseline_telemetry_steps.csv` containing loss, `C_t`, next `C`, clipping rate
+and coefficients, norm summaries, clipped/unclipped signal, clipping bias,
+realized noise, SNR, bias/noise diagnostics, reference small-gradient mass,
+and privacy accounting for plotting and later target-rate preregistration.
+
 The wrapper resolves the account-specific home/scratch paths, pins both model
 revisions and the Git SHA, materializes a content-hashed official GLUE
 validation snapshot before submission, stages immutable source, and runs the

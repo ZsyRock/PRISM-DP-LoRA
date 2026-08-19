@@ -94,6 +94,61 @@ def test_regime_map_crosses_paper_axes_and_clipping_grids() -> None:
     assert sum(arm["lane"] == 1 for arm in arms) == 55
 
 
+def test_baseline_reproduction_covers_all_paper_dataset_model_settings() -> None:
+    manifest = campaign.build_manifest(
+        CODE_SHA,
+        REV_4B,
+        REV_9B,
+        profile="baseline-reproduction",
+        model_12b_revision="4" * 40,
+    )
+    arms = manifest["arms"]
+    assert len(arms) == 10
+    assert manifest["baseline_reproduction"]["covered_settings"] == 10
+    assert manifest["baseline_reproduction"]["excluded_setting"] is None
+    assert {arm["model_id"] for arm in arms} == {
+        campaign.MODEL_4B,
+        campaign.MODEL_9B,
+        campaign.MODEL_12B,
+    }
+    assert sum(arm["dataset"] == "glue8" for arm in arms) == 4
+    assert sum(arm["dataset"] == "math10k" for arm in arms) == 6
+    assert {arm["epsilon"] for arm in arms} == {3.0, 6.0}
+    assert {arm["lora_r"] for arm in arms} == {8, 16, 32}
+    for arm in arms:
+        assert arm["method"] == "baseline"
+        assert arm["initial_c"] == 1.0
+        assert arm["rho"] is None and arm["eta"] is None
+        assert arm["eval_limit"] == 0
+        if arm["dataset"] == "glue8":
+            assert arm["steps"] == 500
+            assert arm["learning_rate"] == 0.0002
+            assert arm["cutoff_len"] == 384
+            assert arm["train_on_inputs"] is False
+        else:
+            assert arm["steps"] == 300
+            assert arm["learning_rate"] == 0.0003
+            assert arm["cutoff_len"] == 256
+            assert arm["train_on_inputs"] is True
+
+
+def test_cached_baseline_profile_is_explicitly_incomplete() -> None:
+    manifest = campaign.build_manifest(
+        CODE_SHA, REV_4B, REV_9B, profile="baseline-reproduction-cached"
+    )
+    assert len(manifest["arms"]) == 9
+    assert manifest["baseline_reproduction"]["covered_settings"] == 9
+    assert "12B" in manifest["baseline_reproduction"]["excluded_setting"]
+    assert campaign.MODEL_12B not in {arm["model_id"] for arm in manifest["arms"]}
+
+
+def test_full_baseline_profile_requires_pinned_12b_revision() -> None:
+    with pytest.raises(campaign.CampaignError, match="requires a pinned 12B"):
+        campaign.build_manifest(
+            CODE_SHA, REV_4B, REV_9B, profile="baseline-reproduction"
+        )
+
+
 def test_task_average_supports_glue_and_math_headers(tmp_path: Path) -> None:
     glue = tmp_path / "glue.csv"
     glue.write_text("method,GLUE8_Avg\nslaclip,0.75\n", encoding="utf-8")

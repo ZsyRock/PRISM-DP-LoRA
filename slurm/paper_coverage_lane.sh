@@ -13,6 +13,8 @@ CAMPAIGN_ROOT="${5:?missing campaign root}"
 EXPECTED_REPO_SHA="${6:?missing repository SHA}"
 JOB_TMP_ROOT="${7:?missing job temporary root}"
 GLUE_EVAL_ROOT="${8:?missing pinned GLUE evaluation assets}"
+COVERAGE_PROFILE="${9:?missing coverage profile}"
+MODEL_12B_REVISION="${10:?missing Gemma-3-12B revision}"
 
 PYTHON_BIN="${ENV_PREFIX}/bin/python"
 JOB_ID="${SLURM_JOB_ID:-manual}"
@@ -200,22 +202,15 @@ run_training() {
   echo "state=completed" >"${status_file}"
 }
 
-run_real_smoke() {
-  local dataset model_id model_revision config
-  if [[ "${LANE}" == 0 ]]; then
-    dataset=math10k
-    model_id=google/gemma-2-9b
-    model_revision=33c193028431c2fde6c6e51f29e6f17b60cbfac6
-    config=configs/math10k_paper.json
-  else
-    dataset=glue8
-    model_id=google/gemma-3-4b-pt
-    model_revision=cc012e0a6d0787b4adcc0fa2c4da74402494554d
-    config=configs/glue8_paper.json
+run_one_real_smoke() {
+  local dataset="$1" model_slug="$2" model_id="$3" model_revision="$4" config="$5"
+  local -a methods=(baseline slaclip)
+  if [[ "${COVERAGE_PROFILE}" == baseline-reproduction* ]]; then
+    methods=(baseline)
   fi
   local method
-  for method in baseline slaclip; do
-    local root="${CAMPAIGN_ROOT}/smoke/lane-${LANE}/${dataset}-${method}"
+  for method in "${methods[@]}"; do
+    local root="${CAMPAIGN_ROOT}/smoke/lane-${LANE}/${dataset}-${model_slug}-${method}"
     mkdir -p "${root}/adapter" "${root}/results"
     local -a args=(
       "${PYTHON_BIN}" -u train_eval.py --config "${config}"
@@ -241,6 +236,23 @@ run_real_smoke() {
     "${args[@]}" >"${root}/train-${JOB_ID}.out" 2>"${root}/train-${JOB_ID}.err"
     [[ -s "${root}/adapter/adapter_model.safetensors" ]] || return 3
   done
+}
+
+run_real_smoke() {
+  if [[ "${LANE}" == 0 ]]; then
+    run_one_real_smoke \
+      math10k gemma-2-9b google/gemma-2-9b \
+      33c193028431c2fde6c6e51f29e6f17b60cbfac6 configs/math10k_paper.json
+  else
+    run_one_real_smoke \
+      glue8 gemma-3-4b-pt google/gemma-3-4b-pt \
+      cc012e0a6d0787b4adcc0fa2c4da74402494554d configs/glue8_paper.json
+    if [[ "${COVERAGE_PROFILE}" == baseline-reproduction ]]; then
+      run_one_real_smoke \
+        math10k gemma-3-12b-pt google/gemma-3-12b-pt \
+        "${MODEL_12B_REVISION}" configs/math10k_paper.json
+    fi
+  fi
 }
 
 CURRENT_ARM="real-model-smoke"

@@ -26,6 +26,7 @@ SCHEMA_VERSION = 2
 SEED = 42
 MODEL_4B = "google/gemma-3-4b-pt"
 MODEL_9B = "google/gemma-2-9b"
+MODEL_12B = "google/gemma-3-12b-pt"
 FULL_SHA_LENGTH = 40
 
 BREADTH_SETTINGS = (
@@ -188,6 +189,21 @@ REGIME_SETTINGS = (
     },
 )
 
+BASELINE_12B_SETTING = {
+    "id": "math10k-12b-eps6-r16",
+    "lane": 1,
+    "paper_reference": "Table 3",
+    "dataset": "math10k",
+    "model_slug": "gemma-3-12b-pt",
+    "model_id": MODEL_12B,
+    "epsilon": 6.0,
+    "lora_r": 16,
+    "steps": 300,
+    "learning_rate": 0.0003,
+    "cutoff_len": 256,
+    "train_on_inputs": True,
+}
+
 REGIME_CANDIDATES = tuple(
     {
         "id": f"fixed-c{str(value).replace('.', 'p')}",
@@ -213,6 +229,16 @@ REGIME_CANDIDATES = tuple(
         "initial_c": 2.0,
         "rho": 0.90,
         "eta": 0.05,
+    },
+)
+
+BASELINE_CANDIDATES = (
+    {
+        "id": "fixed-c1-paper-default",
+        "method": "baseline",
+        "initial_c": 1.0,
+        "rho": None,
+        "eta": None,
     },
 )
 
@@ -253,7 +279,13 @@ def _with_sha(path: Path, data: bytes) -> None:
     _write_immutable(path.with_name(path.name + ".sha256"), f"{digest}  {path.name}\n".encode())
 
 
-def build_manifest(code_sha: str, model_4b_revision: str, model_9b_revision: str, profile: str = "paper-breadth") -> dict[str, Any]:
+def build_manifest(
+    code_sha: str,
+    model_4b_revision: str,
+    model_9b_revision: str,
+    profile: str = "paper-breadth",
+    model_12b_revision: str | None = None,
+) -> dict[str, Any]:
     for label, value in (
         ("code_sha", code_sha),
         ("model_4b_revision", model_4b_revision),
@@ -272,6 +304,20 @@ def build_manifest(code_sha: str, model_4b_revision: str, model_9b_revision: str
         candidates = REGIME_CANDIDATES
         screen_steps = 150
         eval_limit = 512
+    elif profile in {"baseline-reproduction", "baseline-reproduction-cached"}:
+        settings = REGIME_SETTINGS
+        if profile == "baseline-reproduction":
+            if model_12b_revision is None:
+                raise CampaignError("baseline-reproduction requires a pinned 12B revision")
+            if len(model_12b_revision) != FULL_SHA_LENGTH or any(
+                ch not in "0123456789abcdef" for ch in model_12b_revision
+            ):
+                raise CampaignError("model_12b_revision must be a full lowercase commit SHA")
+            revisions[MODEL_12B] = model_12b_revision
+            settings = (*settings, BASELINE_12B_SETTING)
+        candidates = BASELINE_CANDIDATES
+        screen_steps = None
+        eval_limit = 0
     else:
         raise CampaignError(f"unknown campaign profile: {profile}")
     arms = []
@@ -310,6 +356,17 @@ def build_manifest(code_sha: str, model_4b_revision: str, model_9b_revision: str
             "Task-test metrics are descriptive only. Any promising setting must be "
             "repeated on fresh seeds with a locked tuned-fixed comparator."
         ),
+        "baseline_reproduction": {
+            "paper_default_fixed_C": 1.0,
+            "full_length": profile.startswith("baseline-reproduction"),
+            "covered_settings": len(settings),
+            "paper_total_settings": 10,
+            "excluded_setting": (
+                "Math-10K/Gemma-3-12B-pt/epsilon=6/rank=16: gated checkpoint not staged"
+                if profile == "baseline-reproduction-cached" else None
+            ),
+            "purpose": "estimate clipping trajectories and predeclare later SlaClip target grids",
+        },
         "regime_map": {
             "exploratory": profile == "regime-map",
             "screen_steps": screen_steps,
@@ -368,8 +425,14 @@ def _plan_bytes(manifest: dict[str, Any], lane: int) -> bytes:
     return ("\n".join(rows) + "\n").encode()
 
 
-def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision: str, profile: str) -> None:
-    manifest = build_manifest(code_sha, model_4b_revision, model_9b_revision, profile=profile)
+def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision: str, profile: str, model_12b_revision: str | None = None) -> None:
+    manifest = build_manifest(
+        code_sha,
+        model_4b_revision,
+        model_9b_revision,
+        profile=profile,
+        model_12b_revision=model_12b_revision,
+    )
     _with_sha(root / "plans" / "manifest.json", _json_bytes(manifest))
     _with_sha(root / "plans" / "lane-0.tsv", _plan_bytes(manifest, 0))
     _with_sha(root / "plans" / "lane-1.tsv", _plan_bytes(manifest, 1))
@@ -442,6 +505,7 @@ def analyze(root: Path) -> None:
     manifest_path = root / "plans" / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     results = []
+    trajectory_rows = []
     for arm in manifest.get("arms", []):
         arm_root = root / arm["relative_root"]
         status_path = arm_root / "adapter" / "run_status.json"
@@ -460,6 +524,35 @@ def analyze(root: Path) -> None:
         clip_values = _raw_series(raw_path, "raw_clip_fraction")
         small_proxy_values = _raw_series(raw_path, "raw_reference_small_gradient_proxy")
         clip_median = _quantile(clip_values, 0.5)
+        scalar_fields = (
+            "step", "loss_mean", "eps_spent", "dp_clip_threshold",
+            "dp_next_clip_threshold", "dp_noise_multiplier",
+            "raw_realized_batch_size", "raw_clip_fraction",
+            "raw_clip_coefficient_mean", "raw_clip_coefficient_min",
+            "raw_global_norm_mean", "raw_global_norm_std",
+            "raw_global_norm_min", "raw_global_norm_max",
+            "raw_clipped_signal_norm", "raw_unclipped_signal_norm",
+            "raw_clipping_bias_norm", "raw_realized_noise_norm",
+            "raw_signal_to_noise_ratio", "raw_clipping_bias_to_noise_ratio",
+            "raw_bias_noise_squared_error_proxy",
+            "raw_unclipped_clipped_cosine", "raw_clipped_noisy_cosine",
+            "raw_reference_small_gradient_proxy",
+            "raw_reference_remaining_mass_proxy",
+            "raw_reference_conditional_clip_fraction",
+        )
+        with raw_path.open(encoding="utf-8") as raw_handle:
+            for raw_line in raw_handle:
+                raw_record = json.loads(raw_line)
+                trajectory_rows.append({
+                    "setting_id": arm["setting_id"],
+                    "dataset": arm["dataset"],
+                    "model": arm["model_id"],
+                    "epsilon": arm["epsilon"],
+                    "lora_r": arm["lora_r"],
+                    "fixed_C": arm["initial_c"],
+                    "seed": arm["seed"],
+                    **{field: raw_record.get(field) for field in scalar_fields},
+                })
         results.append(
             {
                 "setting_id": arm["setting_id"],
@@ -495,6 +588,18 @@ def analyze(root: Path) -> None:
     for row in results:
         buffer.append(",".join("" if row[k] is None else str(row[k]) for k in fields))
     _with_sha(out / "paper_coverage_summary.csv", ("\n".join(buffer) + "\n").encode())
+    if trajectory_rows:
+        trajectory_fields = list(trajectory_rows[0])
+        trajectory_buffer = [",".join(trajectory_fields)]
+        for row in trajectory_rows:
+            trajectory_buffer.append(",".join(
+                "" if row[field] is None else str(row[field])
+                for field in trajectory_fields
+            ))
+        _with_sha(
+            out / "baseline_telemetry_steps.csv",
+            ("\n".join(trajectory_buffer) + "\n").encode(),
+        )
     best_fixed = {}
     for row in results:
         if row["method"] == "baseline":
@@ -543,7 +648,15 @@ def parser() -> argparse.ArgumentParser:
     prep.add_argument("--code-sha", required=True)
     prep.add_argument("--model-4b-revision", required=True)
     prep.add_argument("--model-9b-revision", required=True)
-    prep.add_argument("--profile", choices=("paper-breadth", "regime-map"), default="paper-breadth")
+    prep.add_argument(
+        "--profile",
+        choices=(
+            "paper-breadth", "regime-map", "baseline-reproduction",
+            "baseline-reproduction-cached",
+        ),
+        default="paper-breadth",
+    )
+    prep.add_argument("--model-12b-revision")
     report = sub.add_parser("analyze")
     report.add_argument("--campaign-root", required=True, type=Path)
     return value
@@ -552,7 +665,14 @@ def parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = parser().parse_args()
     if args.command == "prepare":
-        prepare(args.campaign_root, args.code_sha, args.model_4b_revision, args.model_9b_revision, args.profile)
+        prepare(
+            args.campaign_root,
+            args.code_sha,
+            args.model_4b_revision,
+            args.model_9b_revision,
+            args.profile,
+            args.model_12b_revision,
+        )
     else:
         analyze(args.campaign_root)
 

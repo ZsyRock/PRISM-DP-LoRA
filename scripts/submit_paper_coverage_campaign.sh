@@ -43,6 +43,7 @@ CAMPAIGN_ID="${PRISM_CAMPAIGN_ID:-paper-coverage-${SHORT_SHA}-${COVERAGE_PROFILE
 STAGED_REPO_ROOT="${PRISM_STAGED_REPO_ROOT:-${RUN_ROOT}/sources/PRISM-DP-LoRA-${LOCKED_REPO_SHA}}"
 MODEL_4B_REVISION="cc012e0a6d0787b4adcc0fa2c4da74402494554d"
 MODEL_9B_REVISION="33c193028431c2fde6c6e51f29e6f17b60cbfac6"
+MODEL_12B_REVISION="295efb63d01a7017928f273a94ebb86105c9526f"
 
 ACCOUNT="${PRISM_SLURM_ACCOUNT:-normal}"
 QOS="${PRISM_SLURM_QOS:-normal}"
@@ -50,8 +51,11 @@ PARTITION="${PRISM_SLURM_PARTITION:-quad_h200}"
 EXCLUDE_NODES="${PRISM_SLURM_EXCLUDE:-}"
 WALLTIME="2-12:00:00"
 
-if [[ "${COVERAGE_PROFILE}" != paper-breadth && "${COVERAGE_PROFILE}" != regime-map ]]; then
-  echo "error: PRISM_COVERAGE_PROFILE must be paper-breadth or regime-map" >&2
+if [[ "${COVERAGE_PROFILE}" != paper-breadth \
+    && "${COVERAGE_PROFILE}" != regime-map \
+    && "${COVERAGE_PROFILE}" != baseline-reproduction \
+    && "${COVERAGE_PROFILE}" != baseline-reproduction-cached ]]; then
+  echo "error: unsupported PRISM_COVERAGE_PROFILE" >&2
   exit 2
 fi
 if [[ ! "${CAMPAIGN_ID}" =~ ^paper-coverage-${SHORT_SHA}-[A-Za-z0-9._-]+$ ]]; then
@@ -90,6 +94,16 @@ check_model() {
 }
 check_model google/gemma-3-4b-pt "${MODEL_4B_REVISION}"
 check_model google/gemma-2-9b "${MODEL_9B_REVISION}"
+if [[ "${COVERAGE_PROFILE}" == baseline-reproduction ]]; then
+  if ! check_model google/gemma-3-12b-pt "${MODEL_12B_REVISION}"; then
+    if [[ "${MODE}" == --test-only ]]; then
+      echo "warning: scheduler test continues without the gated 12B snapshot" >&2
+    else
+      echo "error: full baseline reproduction requires the pinned 12B snapshot" >&2
+      exit 2
+    fi
+  fi
+fi
 
 mkdir -p "$(dirname -- "${STAGED_REPO_ROOT}")"
 command -v flock >/dev/null || { echo "error: flock is required" >&2; exit 2; }
@@ -145,6 +159,7 @@ WORKER_ARGS=(
   "${MODEL_4B_REVISION}" "${MODEL_9B_REVISION}"
   "${GLUE_EVAL_ROOT}"
   "${COVERAGE_PROFILE}"
+  "${MODEL_12B_REVISION}"
 )
 
 if [[ "${MODE}" == --test-only ]]; then
@@ -187,13 +202,13 @@ job_id="${submitted%%;*}"
 "${ENV_PREFIX}/bin/python" - "${RECEIPT}" "${job_id}" "${old_job}" "${old_state}" \
   "${CAMPAIGN_ID}" "${CAMPAIGN_ROOT}" "${LOCKED_REPO_SHA}" "${STAGED_REPO_ROOT}" \
   "${ENV_PREFIX}" "${ACCOUNT}" "${QOS}" "${PARTITION}" "${GLUE_EVAL_ROOT}" \
-  "${COVERAGE_PROFILE}" <<'PY'
+  "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" <<'PY'
 import json, os, sys, tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 (target, job, previous, previous_state, campaign, root, sha, source, env,
- account, qos, partition, glue_eval_root, coverage_profile) = sys.argv[1:]
+ account, qos, partition, glue_eval_root, coverage_profile, model_12b_revision) = sys.argv[1:]
 payload = {
     "schema_version": 1,
     "campaign_id": campaign,
@@ -208,6 +223,7 @@ payload = {
     "models": {
         "google/gemma-3-4b-pt": "cc012e0a6d0787b4adcc0fa2c4da74402494554d",
         "google/gemma-2-9b": "33c193028431c2fde6c6e51f29e6f17b60cbfac6",
+        "google/gemma-3-12b-pt": model_12b_revision if coverage_profile == "baseline-reproduction" else None,
     },
     "glue_eval_assets": glue_eval_root,
     "coverage_profile": coverage_profile,
