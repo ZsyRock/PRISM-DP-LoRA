@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Build and summarize the preregistered PRISM paper-coverage screen.
+"""Build and summarize PRISM paper-coverage and clipping-regime screens.
 
-This is a breadth screen, not a multi-seed confirmatory experiment.  It covers
-the highest-value settings from the PRISM paper that were not already tested
-systematically with Full SlaClip: GLUE8 at both paper privacy budgets,
-Math-10K on Gemma-2-9B, and the rank-8/rank-32 Math-10K ablations.  Every
-setting compares the paper fixed C=1 control with two conservative Full
-SlaClip targets in one immutable, two-lane Slurm allocation.
+Both profiles are one-seed exploratory screens rather than confirmatory
+experiments.  ``paper-breadth`` preserves the historical 15-arm plan;
+``regime-map`` crosses the paper's available dataset, privacy, rank, and 4B/9B
+axes with fixed-C and conditional-rho grids.  All arms run inside one immutable
+two-lane Slurm allocation, and measured clipping strata are reported without
+pretending they are pre-established SlaClip failure thresholds.
 """
 
 from __future__ import annotations
@@ -22,13 +22,13 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SEED = 42
 MODEL_4B = "google/gemma-3-4b-pt"
 MODEL_9B = "google/gemma-2-9b"
 FULL_SHA_LENGTH = 40
 
-SETTINGS = (
+BREADTH_SETTINGS = (
     {
         "id": "glue8-4b-eps6-r16",
         "lane": 0,
@@ -101,7 +101,7 @@ SETTINGS = (
     },
 )
 
-CANDIDATES = (
+BREADTH_CANDIDATES = (
     {
         "id": "fixed-c1",
         "method": "baseline",
@@ -121,6 +121,97 @@ CANDIDATES = (
         "method": "slaclip",
         "initial_c": 1.0,
         "rho": 0.98,
+        "eta": 0.05,
+    },
+)
+
+# This crosses every 4B dataset/privacy/rank axis reported by the paper plus
+# the paper's 9B Math setting.  The 12B row remains optional because it needs a
+# separately staged gated checkpoint; it must not silently fall back to 4B.
+REGIME_SETTINGS = (
+    *BREADTH_SETTINGS,
+    {
+        "id": "math10k-4b-eps6-r16",
+        "lane": 0,
+        "paper_reference": "Table 2 / Table 3 / Table 4",
+        "dataset": "math10k",
+        "model_slug": "gemma-3-4b-pt",
+        "model_id": MODEL_4B,
+        "epsilon": 6.0,
+        "lora_r": 16,
+        "steps": 300,
+        "learning_rate": 0.0003,
+        "cutoff_len": 256,
+        "train_on_inputs": True,
+    },
+    {
+        "id": "math10k-4b-eps3-r16",
+        "lane": 1,
+        "paper_reference": "Table 2 epsilon axis",
+        "dataset": "math10k",
+        "model_slug": "gemma-3-4b-pt",
+        "model_id": MODEL_4B,
+        "epsilon": 3.0,
+        "lora_r": 16,
+        "steps": 300,
+        "learning_rate": 0.0003,
+        "cutoff_len": 256,
+        "train_on_inputs": True,
+    },
+    {
+        "id": "glue8-4b-eps6-r8",
+        "lane": 0,
+        "paper_reference": "Table 4",
+        "dataset": "glue8",
+        "model_slug": "gemma-3-4b-pt",
+        "model_id": MODEL_4B,
+        "epsilon": 6.0,
+        "lora_r": 8,
+        "steps": 500,
+        "learning_rate": 0.0002,
+        "cutoff_len": 384,
+        "train_on_inputs": False,
+    },
+    {
+        "id": "glue8-4b-eps6-r32",
+        "lane": 1,
+        "paper_reference": "Table 4",
+        "dataset": "glue8",
+        "model_slug": "gemma-3-4b-pt",
+        "model_id": MODEL_4B,
+        "epsilon": 6.0,
+        "lora_r": 32,
+        "steps": 500,
+        "learning_rate": 0.0002,
+        "cutoff_len": 384,
+        "train_on_inputs": False,
+    },
+)
+
+REGIME_CANDIDATES = tuple(
+    {
+        "id": f"fixed-c{str(value).replace('.', 'p')}",
+        "method": "baseline",
+        "initial_c": value,
+        "rho": None,
+        "eta": None,
+    }
+    for value in (0.5, 1.0, 2.0, 3.0, 5.0)
+) + tuple(
+    {
+        "id": f"full-sla-rho{int(value * 100):03d}",
+        "method": "slaclip",
+        "initial_c": 1.0,
+        "rho": value,
+        "eta": 0.05,
+    }
+    for value in (0.50, 0.70, 0.80, 0.90, 0.98)
+) + (
+    {
+        "id": "full-sla-c2-rho090",
+        "method": "slaclip",
+        "initial_c": 2.0,
+        "rho": 0.90,
         "eta": 0.05,
     },
 )
@@ -162,7 +253,7 @@ def _with_sha(path: Path, data: bytes) -> None:
     _write_immutable(path.with_name(path.name + ".sha256"), f"{digest}  {path.name}\n".encode())
 
 
-def build_manifest(code_sha: str, model_4b_revision: str, model_9b_revision: str) -> dict[str, Any]:
+def build_manifest(code_sha: str, model_4b_revision: str, model_9b_revision: str, profile: str = "paper-breadth") -> dict[str, Any]:
     for label, value in (
         ("code_sha", code_sha),
         ("model_4b_revision", model_4b_revision),
@@ -171,9 +262,21 @@ def build_manifest(code_sha: str, model_4b_revision: str, model_9b_revision: str
         if len(value) != FULL_SHA_LENGTH or any(ch not in "0123456789abcdef" for ch in value):
             raise CampaignError(f"{label} must be a full lowercase commit SHA")
     revisions = {MODEL_4B: model_4b_revision, MODEL_9B: model_9b_revision}
+    if profile == "paper-breadth":
+        settings = BREADTH_SETTINGS
+        candidates = BREADTH_CANDIDATES
+        screen_steps = None
+        eval_limit = 0
+    elif profile == "regime-map":
+        settings = REGIME_SETTINGS
+        candidates = REGIME_CANDIDATES
+        screen_steps = 150
+        eval_limit = 512
+    else:
+        raise CampaignError(f"unknown campaign profile: {profile}")
     arms = []
-    for setting in SETTINGS:
-        for candidate in CANDIDATES:
+    for setting in settings:
+        for candidate in candidates:
             arm_id = f"{setting['id']}--{candidate['id']}--seed{SEED}"
             arms.append(
                 {
@@ -184,12 +287,15 @@ def build_manifest(code_sha: str, model_4b_revision: str, model_9b_revision: str
                     "arm_id": arm_id,
                     "seed": SEED,
                     "model_revision": revisions[setting["model_id"]],
+                    "steps": screen_steps or setting["steps"],
+                    "eval_limit": eval_limit,
                     "relative_root": f"runs/{setting['id']}/{candidate['id']}/seed-{SEED}",
                 }
             )
     return {
         "schema_version": SCHEMA_VERSION,
-        "protocol": "prism_paper_coverage_full_slaclip_breadth_screen_v1",
+        "protocol": f"prism_paper_coverage_{profile.replace('-', '_')}_v2",
+        "profile": profile,
         "inference_class": "single_seed_exploratory_breadth_screen_requires_fresh_seed_confirmation",
         "code_sha": code_sha,
         "seed": SEED,
@@ -204,6 +310,21 @@ def build_manifest(code_sha: str, model_4b_revision: str, model_9b_revision: str
             "Task-test metrics are descriptive only. Any promising setting must be "
             "repeated on fresh seeds with a locked tuned-fixed comparator."
         ),
+        "regime_map": {
+            "exploratory": profile == "regime-map",
+            "screen_steps": screen_steps,
+            "per_task_eval_limit": eval_limit,
+            "fixed_C_grid": [0.5, 1.0, 2.0, 3.0, 5.0] if profile == "regime-map" else [1.0],
+            "conditional_rho_grid": [0.5, 0.7, 0.8, 0.9, 0.98] if profile == "regime-map" else [0.9, 0.98],
+            "initial_C_sensitivity_control": (
+                {"C_0": 2.0, "rho": 0.9, "eta": 0.05}
+                if profile == "regime-map" else None
+            ),
+            "interpretation": (
+                "descriptive one-seed screen; clipping-rate bins are measured outcomes, "
+                "not predeclared failure thresholds or confirmatory evidence"
+            ),
+        },
         "arms": arms,
     }
 
@@ -212,7 +333,7 @@ PLAN_FIELDS = (
     "lane", "arm_id", "setting_id", "dataset", "model_slug", "model_id",
     "model_revision", "epsilon", "lora_r", "method", "initial_c", "rho",
     "eta", "steps", "learning_rate", "cutoff_len", "train_on_inputs",
-    "seed", "relative_root",
+    "seed", "eval_limit", "relative_root",
 )
 
 
@@ -240,18 +361,21 @@ def _plan_bytes(manifest: dict[str, Any], lane: int) -> bytes:
             "cutoff_len": arm["cutoff_len"],
             "train_on_inputs": str(arm["train_on_inputs"]).lower(),
             "seed": arm["seed"],
+            "eval_limit": arm["eval_limit"],
             "relative_root": arm["relative_root"],
         }
         rows.append("|".join(str(values[field]) for field in PLAN_FIELDS))
     return ("\n".join(rows) + "\n").encode()
 
 
-def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision: str) -> None:
-    manifest = build_manifest(code_sha, model_4b_revision, model_9b_revision)
+def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision: str, profile: str) -> None:
+    manifest = build_manifest(code_sha, model_4b_revision, model_9b_revision, profile=profile)
     _with_sha(root / "plans" / "manifest.json", _json_bytes(manifest))
     _with_sha(root / "plans" / "lane-0.tsv", _plan_bytes(manifest, 0))
     _with_sha(root / "plans" / "lane-1.tsv", _plan_bytes(manifest, 1))
-    print(f"prepared_arms={len(manifest['arms'])} lane0=6 lane1=9")
+    lane0 = sum(arm['lane'] == 0 for arm in manifest['arms'])
+    lane1 = sum(arm['lane'] == 1 for arm in manifest['arms'])
+    print(f"prepared_arms={len(manifest['arms'])} lane0={lane0} lane1={lane1} profile={profile}")
 
 
 def _finite(value: Any, label: str) -> float:
@@ -269,9 +393,49 @@ def _task_average(summary_path: Path) -> float:
         rows = list(csv.DictReader(summary_path.open(encoding="utf-8", newline="")))
     except OSError as exc:
         raise CampaignError(f"cannot read evaluation summary: {summary_path}") from exc
-    if len(rows) != 1 or "Average" not in rows[0]:
+    if len(rows) != 1:
         raise CampaignError(f"invalid evaluation summary: {summary_path}")
-    return _finite(rows[0]["Average"], f"{summary_path}:Average")
+    for key in ("Average", "GLUE8_Avg", "Math10K_Avg"):
+        if key in rows[0] and rows[0][key] not in (None, ""):
+            return _finite(rows[0][key], f"{summary_path}:{key}")
+    raise CampaignError(f"evaluation average column is missing: {summary_path}")
+
+
+def _quantile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        raise CampaignError("cannot calculate a quantile of an empty series")
+    position = (len(ordered) - 1) * fraction
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] * (upper - position) + ordered[upper] * (position - lower)
+
+
+def _raw_series(path: Path, field: str) -> list[float]:
+    values = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                record = json.loads(line)
+                if field in record and record[field] is not None:
+                    values.append(_finite(record[field], f"{path}:{line_number}:{field}"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CampaignError(f"cannot read raw telemetry: {path}") from exc
+    if not values:
+        raise CampaignError(f"raw telemetry lacks {field}: {path}")
+    return values
+
+
+def _clip_bin(value: float) -> str:
+    if value < 0.70:
+        return "lt_70pct"
+    if value < 0.90:
+        return "70_to_lt_90pct"
+    if value < 0.98:
+        return "90_to_lt_98pct"
+    return "ge_98pct"
 
 
 def analyze(root: Path) -> None:
@@ -290,8 +454,12 @@ def analyze(root: Path) -> None:
             raise CampaignError(f"incomplete arm {arm['arm_id']}: {exc}") from exc
         if status.get("state") != "completed" or status.get("config", {}).get("implementation_git_sha") != manifest["code_sha"]:
             raise CampaignError(f"arm is not completed at the locked SHA: {arm['arm_id']}")
-        numeric = telemetry.get("numeric_metrics", {})
+        numeric = telemetry.get("metrics", telemetry.get("numeric_metrics", {}))
         metric = lambda name, key="mean": _finite(numeric.get(name, {}).get(key), f"{arm['arm_id']}:{name}.{key}")
+        raw_path = arm_root / "results" / "research_raw" / "NON_PRIVATE_train_log.jsonl"
+        clip_values = _raw_series(raw_path, "raw_clip_fraction")
+        small_proxy_values = _raw_series(raw_path, "raw_reference_small_gradient_proxy")
+        clip_median = _quantile(clip_values, 0.5)
         results.append(
             {
                 "setting_id": arm["setting_id"],
@@ -307,6 +475,12 @@ def analyze(root: Path) -> None:
                 "loss_last": metric("loss_mean", "last"),
                 "clip_fraction_mean": metric("raw_clip_fraction"),
                 "clip_fraction_last": metric("raw_clip_fraction", "last"),
+                "clip_fraction_p10": _quantile(clip_values, 0.1),
+                "clip_fraction_median": clip_median,
+                "clip_fraction_p90": _quantile(clip_values, 0.9),
+                "clip_regime_bin": _clip_bin(clip_median),
+                "small_gradient_proxy_mean": sum(small_proxy_values) / len(small_proxy_values),
+                "small_gradient_proxy_median": _quantile(small_proxy_values, 0.5),
                 "clip_threshold_mean": metric("dp_clip_threshold"),
                 "clip_threshold_last": metric("dp_clip_threshold", "last"),
                 "signal_to_noise_mean": metric("raw_signal_to_noise_ratio"),
@@ -321,7 +495,43 @@ def analyze(root: Path) -> None:
     for row in results:
         buffer.append(",".join("" if row[k] is None else str(row[k]) for k in fields))
     _with_sha(out / "paper_coverage_summary.csv", ("\n".join(buffer) + "\n").encode())
-    _with_sha(out / "paper_coverage_summary.json", _json_bytes({"schema_version": 1, "rows": results}))
+    best_fixed = {}
+    for row in results:
+        if row["method"] == "baseline":
+            best_fixed[row["setting_id"]] = max(
+                best_fixed.get(row["setting_id"], float("-inf")), row["task_average"]
+            )
+    regime_groups: dict[str, list[dict[str, Any]]] = {}
+    for row in results:
+        if row["method"] != "slaclip":
+            continue
+        row["delta_vs_setting_best_fixed"] = row["task_average"] - best_fixed[row["setting_id"]]
+        regime_groups.setdefault(row["clip_regime_bin"], []).append(row)
+    regime_rows = []
+    for label in ("lt_70pct", "70_to_lt_90pct", "90_to_lt_98pct", "ge_98pct"):
+        members = regime_groups.get(label, [])
+        deltas = [row["delta_vs_setting_best_fixed"] for row in members]
+        regime_rows.append({
+            "clip_regime_bin": label,
+            "slaclip_arms": len(deltas),
+            "mean_delta_vs_setting_best_fixed": sum(deltas) / len(deltas) if deltas else None,
+            "win_rate_vs_setting_best_fixed": sum(value > 0 for value in deltas) / len(deltas) if deltas else None,
+            "mean_small_gradient_proxy": (
+                sum(row["small_gradient_proxy_mean"] for row in members) / len(members)
+                if members else None
+            ),
+        })
+    _with_sha(out / "paper_coverage_summary.json", _json_bytes({"schema_version": 2, "rows": results}))
+    regime_fields = list(regime_rows[0])
+    regime_csv = [",".join(regime_fields)]
+    for row in regime_rows:
+        regime_csv.append(",".join("" if row[key] is None else str(row[key]) for key in regime_fields))
+    _with_sha(out / "clipping_regime_summary.csv", ("\n".join(regime_csv) + "\n").encode())
+    _with_sha(out / "clipping_regime_summary.json", _json_bytes({
+        "schema_version": 1,
+        "inference": "exploratory_one_seed_descriptive_only",
+        "rows": regime_rows,
+    }))
     print(f"analyzed_arms={len(results)}")
 
 
@@ -333,6 +543,7 @@ def parser() -> argparse.ArgumentParser:
     prep.add_argument("--code-sha", required=True)
     prep.add_argument("--model-4b-revision", required=True)
     prep.add_argument("--model-9b-revision", required=True)
+    prep.add_argument("--profile", choices=("paper-breadth", "regime-map"), default="paper-breadth")
     report = sub.add_parser("analyze")
     report.add_argument("--campaign-root", required=True, type=Path)
     return value
@@ -341,7 +552,7 @@ def parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = parser().parse_args()
     if args.command == "prepare":
-        prepare(args.campaign_root, args.code_sha, args.model_4b_revision, args.model_9b_revision)
+        prepare(args.campaign_root, args.code_sha, args.model_4b_revision, args.model_9b_revision, args.profile)
     else:
         analyze(args.campaign_root)
 

@@ -387,9 +387,17 @@ or optimizer settings. Inspect the recorded status/config before trusting a
 resumed result. Preserve the Slurm log together with `run_status.json`.
 
 After training is complete, run evaluation in separate GPU jobs using the exact
-model and result directories and `--run_train false --run_eval true`. GLUE8
-evaluation downloads Hugging Face datasets and metrics unless they were staged
-in the cache; Math-10K evaluation assets are tracked in this repository.
+model and result directories and `--run_train false --run_eval true`. For
+general launchers, GLUE8 requires official validation assets to be staged;
+Math-10K evaluation assets are tracked in this repository.
+
+The paper-coverage wrapper removes the compute-node network dependency. On the
+login node it materializes pinned official GLUE validation splits under
+`${PRISM_RUN_ROOT}/cache/glue-eval/<revision>`, records a recursive content
+hash, and passes that portable scratch path to every lane. The allocation
+validates and loads all eight task assets with `HF_HUB_OFFLINE=1` before the
+real-model smoke. Override the account-specific location with
+`PRISM_GLUE_EVAL_ROOT`; never embed a username in an evaluation command.
 
 ## 10. Privacy and artifact handling
 

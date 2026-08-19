@@ -183,25 +183,43 @@ GPU runs one independent Python process; the fixed scan, calibration lock,
 SlaClip screen, stage-2 confirmation, and final controls advance inside that
 single queued job rather than through an array of separately queued jobs.
 
-The separate paper-coverage breadth screen extends beyond the heavily sampled
-Math-10K/Gemma-3-4B/rank-16 setting. It covers GLUE8 at both paper DP budgets
-(`epsilon=6` and `epsilon=3`), Math-10K on Gemma-2-9B, and the rank-8/rank-32
-Math-10K ablations. Every setting runs paper fixed `C=1` plus Full SlaClip at
-conditional `rho in {0.90, 0.98}`, `eta=0.05`, `K=15`, and bounds `[0.1,15]`.
-This is a seed-42 breadth screen: task-test scores are descriptive and any
-positive setting must be confirmed on locked fresh seeds before a journal
-claim. Submit all 15 arms as one portable two-H200 allocation with:
+The paper-coverage launcher has two profiles. `paper-breadth` retains the
+15-arm historical screen. The default `regime-map` profile crosses nine
+paper-supported settings: GLUE8 and Math-10K, `epsilon in {3,6}`, LoRA
+`rank in {8,16,32}` where reported, and the paper's Gemma-2-9B Math row. It
+scans fixed `C in {0.5,1,2,3,5}` and Full SlaClip conditional
+`rho in {0.5,0.7,0.8,0.9,0.98}` at `C_0=1`, `eta=0.05`, `K=15`, and bounds
+`[0.1,15]`; a `C_0=2, rho=0.9` control tests initial-threshold sensitivity.
+These 99 arms use 150 updates and a locked random 512-example subset per task
+to map clipping regimes economically. The Gemma-3-12B Math
+row is deliberately not enabled until its separately pinned gated checkpoint
+is staged and smoke-tested.
+
+The analyzer reports the achieved clipping median and 10th/90th percentiles,
+the exact research-only small-gradient proxy, and descriptive Full-SlaClip
+deltas versus the best fixed arm within each setting. It groups measured
+clipping into `<70%`, `70–<90%`, `90–<98%`, and `>=98%` bins. These bins are
+reporting strata, not assumed failure thresholds. The entire regime map is a
+seed-42 exploratory screen; any boundary or positive utility result requires a
+locked full-length, fresh-seed confirmation. Submit the complete profile as one
+portable two-H200 allocation with:
 
 ```bash
 bash scripts/submit_paper_coverage_campaign.sh --test-only
 bash scripts/submit_paper_coverage_campaign.sh --submit
 ```
 
+Set `PRISM_COVERAGE_PROFILE=paper-breadth` only to reproduce the smaller
+historical plan.
+
 The wrapper resolves the account-specific home/scratch paths, pins both model
-revisions and the Git SHA, stages immutable source, uses offline shared model
-snapshots, and writes the receipt, Slurm logs, adapters, evaluation summaries,
-step telemetry, and aggregate CSV/JSON below one SHA-qualified scratch
-campaign directory.
+revisions and the Git SHA, materializes a content-hashed official GLUE
+validation snapshot before submission, stages immutable source, and runs the
+compute allocation fully offline. It writes the receipt, Slurm logs, adapters,
+evaluation summaries, step telemetry, and aggregate CSV/JSON below one
+SHA-qualified scratch campaign directory. A two-step real-model smoke now
+includes offline GLUE inference, so training success alone cannot mask a broken
+evaluation path.
 
 The noise multiplier is calibrated for the requested update count. Each Poisson batch is normalized by Opacus's fixed expected batch size, not by the randomly realized batch size. Dynamic clipping changes the absolute noise scale with `C_t`, while the matched noise multiplier and accountant determine the same privacy schedule. The sensitivity statement uses Poisson subsampling and add/remove record adjacency; replace-one adjacency must not be substituted without changing the analysis.
 

@@ -4,6 +4,7 @@ import importlib.util
 import json
 import math
 import re
+import random
 import sys
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
@@ -12,6 +13,7 @@ from .evaluation_identity import prepare_evaluation_cache
 from .trainers import RunConfig, completed_adapter_status
 from .utils import llm_adapters_dir
 MATH_TASKS = ['gsm8k', 'AQuA', 'mawps', 'SVAMP']
+EVAL_SUBSET_SEED = 1729
 _NUMERIC_ANSWER_RE = re.compile(r'-?\d+\.?\d*')
 _AQUA_STANDALONE_ANSWER_RE = re.compile(r'(?:^|[^A-Z])([A-E])(?:$|[^A-Z])')
 _AQUA_FALLBACK_ANSWER_RE = re.compile(r'[A-E]')
@@ -34,6 +36,13 @@ def _record_identity(record: Mapping[str, Any]) -> tuple[Any, Any, Any]:
         record.get('input'),
         record.get('answer'),
     )
+
+
+def _deterministic_subset(records: Sequence[Mapping[str, Any]], limit: int) -> list[Mapping[str, Any]]:
+    if int(limit) <= 0 or int(limit) >= len(records):
+        return list(records)
+    indices = sorted(random.Random(EVAL_SUBSET_SEED).sample(range(len(records)), int(limit)))
+    return [records[index] for index in indices]
 
 
 def _prediction_from_output(task: str, output: str) -> Any:
@@ -119,7 +128,7 @@ def _safe_load(
         pass
     return (None, None)
 
-def evaluate_math10k(cfg: RunConfig, batch_size: int=64, num_beams: int=4, max_new_tokens: int=256, max_input_length: int=1024) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def evaluate_math10k(cfg: RunConfig, batch_size: int=64, num_beams: int=4, max_new_tokens: int=256, max_input_length: int=1024, fast_dev_run: int=0) -> Tuple[pd.DataFrame, pd.DataFrame]:
     cfg.finalize()
     adapter_dir = Path(cfg.output_dir)
     adapter_status = completed_adapter_status(cfg)
@@ -148,6 +157,8 @@ def evaluate_math10k(cfg: RunConfig, batch_size: int=64, num_beams: int=4, max_n
             not isinstance(record, dict) for record in records
         ):
             raise RuntimeError(f'Invalid math evaluation asset: {test_path}')
+        if int(fast_dev_run) > 0:
+            records = _deterministic_subset(records, int(fast_dev_run))
         expected_records_by_task[task] = records
         test_asset_identity[ds_name] = {
             'rows': len(records),
@@ -166,6 +177,8 @@ def evaluate_math10k(cfg: RunConfig, batch_size: int=64, num_beams: int=4, max_n
             'num_beams': int(num_beams),
             'max_new_tokens': int(max_new_tokens),
             'max_input_length': int(max_input_length),
+            'fast_dev_run': int(fast_dev_run),
+            'eval_subset_seed': EVAL_SUBSET_SEED if int(fast_dev_run) > 0 else None,
             'test_assets': test_asset_identity,
         },
         artifact_names=[f'{_task_dir_name(task)}.json' for task in MATH_TASKS],
@@ -197,6 +210,11 @@ def evaluate_math10k(cfg: RunConfig, batch_size: int=64, num_beams: int=4, max_n
         if unique_json.exists():
             unique_json.unlink()
         sys.argv = ['evaluate.py', '--dataset', task, '--model', 'other', '--adapter', 'LoRA', '--base_model', cfg.base_model, '--lora_weights', lora_weights, '--output_file', str(unique_json), '--batch_size', str(int(batch_size)), '--num_beams', str(int(num_beams)), '--max_new_tokens', str(int(max_new_tokens)), '--max_input_length', str(int(max_input_length)), '--log_every', '0']
+        if int(fast_dev_run) > 0:
+            sys.argv.extend([
+                '--max_examples', str(int(fast_dev_run)),
+                '--sample_seed', str(EVAL_SUBSET_SEED),
+            ])
         if evaluation_revision:
             sys.argv.extend(['--model_revision', str(evaluation_revision)])
         print('[eval]', ' '.join(sys.argv))

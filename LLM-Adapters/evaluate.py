@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import argparse
+import random
 from pathlib import Path
 
 import fire
@@ -130,7 +131,15 @@ def load_data(args) -> list:
     file_path = DATASET_DIR / dname / "test.json"
     if not file_path.exists():
         raise FileNotFoundError(f"can not find dataset file : {file_path}")
-    return json.load(open(file_path, "r"))
+    records = json.load(open(file_path, "r"))
+    if args.max_examples is not None and args.max_examples > 0:
+        indices = sorted(
+            random.Random(args.sample_seed).sample(
+                range(len(records)), min(args.max_examples, len(records))
+            )
+        )
+        records = [records[index] for index in indices]
+    return records
 
 
 def create_batch(dataset, batch_size: int):
@@ -163,6 +172,12 @@ def parse_args():
         ],
         required=True,
     )
+    parser.add_argument(
+        "--sample_seed",
+        type=int,
+        default=1729,
+        help="Locked seed used when --max_examples selects an exploratory subset.",
+    )
     parser.add_argument("--model", choices=["LLaMA-7B", "BLOOM-7B", "GPT-j-6B", "other"], required=True)
     parser.add_argument("--adapter", choices=["LoRA", "AdapterP", "AdapterH", "Parallel", "Prefix"], required=True)
     parser.add_argument("--base_model", required=True)
@@ -181,6 +196,12 @@ def parse_args():
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--max_input_length", type=int, default=1024)
     parser.add_argument("--log_every", type=int, default=0)  # 0 = silent per-example
+    parser.add_argument(
+        "--max_examples",
+        type=int,
+        default=0,
+        help="Deterministic task-prefix limit for exploratory evaluation; 0 uses all rows.",
+    )
 
     return parser.parse_args()
 

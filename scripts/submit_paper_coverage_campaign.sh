@@ -36,7 +36,10 @@ SHORT_SHA="${LOCKED_REPO_SHA:0:12}"
 ENV_PREFIX="${PRISM_ENV_PREFIX:-${SCRATCH_ROOT}/envs/prism-dp-lora-${PRISM_ENV_TAG:-71bce55}}"
 RUN_ROOT="${PRISM_RUN_ROOT:-${SCRATCH_ROOT}/runs/prism-dp-lora}"
 SHARED_HF_HOME="${PRISM_HF_HOME:-${RUN_ROOT}/cache/huggingface}"
-CAMPAIGN_ID="${PRISM_CAMPAIGN_ID:-paper-coverage-${SHORT_SHA}-v1}"
+GLUE_EVAL_REVISION="bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c"
+GLUE_EVAL_ROOT="${PRISM_GLUE_EVAL_ROOT:-${RUN_ROOT}/cache/glue-eval/${GLUE_EVAL_REVISION}}"
+COVERAGE_PROFILE="${PRISM_COVERAGE_PROFILE:-regime-map}"
+CAMPAIGN_ID="${PRISM_CAMPAIGN_ID:-paper-coverage-${SHORT_SHA}-${COVERAGE_PROFILE}-v2}"
 STAGED_REPO_ROOT="${PRISM_STAGED_REPO_ROOT:-${RUN_ROOT}/sources/PRISM-DP-LoRA-${LOCKED_REPO_SHA}}"
 MODEL_4B_REVISION="cc012e0a6d0787b4adcc0fa2c4da74402494554d"
 MODEL_9B_REVISION="33c193028431c2fde6c6e51f29e6f17b60cbfac6"
@@ -47,6 +50,10 @@ PARTITION="${PRISM_SLURM_PARTITION:-quad_h200}"
 EXCLUDE_NODES="${PRISM_SLURM_EXCLUDE:-}"
 WALLTIME="2-12:00:00"
 
+if [[ "${COVERAGE_PROFILE}" != paper-breadth && "${COVERAGE_PROFILE}" != regime-map ]]; then
+  echo "error: PRISM_COVERAGE_PROFILE must be paper-breadth or regime-map" >&2
+  exit 2
+fi
 if [[ ! "${CAMPAIGN_ID}" =~ ^paper-coverage-${SHORT_SHA}-[A-Za-z0-9._-]+$ ]]; then
   echo "error: campaign ID must include locked SHA ${SHORT_SHA}" >&2
   exit 2
@@ -58,6 +65,7 @@ fi
 [[ -x "${ENV_PREFIX}/bin/python" ]] || { echo "error: environment unavailable: ${ENV_PREFIX}" >&2; exit 2; }
 for required in \
   scripts/build_paper_coverage_campaign.py \
+  scripts/prepare_glue_eval_assets.py \
   scripts/preflight_hpc.py \
   scripts/smoke_dp_path.py \
   scripts/summarize_telemetry.py \
@@ -65,6 +73,10 @@ for required in \
   slurm/paper_coverage_lane.sh; do
   [[ -f "${REPO_ROOT}/${required}" ]] || { echo "error: missing ${required}" >&2; exit 2; }
 done
+
+"${ENV_PREFIX}/bin/python" "${REPO_ROOT}/scripts/prepare_glue_eval_assets.py" \
+  --output-root "${GLUE_EVAL_ROOT}" \
+  --cache-dir "${SHARED_HF_HOME}/datasets"
 
 check_model() {
   local model_id="$1" revision="$2"
@@ -131,6 +143,8 @@ WORKER_ARGS=(
   "${USER_NAME}" "${STAGED_REPO_ROOT}" "${ENV_PREFIX}" "${RUN_ROOT}"
   "${SHARED_HF_HOME}" "${LOCKED_REPO_SHA}" "${CAMPAIGN_ID}" "${SCRATCH_ROOT}"
   "${MODEL_4B_REVISION}" "${MODEL_9B_REVISION}"
+  "${GLUE_EVAL_ROOT}"
+  "${COVERAGE_PROFILE}"
 )
 
 if [[ "${MODE}" == --test-only ]]; then
@@ -172,13 +186,14 @@ job_id="${submitted%%;*}"
 [[ "${job_id}" =~ ^[0-9]+$ ]] || { echo "error: invalid job ID: ${submitted}" >&2; exit 2; }
 "${ENV_PREFIX}/bin/python" - "${RECEIPT}" "${job_id}" "${old_job}" "${old_state}" \
   "${CAMPAIGN_ID}" "${CAMPAIGN_ROOT}" "${LOCKED_REPO_SHA}" "${STAGED_REPO_ROOT}" \
-  "${ENV_PREFIX}" "${ACCOUNT}" "${QOS}" "${PARTITION}" <<'PY'
+  "${ENV_PREFIX}" "${ACCOUNT}" "${QOS}" "${PARTITION}" "${GLUE_EVAL_ROOT}" \
+  "${COVERAGE_PROFILE}" <<'PY'
 import json, os, sys, tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 (target, job, previous, previous_state, campaign, root, sha, source, env,
- account, qos, partition) = sys.argv[1:]
+ account, qos, partition, glue_eval_root, coverage_profile) = sys.argv[1:]
 payload = {
     "schema_version": 1,
     "campaign_id": campaign,
@@ -194,6 +209,8 @@ payload = {
         "google/gemma-3-4b-pt": "cc012e0a6d0787b4adcc0fa2c4da74402494554d",
         "google/gemma-2-9b": "33c193028431c2fde6c6e51f29e6f17b60cbfac6",
     },
+    "glue_eval_assets": glue_eval_root,
+    "coverage_profile": coverage_profile,
     "resources": {
         "account": account, "qos": qos, "partition": partition,
         "nodes": 1, "tasks": 2, "cpus_per_task": 12, "memory": "320G",

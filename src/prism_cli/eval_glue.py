@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import hashlib
 import re
 from pathlib import Path
 from typing import Dict, Tuple
@@ -13,6 +14,51 @@ from .evaluation_identity import prepare_evaluation_cache
 from .modeling import load_base_model
 from .utils import build_prompt, build_tokenizer, cleanup_cuda, write_json_atomic
 GLUE_TASKS = ['cola', 'sst2', 'mrpc', 'stsb', 'qqp', 'mnli', 'qnli', 'rte']
+GLUE_ASSET_SCHEMA_VERSION = 1
+EVAL_SUBSET_SEED = 1729
+
+
+def _load_glue_asset_manifest(root: Path) -> dict:
+    manifest_path = root / 'manifest.json'
+    try:
+        raw = manifest_path.read_bytes()
+        manifest = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f'GLUE evaluation assets are unavailable or invalid: {manifest_path}') from exc
+    if manifest.get('schema_version') != GLUE_ASSET_SCHEMA_VERSION:
+        raise RuntimeError(f'Unsupported GLUE asset schema in {manifest_path}')
+    if manifest.get('tasks') != GLUE_TASKS:
+        raise RuntimeError(f'GLUE asset task order does not match evaluator: {manifest_path}')
+    manifest['manifest_sha256'] = hashlib.sha256(raw).hexdigest()
+    return manifest
+
+
+def _load_glue_dataset(task: str, data_root: Path | None):
+    if data_root is None:
+        from datasets import load_dataset
+        return load_dataset('nyu-mll/glue', task)
+    from datasets import load_from_disk
+    task_root = data_root / task
+    if not task_root.is_dir():
+        raise RuntimeError(f'Missing materialized GLUE task: {task_root}')
+    return load_from_disk(str(task_root))
+
+
+def _compute_metric(task: str, predictions, references) -> dict[str, float]:
+    from sklearn.metrics import accuracy_score, f1_score, matthews_corrcoef
+    if task == 'stsb':
+        from scipy.stats import pearsonr, spearmanr
+        pearson = float(pearsonr(predictions, references).statistic)
+        spearman = float(spearmanr(predictions, references).statistic)
+        return {'pearson': pearson, 'spearmanr': spearman}
+    predictions = [int(value) for value in predictions]
+    references = [int(value) for value in references]
+    if task == 'cola':
+        return {'matthews_correlation': float(matthews_corrcoef(references, predictions))}
+    result = {'accuracy': float(accuracy_score(references, predictions))}
+    if task in ('mrpc', 'qqp'):
+        result['f1'] = float(f1_score(references, predictions, zero_division=0))
+    return result
 
 def glue_to_instruction_input(task: str, ex: dict):
     task = task.lower()
@@ -180,14 +226,11 @@ def generate_labels(model, tokenizer, gen_cfg, prompts, max_input_length: int, m
 def _maybe_limit(ds, n):
     if n is None or int(n) <= 0:
         return ds
-    return ds.select(range(min(int(n), len(ds))))
+    return ds.shuffle(seed=EVAL_SUBSET_SEED).select(range(min(int(n), len(ds))))
 
-def eval_task(model, tokenizer, gen_cfg, task: str, batch_size: int, max_input_length: int, max_new_tokens: int, fast_dev_run: int=0, split_name: str='validation'):
-    import evaluate as hf_evaluate
-    from datasets import load_dataset
+def eval_task(model, tokenizer, gen_cfg, task: str, batch_size: int, max_input_length: int, max_new_tokens: int, fast_dev_run: int=0, split_name: str='validation', data_root: Path | None=None):
     from tqdm.auto import tqdm
-    ds = load_dataset('glue', task)
-    metric = hf_evaluate.load('glue', task)
+    ds = _load_glue_dataset(task, data_root)
     split = ds[split_name].filter(lambda x: x['label'] != -1)
     split = _maybe_limit(split, fast_dev_run)
     refs, prompts = ([], [])
@@ -203,10 +246,10 @@ def eval_task(model, tokenizer, gen_cfg, task: str, batch_size: int, max_input_l
             pred_ids.append(pred)
             parse_ok += int(ok)
     if task == 'stsb':
-        res = metric.compute(predictions=[float(p) for p in pred_ids], references=[float(r) for r in refs])
+        res = _compute_metric(task, [float(p) for p in pred_ids], [float(r) for r in refs])
         score = (float(res['pearson']) + float(res['spearmanr'])) / 2.0
     else:
-        res = metric.compute(predictions=[int(p) for p in pred_ids], references=[int(r) for r in refs])
+        res = _compute_metric(task, pred_ids, refs)
         if task in ('mrpc', 'qqp'):
             score = (float(res['accuracy']) + float(res['f1'])) / 2.0
         elif task == 'cola':
@@ -215,12 +258,9 @@ def eval_task(model, tokenizer, gen_cfg, task: str, batch_size: int, max_input_l
             score = float(res['accuracy'])
     return {'task': task, 'score': float(score), 'parse_rate': float(parse_ok / max(1, len(pred_ids))), 'n': int(len(pred_ids)), 'metrics': {k: float(v) for k, v in res.items()}}
 
-def eval_mnli(model, tokenizer, gen_cfg, batch_size: int, max_input_length: int, max_new_tokens: int, fast_dev_run: int=0):
-    import evaluate as hf_evaluate
-    from datasets import load_dataset
+def eval_mnli(model, tokenizer, gen_cfg, batch_size: int, max_input_length: int, max_new_tokens: int, fast_dev_run: int=0, data_root: Path | None=None):
     from tqdm.auto import tqdm
-    ds = load_dataset('glue', 'mnli')
-    metric = hf_evaluate.load('glue', 'mnli')
+    ds = _load_glue_dataset('mnli', data_root)
     details = {}
     for split_name in ['validation_matched', 'validation_mismatched']:
         split = ds[split_name].filter(lambda x: x['label'] != -1)
@@ -237,12 +277,12 @@ def eval_mnli(model, tokenizer, gen_cfg, batch_size: int, max_input_length: int,
                 pred, ok = parse_pred('mnli', o)
                 pred_ids.append(pred)
                 parse_ok += int(ok)
-        res = metric.compute(predictions=[int(p) for p in pred_ids], references=[int(r) for r in refs])
+        res = _compute_metric('mnli', pred_ids, refs)
         details[split_name] = {'metrics': {k: float(v) for k, v in res.items()}, 'parse_rate': float(parse_ok / max(1, len(pred_ids))), 'n': int(len(pred_ids))}
     score = (details['validation_matched']['metrics']['accuracy'] + details['validation_mismatched']['metrics']['accuracy']) / 2.0
     return {'task': 'mnli', 'score': float(score), 'matched_acc': float(details['validation_matched']['metrics']['accuracy']), 'mismatched_acc': float(details['validation_mismatched']['metrics']['accuracy']), 'details': details}
 
-def evaluate_glue8(cfg: RunConfig, batch_size: int=128, num_beams: int=1, max_new_tokens: int=8, max_input_length: int=384, fast_dev_run: int=0) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def evaluate_glue8(cfg: RunConfig, batch_size: int=128, num_beams: int=1, max_new_tokens: int=8, max_input_length: int=384, fast_dev_run: int=0, data_root: Path | None=None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     cfg.finalize()
     adapter_dir = Path(cfg.output_dir)
     adapter_status = completed_adapter_status(cfg)
@@ -253,6 +293,16 @@ def evaluate_glue8(cfg: RunConfig, batch_size: int=128, num_beams: int=1, max_ne
     )
     result_dir = Path(cfg.result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
+    data_root = Path(data_root).resolve() if data_root is not None else None
+    asset_identity = None
+    if data_root is not None:
+        manifest = _load_glue_asset_manifest(data_root)
+        asset_identity = {
+            'dataset_id': manifest['dataset_id'],
+            'dataset_revision': manifest['dataset_revision'],
+            'content_sha256': manifest['content_sha256'],
+            'manifest_sha256': manifest['manifest_sha256'],
+        }
     prepare_evaluation_cache(
         result_dir,
         {
@@ -267,6 +317,8 @@ def evaluate_glue8(cfg: RunConfig, batch_size: int=128, num_beams: int=1, max_ne
             'max_new_tokens': int(max_new_tokens),
             'max_input_length': int(max_input_length),
             'fast_dev_run': int(fast_dev_run),
+            'eval_subset_seed': EVAL_SUBSET_SEED if int(fast_dev_run) > 0 else None,
+            'glue_eval_assets': asset_identity,
         },
         artifact_names=[f'{task}.json' for task in GLUE_TASKS],
         force=bool(cfg.force_eval),
@@ -293,7 +345,7 @@ def evaluate_glue8(cfg: RunConfig, batch_size: int=128, num_beams: int=1, max_ne
             rec = cached[task]
             print(f'[eval cache] {task}: {p}')
         else:
-            rec = eval_mnli(model, tokenizer, gen_cfg, batch_size, max_input_length, max_new_tokens, fast_dev_run) if task == 'mnli' else eval_task(model, tokenizer, gen_cfg, task, batch_size, max_input_length, max_new_tokens, fast_dev_run)
+            rec = eval_mnli(model, tokenizer, gen_cfg, batch_size, max_input_length, max_new_tokens, fast_dev_run, data_root=data_root) if task == 'mnli' else eval_task(model, tokenizer, gen_cfg, task, batch_size, max_input_length, max_new_tokens, fast_dev_run, data_root=data_root)
             write_json_atomic(p, rec)
         task_rows.append(rec)
     if model is not None:

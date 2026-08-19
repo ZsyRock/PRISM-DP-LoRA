@@ -175,6 +175,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--max_new_tokens', type=int, default=None)
     p.add_argument('--max_input_length', type=int, default=None)
     p.add_argument('--fast_dev_run', type=int, default=0)
+    p.add_argument(
+        '--glue_eval_data_root',
+        type=Path,
+        default=None,
+        help='Materialized, pinned GLUE validation assets for offline evaluation.',
+    )
     return p
 
 
@@ -265,9 +271,9 @@ def main(argv=None):
         print('[skip] run_train=False')
     if cfg.run_eval:
         if cfg.dataset == 'math10k':
-            evaluate_math10k(cfg, batch_size=args.eval_batch_size or 64, num_beams=args.num_beams or 4, max_new_tokens=args.max_new_tokens or 256, max_input_length=args.max_input_length or 1024)
+            evaluate_math10k(cfg, batch_size=args.eval_batch_size or 64, num_beams=args.num_beams or 4, max_new_tokens=args.max_new_tokens or 256, max_input_length=args.max_input_length or 1024, fast_dev_run=args.fast_dev_run)
         else:
-            evaluate_glue8(cfg, batch_size=args.eval_batch_size or 128, num_beams=args.num_beams or 1, max_new_tokens=args.max_new_tokens or 8, max_input_length=args.max_input_length or 384, fast_dev_run=args.fast_dev_run)
+            evaluate_glue8(cfg, batch_size=args.eval_batch_size or 128, num_beams=args.num_beams or 1, max_new_tokens=args.max_new_tokens or 8, max_input_length=args.max_input_length or 384, fast_dev_run=args.fast_dev_run, data_root=args.glue_eval_data_root)
     else:
         print('[skip] run_eval=False')
 if __name__ == '__main__':

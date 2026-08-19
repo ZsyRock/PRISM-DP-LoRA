@@ -12,6 +12,7 @@ ENV_PREFIX="${4:?missing environment prefix}"
 CAMPAIGN_ROOT="${5:?missing campaign root}"
 EXPECTED_REPO_SHA="${6:?missing repository SHA}"
 JOB_TMP_ROOT="${7:?missing job temporary root}"
+GLUE_EVAL_ROOT="${8:?missing pinned GLUE evaluation assets}"
 
 PYTHON_BIN="${ENV_PREFIX}/bin/python"
 JOB_ID="${SLURM_JOB_ID:-manual}"
@@ -76,9 +77,9 @@ mkdir -p "${TMPDIR}" "${HF_DATASETS_CACHE}" "${TRITON_CACHE_DIR}" "${TORCH_EXTEN
 run_training() {
   local spec="$1"
   local plan_lane arm_id setting_id dataset model_slug model_id model_revision
-  local epsilon lora_r method initial_c rho eta steps lr cutoff train_inputs seed relative_root
+  local epsilon lora_r method initial_c rho eta steps lr cutoff train_inputs seed eval_limit relative_root
   IFS='|' read -r plan_lane arm_id setting_id dataset model_slug model_id model_revision \
-    epsilon lora_r method initial_c rho eta steps lr cutoff train_inputs seed relative_root <<<"${spec}"
+    epsilon lora_r method initial_c rho eta steps lr cutoff train_inputs seed eval_limit relative_root <<<"${spec}"
   if [[ "${plan_lane}" != "${LANE}" || -z "${arm_id}" || -z "${relative_root}" ]]; then
     echo "error: invalid or cross-lane plan row: ${spec}" >&2
     return 2
@@ -168,9 +169,15 @@ run_training() {
     return 2
   fi
   if [[ "${dataset}" == glue8 ]]; then
-    args+=(--eval_batch_size 64 --num_beams 1 --max_new_tokens 8 --max_input_length 384)
+    args+=(
+      --eval_batch_size 64 --num_beams 1 --max_new_tokens 8 --max_input_length 384
+      --glue_eval_data_root "${GLUE_EVAL_ROOT}"
+    )
   else
     args+=(--eval_batch_size 8 --num_beams 4 --max_new_tokens 256 --max_input_length 1024)
+  fi
+  if [[ "${eval_limit}" =~ ^[0-9]+$ ]] && (( eval_limit > 0 )); then
+    args+=(--fast_dev_run "${eval_limit}")
   fi
 
   echo "state=running" >"${status_file}"
@@ -224,6 +231,13 @@ run_real_smoke() {
     if [[ "${method}" == slaclip ]]; then
       args+=(--slaclip_target_non_small_clip_fraction 0.9 --slaclip_eta 0.05 --slaclip_c_min 0.1 --slaclip_c_max 15)
     fi
+    if [[ "${dataset}" == glue8 ]]; then
+      args+=(
+        --run_eval true --fast_dev_run 2 --eval_batch_size 2 --num_beams 1
+        --max_new_tokens 8 --max_input_length 384
+        --glue_eval_data_root "${GLUE_EVAL_ROOT}"
+      )
+    fi
     "${args[@]}" >"${root}/train-${JOB_ID}.out" 2>"${root}/train-${JOB_ID}.err"
     [[ -s "${root}/adapter/adapter_model.safetensors" ]] || return 3
   done
@@ -233,11 +247,9 @@ CURRENT_ARM="real-model-smoke"
 write_lane_status running 0
 run_real_smoke
 
-expected=6
-if [[ "${LANE}" == 1 ]]; then expected=9; fi
 actual="$(awk 'NF {n++} END {print n+0}' "${PLAN}")"
-if [[ "${actual}" != "${expected}" ]]; then
-  echo "error: lane ${LANE} expected ${expected} arms, found ${actual}" >&2
+if (( actual < 1 )); then
+  echo "error: lane ${LANE} has no planned arms" >&2
   exit 2
 fi
 while IFS= read -r spec; do

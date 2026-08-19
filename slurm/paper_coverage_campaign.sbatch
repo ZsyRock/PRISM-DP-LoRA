@@ -15,6 +15,8 @@ CAMPAIGN_ID="${7:?missing campaign ID}"
 SCRATCH_ROOT="${8:?missing scratch root}"
 MODEL_4B_REVISION="${9:?missing Gemma-3-4B revision}"
 MODEL_9B_REVISION="${10:?missing Gemma-2-9B revision}"
+GLUE_EVAL_ROOT="${11:?missing pinned GLUE evaluation assets}"
+COVERAGE_PROFILE="${12:?missing coverage profile}"
 
 PYTHON_BIN="${ENV_PREFIX}/bin/python"
 CAMPAIGN_ROOT="${RUN_ROOT}/campaigns/${CAMPAIGN_ID}"
@@ -69,12 +71,24 @@ for required in \
   configs/glue8_paper.json \
   configs/math10k_paper.json \
   scripts/build_paper_coverage_campaign.py \
+  scripts/prepare_glue_eval_assets.py \
   scripts/preflight_hpc.py \
   scripts/smoke_dp_path.py \
   scripts/summarize_telemetry.py \
   slurm/paper_coverage_lane.sh; do
   [[ -f "${REPO_ROOT}/${required}" ]] || { echo "error: missing ${required}" >&2; exit 2; }
 done
+"${PYTHON_BIN}" - "${GLUE_EVAL_ROOT}" <<'PY'
+import sys
+from pathlib import Path
+from src.prism_cli.eval_glue import _load_glue_asset_manifest, _load_glue_dataset
+
+root = Path(sys.argv[1])
+manifest = _load_glue_asset_manifest(root)
+for task in manifest['tasks']:
+    _load_glue_dataset(task, root)
+print(f"offline_glue_assets={root} revision={manifest['dataset_revision']} content={manifest['content_sha256']}")
+PY
 
 cd -- "${REPO_ROOT}"
 export PRISM_REPO_ROOT="${REPO_ROOT}"
@@ -149,6 +163,7 @@ write_status running 0
   --code-sha "${EXPECTED_REPO_SHA}" \
   --model-4b-revision "${MODEL_4B_REVISION}" \
   --model-9b-revision "${MODEL_9B_REVISION}" \
+  --profile "${COVERAGE_PROFILE}" \
   >"${CAMPAIGN_ROOT}/plans/prepare-${JOB_ID}.out" \
   2>"${CAMPAIGN_ROOT}/plans/prepare-${JOB_ID}.err"
 
@@ -158,12 +173,14 @@ LANE_SCRIPT="${REPO_ROOT}/slurm/paper_coverage_lane.sh"
 srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
   --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres=gpu:h200:1 \
   "${LANE_SCRIPT}" 0 "${CAMPAIGN_ROOT}/plans/lane-0.tsv" "${REPO_ROOT}" \
-  "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" &
+  "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
+  "${GLUE_EVAL_ROOT}" &
 PID0=$!
 srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
   --nodes=1 --ntasks=1 --cpus-per-task=12 --mem=150G --gres=gpu:h200:1 \
   "${LANE_SCRIPT}" 1 "${CAMPAIGN_ROOT}/plans/lane-1.tsv" "${REPO_ROOT}" \
-  "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" &
+  "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
+  "${GLUE_EVAL_ROOT}" &
 PID1=$!
 LANE_CODE=0
 wait "${PID0}" || LANE_CODE=$?
