@@ -62,7 +62,8 @@ STEP_GRES="${PRISM_SLURM_STEP_GRES:-gpu:${GPU_TYPE}:1}"
 if [[ "${COVERAGE_PROFILE}" != paper-breadth \
     && "${COVERAGE_PROFILE}" != regime-map \
     && "${COVERAGE_PROFILE}" != baseline-reproduction \
-    && "${COVERAGE_PROFILE}" != baseline-reproduction-cached ]]; then
+    && "${COVERAGE_PROFILE}" != baseline-reproduction-cached \
+    && "${COVERAGE_PROFILE}" != glue-slaclip-screen ]]; then
   echo "error: unsupported PRISM_COVERAGE_PROFILE" >&2
   exit 2
 fi
@@ -108,7 +109,9 @@ check_model() {
   }
 }
 check_model google/gemma-3-4b-pt "${MODEL_4B_REVISION}"
-check_model google/gemma-2-9b "${MODEL_9B_REVISION}"
+if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen ]]; then
+  check_model google/gemma-2-9b "${MODEL_9B_REVISION}"
+fi
 if [[ "${COVERAGE_PROFILE}" == baseline-reproduction ]]; then
   if ! check_model google/gemma-3-12b-pt "${MODEL_12B_REVISION}"; then
     if [[ "${MODE}" == --test-only ]]; then
@@ -150,6 +153,19 @@ RECEIPT="${CAMPAIGN_ROOT}/submission_receipt.json"
 mkdir -p "${LOG_ROOT}"
 WORKER="${STAGED_REPO_ROOT}/slurm/paper_coverage_campaign.sbatch"
 
+# Materialize and validate the immutable plan on the login node before asking
+# for queued GPU time. The compute job repeats this idempotently. For the
+# focused screen this also reads, hashes, and recomputes the locked calibration
+# source, so a missing/stale source cannot fail only after the queue wait.
+"${ENV_PREFIX}/bin/python" \
+  "${STAGED_REPO_ROOT}/scripts/build_paper_coverage_campaign.py" prepare \
+  --campaign-root "${CAMPAIGN_ROOT}" \
+  --code-sha "${LOCKED_REPO_SHA}" \
+  --model-4b-revision "${MODEL_4B_REVISION}" \
+  --model-9b-revision "${MODEL_9B_REVISION}" \
+  --model-12b-revision "${MODEL_12B_REVISION}" \
+  --profile "${COVERAGE_PROFILE}"
+
 SBATCH_ARGS=(
   --account="${ACCOUNT}"
   --qos="${QOS}"
@@ -166,6 +182,10 @@ SBATCH_ARGS=(
   --chdir="${STAGED_REPO_ROOT}"
   --export=NONE
   --no-requeue
+  # Without B:, Slurm signals every active job step. This lets the lane and
+  # trainer terminate before the hard limit; B: would signal only the batch
+  # shell while it is blocked waiting for srun.
+  --signal=TERM@180
 )
 [[ -z "${EXCLUDE_NODES}" ]] || SBATCH_ARGS+=(--exclude="${EXCLUDE_NODES}")
 WORKER_ARGS=(

@@ -183,7 +183,7 @@ GPU runs one independent Python process; the fixed scan, calibration lock,
 SlaClip screen, stage-2 confirmation, and final controls advance inside that
 single queued job rather than through an array of separately queued jobs.
 
-The paper-coverage launcher has two profiles. `paper-breadth` retains the
+The paper-coverage launcher has several profiles. `paper-breadth` retains the
 15-arm historical screen. The default `regime-map` profile crosses nine
 paper-supported settings: GLUE8 and Math-10K, `epsilon in {3,6}`, LoRA
 `rank in {8,16,32}` where reported, and the paper's Gemma-2-9B Math row. It
@@ -211,6 +211,36 @@ bash scripts/submit_paper_coverage_campaign.sh --submit
 
 Set `PRISM_COVERAGE_PROFILE=paper-breadth` only to reproduce the smaller
 historical plan.
+
+After a full-length fixed-`C=1` baseline has established a non-saturated
+clipping trajectory, `glue-slaclip-screen` performs the next exploratory
+selection stage. The current preregistered instance focuses on
+GLUE8/Gemma-3-4B/epsilon 6/rank 16. It compares five equally budgeted fixed
+thresholds `C in {0.5,1,2,3,5}` with five Full SlaClip conditional targets
+`rho in {0.55,0.60,0.65,0.70,0.75}` at `C_0=1`, plus two `rho=0.65`
+initial-threshold controls at `C_0 in {0.5,2}`. All 12 arms run for 150 updates
+with seed 43 and are ranked only by response-only loss on the same deterministic
+800-row public training holdout. Official GLUE validation is not run or used
+for screening. The exact source-telemetry hash, burn-in rule, target mapping,
+candidate roles, and confirmation requirement are locked in the manifest.
+The seed-42 calibration run trained on the complete 10,000-row file, including
+the rows later assigned to this public holdout. Consequently this screen is
+useful for target discovery but is not an untouched-holdout or confirmatory
+estimate; the later fresh-seed, locked-candidate stage supplies that evidence.
+
+Submit all candidates sequentially inside one allocation with, for example:
+
+```bash
+PRISM_COVERAGE_PROFILE=glue-slaclip-screen \
+PRISM_SLURM_PARTITION=a100 PRISM_GPU_TYPE=a100 PRISM_GPU_LANES=1 \
+PRISM_CPUS_PER_TASK=8 PRISM_SLURM_MEMORY=48G PRISM_STEP_MEMORY=44G \
+PRISM_SLURM_WALLTIME=1-00:00:00 \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+```
+
+This screen is single-seed exploratory evidence, not the journal result. Its
+selected Full SlaClip and tuned-fixed candidates must next be locked and rerun
+for the full 500 updates on fresh paired seeds before official evaluation.
 
 For fixed-C baseline reproduction and target-rate calibration, use
 `baseline-reproduction`. It runs the ten distinct DP-PRISM settings obtained

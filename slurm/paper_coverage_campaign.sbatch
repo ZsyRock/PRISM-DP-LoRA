@@ -51,7 +51,11 @@ write_status() {
 finish() {
   local code=$? state=completed
   trap - EXIT TERM INT
-  if [[ "${code}" != 0 ]]; then state=failed; fi
+  if [[ "${code}" == 130 || "${code}" == 143 ]]; then
+    state=interrupted
+  elif [[ "${code}" != 0 ]]; then
+    state=failed
+  fi
   write_status "${state}" "${code}" || true
   exit "${code}"
 }
@@ -154,12 +158,14 @@ single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
   --expected-data-sha256 281bad3305e8be7a7660b64b22704a9462f983b90df5d6f0c1c4abb649d6d091 \
   --output-root "${CAMPAIGN_ROOT}/preflight/glue8" \
   --require-cuda --model-id google/gemma-3-4b-pt --model-revision "${MODEL_4B_REVISION}"
-single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
-  --dataset math10k \
-  --data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/math_10k.json" \
-  --expected-data-sha256 0342d0d860ad8592b579329337c90e42eefd3d9f2898043140cbd120630418b8 \
-  --output-root "${CAMPAIGN_ROOT}/preflight/math10k" \
-  --require-cuda --model-id google/gemma-2-9b --model-revision "${MODEL_9B_REVISION}"
+if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen ]]; then
+  single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
+    --dataset math10k \
+    --data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/math_10k.json" \
+    --expected-data-sha256 0342d0d860ad8592b579329337c90e42eefd3d9f2898043140cbd120630418b8 \
+    --output-root "${CAMPAIGN_ROOT}/preflight/math10k" \
+    --require-cuda --model-id google/gemma-2-9b --model-revision "${MODEL_9B_REVISION}"
+fi
 
 CURRENT_PHASE=synthetic-smoke
 write_status running 0
