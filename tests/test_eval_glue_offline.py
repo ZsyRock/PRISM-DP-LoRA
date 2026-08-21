@@ -1,12 +1,28 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 
 import pytest
 
-from prism_cli.eval_glue import GLUE_TASKS, _compute_metric, _load_glue_asset_manifest
+from prism_cli.eval_glue import (
+    GLUE_TASKS,
+    _compute_metric,
+    _load_glue_asset_manifest,
+    _maybe_limit,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PREP_SPEC = importlib.util.spec_from_file_location(
+    "prepare_glue_eval_assets",
+    ROOT / "scripts" / "prepare_glue_eval_assets.py",
+)
+assert PREP_SPEC and PREP_SPEC.loader
+prepare_assets = importlib.util.module_from_spec(PREP_SPEC)
+PREP_SPEC.loader.exec_module(prepare_assets)
 
 
 def test_local_glue_metrics_match_expected_definitions() -> None:
@@ -39,3 +55,40 @@ def test_asset_manifest_rejects_task_mismatch(tmp_path: Path) -> None:
     )
     with pytest.raises(RuntimeError, match='task order'):
         _load_glue_asset_manifest(tmp_path)
+
+
+def test_asset_digest_ignores_derived_dataset_cache_files(tmp_path: Path) -> None:
+    task = tmp_path / "sst2" / "validation"
+    task.mkdir(parents=True)
+    (task / "data-00000-of-00001.arrow").write_bytes(b"locked source")
+    before = prepare_assets._content_digest_without_manifest(tmp_path)
+    (task / "cache-derived.arrow").write_bytes(b"transient filter output")
+    assert prepare_assets._content_digest_without_manifest(tmp_path) == before
+    (task / "data-00000-of-00001.arrow").write_bytes(b"changed source")
+    assert prepare_assets._content_digest_without_manifest(tmp_path) != before
+
+
+def test_eval_subset_shuffle_stays_in_memory() -> None:
+    class FakeDataset:
+        def __init__(self) -> None:
+            self.shuffle_kwargs = None
+            self.selected = None
+
+        def __len__(self) -> int:
+            return 5
+
+        def shuffle(self, **kwargs):
+            self.shuffle_kwargs = kwargs
+            return self
+
+        def select(self, indices):
+            self.selected = list(indices)
+            return self
+
+    dataset = FakeDataset()
+    assert _maybe_limit(dataset, 2) is dataset
+    assert dataset.shuffle_kwargs == {
+        "seed": 1729,
+        "keep_in_memory": True,
+    }
+    assert dataset.selected == [0, 1]

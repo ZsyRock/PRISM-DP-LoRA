@@ -48,7 +48,17 @@ def _validate_existing(root: Path) -> bool:
 
 def _content_digest_without_manifest(root: Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted(p for p in root.rglob('*') if p.is_file() and p.name != 'manifest.json'):
+    # Hugging Face Dataset transformations may create cache-*.arrow files next
+    # to a dataset loaded from disk. They are derived evaluation scratch, not
+    # part of the materialized source snapshot, and must not invalidate its
+    # content identity. The evaluator also requests in-memory transforms, but
+    # ignoring legacy cache files keeps older valid snapshots usable.
+    for path in sorted(
+        p for p in root.rglob('*')
+        if p.is_file()
+        and p.name != 'manifest.json'
+        and not (p.name.startswith('cache-') and p.suffix == '.arrow')
+    ):
         relative = path.relative_to(root).as_posix().encode()
         digest.update(len(relative).to_bytes(8, 'big'))
         digest.update(relative)

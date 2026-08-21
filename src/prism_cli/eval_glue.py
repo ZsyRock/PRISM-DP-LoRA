@@ -226,12 +226,18 @@ def generate_labels(model, tokenizer, gen_cfg, prompts, max_input_length: int, m
 def _maybe_limit(ds, n):
     if n is None or int(n) <= 0:
         return ds
-    return ds.shuffle(seed=EVAL_SUBSET_SEED).select(range(min(int(n), len(ds))))
+    return ds.shuffle(
+        seed=EVAL_SUBSET_SEED,
+        keep_in_memory=True,
+    ).select(range(min(int(n), len(ds))))
 
 def eval_task(model, tokenizer, gen_cfg, task: str, batch_size: int, max_input_length: int, max_new_tokens: int, fast_dev_run: int=0, split_name: str='validation', data_root: Path | None=None):
     from tqdm.auto import tqdm
     ds = _load_glue_dataset(task, data_root)
-    split = ds[split_name].filter(lambda x: x['label'] != -1)
+    split = ds[split_name].filter(
+        lambda x: x['label'] != -1,
+        keep_in_memory=True,
+    )
     split = _maybe_limit(split, fast_dev_run)
     refs, prompts = ([], [])
     for ex in split:
@@ -263,7 +269,10 @@ def eval_mnli(model, tokenizer, gen_cfg, batch_size: int, max_input_length: int,
     ds = _load_glue_dataset('mnli', data_root)
     details = {}
     for split_name in ['validation_matched', 'validation_mismatched']:
-        split = ds[split_name].filter(lambda x: x['label'] != -1)
+        split = ds[split_name].filter(
+            lambda x: x['label'] != -1,
+            keep_in_memory=True,
+        )
         split = _maybe_limit(split, fast_dev_run)
         refs, prompts = ([], [])
         for ex in split:
