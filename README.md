@@ -178,13 +178,15 @@ privacy composition covering the selection. See
 [the experiment protocol](docs/experiment_protocol.md) for the exact mapping,
 leakage guards, and public-data privacy boundary.
 
-On Slurm, the full campaign is submitted once as one two-H200 allocation. Each
-GPU runs one independent Python process; the fixed scan, calibration lock,
-SlaClip screen, stage-2 confirmation, and final controls advance inside that
-single queued job rather than through an array of separately queued jobs.
+On Slurm, every new paper-coverage submission uses one queued allocation rather
+than an array.  The current canonical default is one A100, one sequential GPU
+lane, eight CPUs, 80G host memory, and 24 hours; the single-GPU training step
+uses 76G of that parent allocation.  Historical multi-H200 shapes can still be
+requested through explicit `PRISM_*` overrides, but they are not the default
+for new experiments.
 
 The paper-coverage launcher has several profiles. `paper-breadth` retains the
-15-arm historical screen. The default `regime-map` profile crosses nine
+15-arm historical screen. The historical `regime-map` profile crosses nine
 paper-supported settings: GLUE8 and Math-10K, `epsilon in {3,6}`, LoRA
 `rank in {8,16,32}` where reported, and the paper's Gemma-2-9B Math row. It
 scans fixed `C in {0.5,1,2,3,5}` and Full SlaClip conditional
@@ -201,16 +203,20 @@ deltas versus the best fixed arm within each setting. It groups measured
 clipping into `<70%`, `70–<90%`, `90–<98%`, and `>=98%` bins. These bins are
 reporting strata, not assumed failure thresholds. The entire regime map is a
 seed-42 exploratory screen; any boundary or positive utility result requires a
-locked full-length, fresh-seed confirmation. Submit the complete profile as one
-portable two-H200 allocation with:
+locked full-length, fresh-seed confirmation. This historical 99-arm profile is
+not expected to finish on one A100 within the current 24-hour queue policy. It
+can be materialized for scheduler inspection only with an explicit profile,
+but it must be redesigned into a smaller preregistered campaign before a new
+formal submission:
 
 ```bash
-bash scripts/submit_paper_coverage_campaign.sh --test-only
-bash scripts/submit_paper_coverage_campaign.sh --submit
+PRISM_COVERAGE_PROFILE=regime-map \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
 ```
 
-Set `PRISM_COVERAGE_PROFILE=paper-breadth` only to reproduce the smaller
-historical plan.
+Every launcher invocation requires an explicit `PRISM_COVERAGE_PROFILE`; this
+prevents an accidental bare submission of a large historical plan. Set it to
+`paper-breadth` only to materialize the smaller historical profile.
 
 After a full-length fixed-`C=1` baseline has established a non-saturated
 clipping trajectory, `glue-slaclip-screen` performs the next exploratory
@@ -233,7 +239,7 @@ Submit all candidates sequentially inside one allocation with, for example:
 ```bash
 PRISM_COVERAGE_PROFILE=glue-slaclip-screen \
 PRISM_SLURM_PARTITION=a100 PRISM_GPU_TYPE=a100 PRISM_GPU_LANES=1 \
-PRISM_CPUS_PER_TASK=8 PRISM_SLURM_MEMORY=48G PRISM_STEP_MEMORY=44G \
+PRISM_CPUS_PER_TASK=8 PRISM_SLURM_MEMORY=80G PRISM_STEP_MEMORY=76G \
 PRISM_SLURM_WALLTIME=1-00:00:00 \
   bash scripts/submit_paper_coverage_campaign.sh --test-only
 ```

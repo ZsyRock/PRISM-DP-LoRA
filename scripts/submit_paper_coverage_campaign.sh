@@ -39,7 +39,11 @@ RUN_ROOT="${PRISM_RUN_ROOT:-${SCRATCH_ROOT}/runs/prism-dp-lora}"
 SHARED_HF_HOME="${PRISM_HF_HOME:-${RUN_ROOT}/cache/huggingface}"
 GLUE_EVAL_REVISION="bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c"
 GLUE_EVAL_ROOT="${PRISM_GLUE_EVAL_ROOT:-${RUN_ROOT}/cache/glue-eval/${GLUE_EVAL_REVISION}}"
-COVERAGE_PROFILE="${PRISM_COVERAGE_PROFILE:-regime-map}"
+COVERAGE_PROFILE="${PRISM_COVERAGE_PROFILE:-}"
+if [[ -z "${COVERAGE_PROFILE}" ]]; then
+  echo "error: PRISM_COVERAGE_PROFILE must be set explicitly" >&2
+  exit 2
+fi
 CAMPAIGN_ID="${PRISM_CAMPAIGN_ID:-paper-coverage-${SHORT_SHA}-${COVERAGE_PROFILE}-v2}"
 STAGED_REPO_ROOT="${PRISM_STAGED_REPO_ROOT:-${RUN_ROOT}/sources/PRISM-DP-LoRA-${LOCKED_REPO_SHA}}"
 MODEL_4B_REVISION="cc012e0a6d0787b4adcc0fa2c4da74402494554d"
@@ -48,22 +52,16 @@ MODEL_12B_REVISION="295efb63d01a7017928f273a94ebb86105c9526f"
 
 ACCOUNT="${PRISM_SLURM_ACCOUNT:-normal}"
 QOS="${PRISM_SLURM_QOS:-normal}"
-DEFAULT_PARTITION=quad_h200
-DEFAULT_WALLTIME=2-12:00:00
-DEFAULT_GPU_TYPE=h200
-DEFAULT_GPU_LANES=2
-DEFAULT_CPUS_PER_TASK=12
-DEFAULT_HOST_MEMORY=320G
-DEFAULT_STEP_MEMORY=150G
-if [[ "${COVERAGE_PROFILE}" == glue-high-c-refinement ]]; then
-  DEFAULT_PARTITION=a100
-  DEFAULT_WALLTIME=1-00:00:00
-  DEFAULT_GPU_TYPE=a100
-  DEFAULT_GPU_LANES=1
-  DEFAULT_CPUS_PER_TASK=8
-  DEFAULT_HOST_MEMORY=48G
-  DEFAULT_STEP_MEMORY=44G
-fi
+# Current queue policy: one sequential A100 allocation with enough host memory
+# for the validated single-process trainer.  Profile-specific larger historical
+# shapes remain available only through explicit PRISM_* overrides.
+DEFAULT_PARTITION=a100
+DEFAULT_WALLTIME=1-00:00:00
+DEFAULT_GPU_TYPE=a100
+DEFAULT_GPU_LANES=1
+DEFAULT_CPUS_PER_TASK=8
+DEFAULT_HOST_MEMORY=80G
+DEFAULT_STEP_MEMORY=76G
 PARTITION="${PRISM_SLURM_PARTITION:-${DEFAULT_PARTITION}}"
 EXCLUDE_NODES="${PRISM_SLURM_EXCLUDE:-}"
 WALLTIME="${PRISM_SLURM_WALLTIME:-${DEFAULT_WALLTIME}}"
@@ -265,14 +263,16 @@ job_id="${submitted%%;*}"
   "${CAMPAIGN_ID}" "${CAMPAIGN_ROOT}" "${LOCKED_REPO_SHA}" "${STAGED_REPO_ROOT}" \
   "${ENV_PREFIX}" "${ACCOUNT}" "${QOS}" "${PARTITION}" "${GLUE_EVAL_ROOT}" \
   "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" "${GPU_GRES}" \
-  "${GPU_LANES}" "${CPUS_PER_TASK}" "${HOST_MEMORY}" "${WALLTIME}" <<'PY'
+  "${GPU_LANES}" "${CPUS_PER_TASK}" "${HOST_MEMORY}" "${WALLTIME}" \
+  "${STEP_GRES}" "${STEP_MEMORY}" <<'PY'
 import json, os, sys, tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 (target, job, previous, previous_state, campaign, root, sha, source, env,
  account, qos, partition, glue_eval_root, coverage_profile, model_12b_revision,
- gpu_gres, gpu_lanes, cpus_per_task, host_memory, walltime) = sys.argv[1:]
+ gpu_gres, gpu_lanes, cpus_per_task, host_memory, walltime, step_gres,
+ step_memory) = sys.argv[1:]
 payload = {
     "schema_version": 1,
     "campaign_id": campaign,
@@ -296,6 +296,7 @@ payload = {
         "nodes": 1, "tasks": int(gpu_lanes),
         "cpus_per_task": int(cpus_per_task), "memory": host_memory,
         "gpus": gpu_gres, "walltime": walltime,
+        "step_gres": step_gres, "step_memory": step_memory,
         "single_allocation": True, "array": False, "requeue": False,
     },
 }

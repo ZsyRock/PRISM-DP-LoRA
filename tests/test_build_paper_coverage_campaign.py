@@ -806,7 +806,7 @@ def test_paper_coverage_timeout_signal_reaches_job_steps() -> None:
     assert 'write_arm_status completed 0\n  CURRENT_ARM_STATUS=""' in lane
 
 
-def test_high_c_refinement_shell_contract_is_one_a100_one_allocation() -> None:
+def test_paper_coverage_shell_contract_uses_queue_friendly_a100_defaults() -> None:
     wrapper = (ROOT / "scripts" / "submit_paper_coverage_campaign.sh").read_text()
     worker = (ROOT / "slurm" / "paper_coverage_campaign.sbatch").read_text()
     lane = (ROOT / "slurm" / "paper_coverage_lane.sh").read_text()
@@ -816,8 +816,14 @@ def test_high_c_refinement_shell_contract_is_one_a100_one_allocation() -> None:
     assert "DEFAULT_GPU_TYPE=a100" in wrapper
     assert "DEFAULT_GPU_LANES=1" in wrapper
     assert "DEFAULT_CPUS_PER_TASK=8" in wrapper
-    assert "DEFAULT_HOST_MEMORY=48G" in wrapper
-    assert "DEFAULT_STEP_MEMORY=44G" in wrapper
+    assert "DEFAULT_HOST_MEMORY=80G" in wrapper
+    assert "DEFAULT_STEP_MEMORY=76G" in wrapper
+    assert "DEFAULT_HOST_MEMORY=48G" not in wrapper
+    assert "DEFAULT_GPU_TYPE=h200" not in wrapper
+    assert 'COVERAGE_PROFILE="${PRISM_COVERAGE_PROFILE:-}"' in wrapper
+    assert "PRISM_COVERAGE_PROFILE must be set explicitly" in wrapper
+    assert '"step_gres": step_gres' in wrapper
+    assert '"step_memory": step_memory' in wrapper
     assert "requires PRISM_GPU_LANES=1" in wrapper
     assert "stage1-high-c-fixed-screen" in worker
     assert "lock-high-c-refinement" in worker

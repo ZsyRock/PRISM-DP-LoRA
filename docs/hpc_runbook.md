@@ -5,6 +5,16 @@ supported production shape is one Python process on one CUDA GPU. The current
 trainer is not DDP-aware; never use `torchrun`, multiple Slurm tasks, or multiple
 nodes for one run.
 
+For new formal submissions, use
+`scripts/submit_paper_coverage_campaign.sh` as the canonical entry point.  Its
+reviewed queue-friendly defaults are one A100, one GPU lane, eight CPUs, 80G
+host memory, a 76G exclusive training step, and a 24-hour walltime.  The older
+array, two-GPU, 128G/256G, and 60-hour launchers documented later in this file
+are retained only to reproduce their already-locked historical protocols; do
+not use them as defaults for a newly designed campaign.  The canonical wrapper
+also requires `PRISM_COVERAGE_PROFILE` explicitly so a bare command cannot
+silently submit a historical 99-arm profile.
+
 ## 1. Clone an immutable code revision
 
 Clone the repository on persistent project storage and record the exact commit:
