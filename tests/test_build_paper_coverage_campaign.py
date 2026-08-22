@@ -228,20 +228,90 @@ def test_glue_slaclip_screen_is_predeclared_and_balanced() -> None:
     assert "full-sla-c2p0-rho065" in sequential[-1]
 
 
-def _write_focused_campaign(root_path: Path) -> dict:
+def test_glue_high_c_refinement_predeclares_dynamic_two_stage_recipe() -> None:
     manifest = campaign.build_manifest(
-        CODE_SHA, REV_4B, REV_9B, profile="glue-slaclip-screen"
+        CODE_SHA, REV_4B, REV_9B, profile="glue-high-c-refinement"
     )
-    (root_path / "plans").mkdir()
-    (root_path / "plans" / "manifest.json").write_text(
-        json.dumps(manifest), encoding="utf-8"
+    arms = manifest["arms"]
+    assert len(arms) == 5
+    assert manifest["seed"] == 44
+    assert {arm["initial_c"] for arm in arms} == {3.0, 5.0, 7.5, 10.0, 15.0}
+    assert all(
+        arm["method"] == "baseline"
+        and arm["role"] == "high_C_fixed_candidate"
+        and arm["stage"] == 1
+        and arm["seed"] == 44
+        and arm["steps"] == 200
+        and arm["lane"] == 0
+        for arm in arms
     )
-    for index, arm in enumerate(manifest["arms"]):
+    refinement = manifest["glue_high_c_refinement"]
+    assert refinement["stage2_recipe"]["rho_quantiles"] == [
+        0.10, 0.25, 0.50, 0.75, 0.90
+    ]
+    assert refinement["stage2_recipe"]["rho_bounds"] == [0.20, 0.90]
+    assert refinement["stage2_recipe"]["require_unique_rho_values"] is True
+    assert refinement["stage2_recipe"]["primary"] == {
+        "arms": 5,
+        "initial_C": "stage1_best_fixed_C",
+        "eta": 0.02,
+    }
+    assert refinement["selection"]["validation_curve_steps"] == [
+        0, 50, 100, 150, 200
+    ]
+    assert refinement["selection"]["primary_metric"].startswith("step_200")
+    source = refinement["preceding_screen_source"]
+    assert source["job_id"] == "1411662"
+    assert source["manifest_sha256"] == (
+        "54215469ec16bc369b1075021751417610bba6b7b4c0dc791cd3c3618cc806b5"
+    )
+    assert source["submission_receipt_sha256"] == (
+        "d399b04fea09f31a9b6aaaa410f1df7df2fa9a7feeaf8187ee6d44e9489b9926"
+    )
+    assert len(source["artifact_sha256"]) == 10
+    assert source["expected_best_fixed"] == "fixed-c5p0"
+    assert source["expected_best_slaclip"] == "full-sla-c1-rho055"
+    assert all(len(value) == 6 for value in source["artifact_sha256"].values())
+    assert refinement["privacy_scope"]["end_to_end_dp_claim"] is False
+    assert "NON_PRIVATE" in refinement["privacy_scope"]["target_selection"]
+    plan = campaign._plan_bytes(manifest, 0, include_all=True).decode().splitlines()
+    assert len(plan) == 5 and all(line.startswith("0|") for line in plan)
+
+
+def _write_focused_campaign(
+    root_path: Path,
+    *,
+    profile: str = "glue-slaclip-screen",
+    validation_losses: dict[str, float] | None = None,
+    arms_override: list[dict] | None = None,
+    index_offset: int = 0,
+) -> dict:
+    if arms_override is None:
+        manifest = campaign.build_manifest(
+            CODE_SHA, REV_4B, REV_9B, profile=profile
+        )
+        (root_path / "plans").mkdir()
+        (root_path / "plans" / "manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        arms = manifest["arms"]
+    else:
+        manifest = json.loads(
+            (root_path / "plans" / "manifest.json").read_text(encoding="utf-8")
+        )
+        arms = arms_override
+    for local_index, arm in enumerate(arms):
+        index = index_offset + local_index
+        steps = int(arm["steps"])
         root = root_path / arm["relative_root"]
         (root / "adapter").mkdir(parents=True)
         (root / "results" / "research_raw").mkdir(parents=True)
         (root / "results" / "validation").mkdir(parents=True)
-        validation_loss = 1.0 + index / 100.0
+        validation_loss = (
+            validation_losses[arm["candidate_id"]]
+            if validation_losses is not None
+            else 1.0 + index / 100.0
+        )
         run_id = f"focused-arm-{index}"
         fingerprint = f"{index + 1:064x}"
         manifest_sha = f"{index + 101:064x}"
@@ -279,7 +349,7 @@ def _write_focused_campaign(root_path: Path) -> dict:
             "model_revision": arm["model_revision"],
             "seed": arm["seed"],
             "lora_r": arm["lora_r"],
-            "total_update_steps": 150,
+            "total_update_steps": steps,
             "batch_size": 64,
             "micro_batch_size": 4,
             "learning_rate": arm["learning_rate"],
@@ -313,7 +383,7 @@ def _write_focused_campaign(root_path: Path) -> dict:
             })
         status = {
             "state": "completed",
-            "update_steps": 150,
+            "update_steps": steps,
             "dataset": arm["dataset"],
             "method": arm["method"],
             "privacy": "dp",
@@ -345,8 +415,12 @@ def _write_focused_campaign(root_path: Path) -> dict:
                 "step": step,
                 "raw_clip_fraction": 0.4 + step / 1000.0,
                 "raw_reference_small_gradient_proxy": 0.2,
+                "raw_reference_conditional_clip_fraction": (
+                    0.30 + index / 100.0 + step / 2000.0
+                ),
+                "raw_reference_conditional_clip_fraction_valid": True,
             }
-            for step in range(1, 151)
+            for step in range(1, steps + 1)
         ]
         raw_text = "".join(json.dumps(row) + "\n" for row in raw_records)
         raw_path = root / "results" / "research_raw" / "NON_PRIVATE_train_log.jsonl"
@@ -354,7 +428,7 @@ def _write_focused_campaign(root_path: Path) -> dict:
         raw_sha = hashlib.sha256(raw_text.encode()).hexdigest()
         metrics = {
             name: {
-                "count": 150,
+                "count": steps,
                 "missing": 0,
                 "mean": 0.5 + index / 100.0,
                 "last": 0.6 + index / 100.0,
@@ -366,14 +440,14 @@ def _write_focused_campaign(root_path: Path) -> dict:
             "NON_PRIVATE_TELEMETRY": True,
             "source": {
                 "raw_sha256": raw_sha,
-                "raw_physical_records": 150,
-                "raw_unique_steps": 150,
+                "raw_physical_records": steps,
+                "raw_unique_steps": steps,
                 "raw_duplicate_records": 0,
             },
             "steps": {
-                "count": 150,
+                "count": steps,
                 "first": 1,
-                "last": 150,
+                "last": steps,
                 "missing_count": 0,
                 "missing": [],
             },
@@ -399,7 +473,7 @@ def _write_focused_campaign(root_path: Path) -> dict:
                 "records": 800,
                 "run_id": run_id,
                 "config_fingerprint": fingerprint,
-                "planned_update_steps": 150,
+                "planned_update_steps": steps,
                 "manifest_sha256": manifest_sha,
                 "selection_metric": "response_only_mean_per_record_causal_lm_loss",
                 "loss_definition": (
@@ -412,12 +486,18 @@ def _write_focused_campaign(root_path: Path) -> dict:
                     campaign.GLUE_SLACLIP_VALIDATION_RECORDS_SHA256
                 ),
                 "step": step,
-                "loss_mean": validation_loss + (150 - step) / 1000.0,
+                "loss_mean": validation_loss + (steps - step) / 1000.0,
                 "token_mean_loss": validation_loss,
                 "supervised_tokens": 3200,
             }
-            for step in (0, 50, 100, 150)
+            for step in sorted(campaign._expected_validation_curve_steps(steps))
         ]
+        (root / "results" / "validation" / "split_manifest.json").write_text(
+            json.dumps(split), encoding="utf-8"
+        )
+        (root / "results" / "validation" / "validation_metrics.json").write_text(
+            json.dumps(validation), encoding="utf-8"
+        )
         (root / "results" / "validation" / "validation_curve.jsonl").write_text(
             "".join(json.dumps(row) + "\n" for row in curve_records), encoding="utf-8"
         )
@@ -471,6 +551,227 @@ def test_glue_slaclip_analyzer_rejects_stale_summary(tmp_path: Path) -> None:
         campaign.analyze(tmp_path)
 
 
+def _write_high_c_stage1_and_lock(tmp_path: Path) -> dict:
+    losses = {
+        "fixed-c3p0": 0.50,
+        "fixed-c5p0": 0.45,
+        "fixed-c7p5": 0.40,
+        "fixed-c10p0": 0.35,
+        "fixed-c15p0": 0.38,
+    }
+    _write_focused_campaign(
+        tmp_path,
+        profile="glue-high-c-refinement",
+        validation_losses=losses,
+    )
+    campaign.lock_high_c_refinement(tmp_path)
+    campaign.lock_high_c_refinement(tmp_path)
+    return json.loads(
+        (tmp_path / "selection" / "high_c_stage1_lock.json").read_text()
+    )
+
+
+def test_high_c_stage1_lock_derives_unique_stage2_plan(tmp_path: Path) -> None:
+    lock = _write_high_c_stage1_and_lock(tmp_path)
+    assert lock["best_fixed"]["candidate_id"] == "fixed-c10p0"
+    assert lock["best_fixed"]["fixed_C"] == 10.0
+    assert lock["conditional_clip_proxy_records"] == 150
+    assert list(lock["rho_quantiles"]) == ["q10", "q25", "q50", "q75", "q90"]
+    rhos = list(lock["rho_quantiles"].values())
+    assert rhos == sorted(rhos) and len(set(rhos)) == 5
+    assert all(0.20 <= rho <= 0.90 for rho in rhos)
+    arms = lock["stage2_arms"]
+    primary = [arm for arm in arms if arm["role"] == "slaclip_target_candidate"]
+    assert len(primary) == 5
+    assert all(
+        arm["initial_c"] == 10.0
+        and arm["eta"] == 0.02
+        and arm["steps"] == 200
+        and arm["seed"] == 44
+        and arm["lane"] == 0
+        for arm in primary
+    )
+    speed = next(arm for arm in arms if arm["role"] == "controller_speed_control")
+    sensitivity = next(
+        arm for arm in arms if arm["role"] == "initial_C_sensitivity_control"
+    )
+    assert speed["initial_c"] == 10.0 and speed["eta"] == 0.05
+    assert sensitivity["initial_c"] == 5.0 and sensitivity["eta"] == 0.02
+    assert speed["rho"] == sensitivity["rho"] == lock["rho_quantiles"]["q50"]
+    stage2_plan = (tmp_path / "plans" / "stage2-slaclip.tsv").read_text().splitlines()
+    assert len(stage2_plan) == 7
+    assert all(line.startswith("0|") for line in stage2_plan)
+    assert lock["stage2_plan_sha256"] == hashlib.sha256(
+        (tmp_path / "plans" / "stage2-slaclip.tsv").read_bytes()
+    ).hexdigest()
+    assert (tmp_path / "selection" / "high_c_stage1_lock.json.sha256").is_file()
+    assert (tmp_path / "plans" / "stage2-slaclip.tsv.sha256").is_file()
+
+
+def test_high_c_analyzer_uses_endpoint_primary_and_reports_auc(tmp_path: Path) -> None:
+    lock = _write_high_c_stage1_and_lock(tmp_path)
+    stage2_losses = {
+        arm["candidate_id"]: 0.34 + index / 100.0
+        for index, arm in enumerate(lock["stage2_arms"])
+    }
+    _write_focused_campaign(
+        tmp_path,
+        profile="glue-high-c-refinement",
+        validation_losses=stage2_losses,
+        arms_override=lock["stage2_arms"],
+        index_offset=100,
+    )
+    campaign.analyze(tmp_path)
+    ranking = json.loads(
+        (tmp_path / "artifacts" / "glue_high_c_refinement_ranking.json").read_text()
+    )
+    assert ranking["best_fixed"]["candidate"] == "fixed-c10p0"
+    assert ranking["best_slaclip"]["candidate"] == "full-sla-q10-eta002"
+    assert ranking["slaclip_beats_best_fixed_primary"] is True
+    assert len(ranking["fixed_ranking"]) == 5
+    assert len(ranking["slaclip_ranking"]) == 5
+    assert len(ranking["controls"]) == 2
+    assert ranking["stage2_plan_sha256"] == lock["stage2_plan_sha256"]
+    assert ranking["privacy_scope"]["end_to_end_dp_claim"] is False
+    assert len(ranking["arm_artifact_sha256"]) == 12
+    assert all(
+        row["full_normalized_validation_loss_auc"] is not None
+        and row["late_window_normalized_validation_loss_auc"] is not None
+        for row in ranking["fixed_ranking"] + ranking["slaclip_ranking"]
+    )
+    curve_lines = (
+        tmp_path / "artifacts" / "public_validation_curve.csv"
+    ).read_text().splitlines()
+    summary_header = (
+        tmp_path / "artifacts" / "paper_coverage_summary.csv"
+    ).read_text().splitlines()[0]
+    regime_header = (
+        tmp_path / "artifacts" / "clipping_regime_summary.csv"
+    ).read_text().splitlines()[0]
+    telemetry_lines = (
+        tmp_path / "artifacts" / "baseline_telemetry_steps.csv"
+    ).read_text().splitlines()
+    assert len(curve_lines) == 1 + 12 * 5
+    assert len(telemetry_lines) == 1 + 12 * 200
+    assert "NON_PRIVATE_TELEMETRY" in summary_header
+    assert "NON_PRIVATE_TELEMETRY" in regime_header
+    assert "NON_PRIVATE_SELECTION_METRIC" in curve_lines[0]
+    assert "NON_PRIVATE_TELEMETRY" in telemetry_lines[0]
+    assert "raw_signal_retention_ratio" in telemetry_lines[0]
+    assert "raw_reference_conditional_clip_fraction_valid" in telemetry_lines[0]
+    assert "raw_slack_indicator_noise_residual_rmse" in telemetry_lines[0]
+
+
+def test_high_c_analyzer_rejects_stage2_plan_tampering(tmp_path: Path) -> None:
+    lock = _write_high_c_stage1_and_lock(tmp_path)
+    stage2_losses = {
+        arm["candidate_id"]: 0.34 + index / 100.0
+        for index, arm in enumerate(lock["stage2_arms"])
+    }
+    _write_focused_campaign(
+        tmp_path,
+        profile="glue-high-c-refinement",
+        validation_losses=stage2_losses,
+        arms_override=lock["stage2_arms"],
+        index_offset=100,
+    )
+    plan_path = tmp_path / "plans" / "stage2-slaclip.tsv"
+    plan_path.write_bytes(plan_path.read_bytes() + b"\n")
+    with pytest.raises(campaign.CampaignError, match="immutable artifact"):
+        campaign.analyze(tmp_path)
+
+
+def test_high_c_analyzer_binds_stage2_metrics_to_status(tmp_path: Path) -> None:
+    lock = _write_high_c_stage1_and_lock(tmp_path)
+    stage2_losses = {
+        arm["candidate_id"]: 0.34 + index / 100.0
+        for index, arm in enumerate(lock["stage2_arms"])
+    }
+    _write_focused_campaign(
+        tmp_path,
+        profile="glue-high-c-refinement",
+        validation_losses=stage2_losses,
+        arms_override=lock["stage2_arms"],
+        index_offset=100,
+    )
+    arm = lock["stage2_arms"][0]
+    metrics_path = (
+        tmp_path / arm["relative_root"]
+        / "results" / "validation" / "validation_metrics.json"
+    )
+    metrics = json.loads(metrics_path.read_text())
+    metrics["loss_mean"] += 1.0
+    metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+    with pytest.raises(campaign.CampaignError, match="not bound to split/metrics"):
+        campaign.analyze(tmp_path)
+
+
+def test_high_c_lock_rejects_nonunique_clamped_rho_grid(tmp_path: Path) -> None:
+    losses = {
+        "fixed-c3p0": 0.50,
+        "fixed-c5p0": 0.45,
+        "fixed-c7p5": 0.40,
+        "fixed-c10p0": 0.35,
+        "fixed-c15p0": 0.38,
+    }
+    manifest = _write_focused_campaign(
+        tmp_path,
+        profile="glue-high-c-refinement",
+        validation_losses=losses,
+    )
+    winner = next(arm for arm in manifest["arms"] if arm["candidate_id"] == "fixed-c10p0")
+    raw_path = (
+        tmp_path / winner["relative_root"]
+        / "results" / "research_raw" / "NON_PRIVATE_train_log.jsonl"
+    )
+    records = [json.loads(line) for line in raw_path.read_text().splitlines()]
+    for record in records:
+        record["raw_reference_conditional_clip_fraction"] = 0.1
+    raw_text = "".join(json.dumps(record) + "\n" for record in records)
+    raw_path.write_text(raw_text, encoding="utf-8")
+    summary_path = raw_path.with_name("telemetry_summary.json")
+    summary = json.loads(summary_path.read_text())
+    summary["source"]["raw_sha256"] = hashlib.sha256(raw_text.encode()).hexdigest()
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    with pytest.raises(campaign.CampaignError, match="rho grid is not unique"):
+        campaign.lock_high_c_refinement(tmp_path)
+
+
+@pytest.mark.parametrize("invalid_fraction", [-0.01, 1.01])
+def test_high_c_lock_rejects_out_of_range_conditional_fraction(
+    tmp_path: Path, invalid_fraction: float
+) -> None:
+    losses = {
+        "fixed-c3p0": 0.50,
+        "fixed-c5p0": 0.45,
+        "fixed-c7p5": 0.40,
+        "fixed-c10p0": 0.35,
+        "fixed-c15p0": 0.38,
+    }
+    manifest = _write_focused_campaign(
+        tmp_path,
+        profile="glue-high-c-refinement",
+        validation_losses=losses,
+    )
+    winner = next(
+        arm for arm in manifest["arms"] if arm["candidate_id"] == "fixed-c10p0"
+    )
+    raw_path = (
+        tmp_path / winner["relative_root"]
+        / "results" / "research_raw" / "NON_PRIVATE_train_log.jsonl"
+    )
+    records = [json.loads(line) for line in raw_path.read_text().splitlines()]
+    records[50]["raw_reference_conditional_clip_fraction"] = invalid_fraction
+    raw_text = "".join(json.dumps(record) + "\n" for record in records)
+    raw_path.write_text(raw_text, encoding="utf-8")
+    summary_path = raw_path.with_name("telemetry_summary.json")
+    summary = json.loads(summary_path.read_text())
+    summary["source"]["raw_sha256"] = hashlib.sha256(raw_text.encode()).hexdigest()
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    with pytest.raises(campaign.CampaignError, match="out-of-range"):
+        campaign.lock_high_c_refinement(tmp_path)
+
+
 def test_full_baseline_profile_requires_pinned_12b_revision() -> None:
     with pytest.raises(campaign.CampaignError, match="requires a pinned 12B"):
         campaign.build_manifest(
@@ -503,3 +804,26 @@ def test_paper_coverage_timeout_signal_reaches_job_steps() -> None:
     assert 'state=interrupted' in lane
     assert 'write_arm_status "${state}" "${code}"' in lane
     assert 'write_arm_status completed 0\n  CURRENT_ARM_STATUS=""' in lane
+
+
+def test_high_c_refinement_shell_contract_is_one_a100_one_allocation() -> None:
+    wrapper = (ROOT / "scripts" / "submit_paper_coverage_campaign.sh").read_text()
+    worker = (ROOT / "slurm" / "paper_coverage_campaign.sbatch").read_text()
+    lane = (ROOT / "slurm" / "paper_coverage_lane.sh").read_text()
+    assert "glue-high-c-refinement" in wrapper
+    assert "DEFAULT_PARTITION=a100" in wrapper
+    assert "DEFAULT_WALLTIME=1-00:00:00" in wrapper
+    assert "DEFAULT_GPU_TYPE=a100" in wrapper
+    assert "DEFAULT_GPU_LANES=1" in wrapper
+    assert "DEFAULT_CPUS_PER_TASK=8" in wrapper
+    assert "DEFAULT_HOST_MEMORY=48G" in wrapper
+    assert "DEFAULT_STEP_MEMORY=44G" in wrapper
+    assert "requires PRISM_GPU_LANES=1" in wrapper
+    assert "stage1-high-c-fixed-screen" in worker
+    assert "lock-high-c-refinement" in worker
+    assert "stage2-derived-full-slaclip-screen" in worker
+    assert "stage1-fixed.tsv" in worker and "stage2-slaclip.tsv" in worker
+    assert worker.count("verify_plan_sidecar") >= 3
+    assert "sbatch" not in worker
+    assert 'RUN_REAL_SMOKE="${12:-true}"' in lane
+    assert "expected_curve_steps" in lane

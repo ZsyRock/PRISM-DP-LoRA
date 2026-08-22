@@ -48,14 +48,30 @@ MODEL_12B_REVISION="295efb63d01a7017928f273a94ebb86105c9526f"
 
 ACCOUNT="${PRISM_SLURM_ACCOUNT:-normal}"
 QOS="${PRISM_SLURM_QOS:-normal}"
-PARTITION="${PRISM_SLURM_PARTITION:-quad_h200}"
+DEFAULT_PARTITION=quad_h200
+DEFAULT_WALLTIME=2-12:00:00
+DEFAULT_GPU_TYPE=h200
+DEFAULT_GPU_LANES=2
+DEFAULT_CPUS_PER_TASK=12
+DEFAULT_HOST_MEMORY=320G
+DEFAULT_STEP_MEMORY=150G
+if [[ "${COVERAGE_PROFILE}" == glue-high-c-refinement ]]; then
+  DEFAULT_PARTITION=a100
+  DEFAULT_WALLTIME=1-00:00:00
+  DEFAULT_GPU_TYPE=a100
+  DEFAULT_GPU_LANES=1
+  DEFAULT_CPUS_PER_TASK=8
+  DEFAULT_HOST_MEMORY=48G
+  DEFAULT_STEP_MEMORY=44G
+fi
+PARTITION="${PRISM_SLURM_PARTITION:-${DEFAULT_PARTITION}}"
 EXCLUDE_NODES="${PRISM_SLURM_EXCLUDE:-}"
-WALLTIME="${PRISM_SLURM_WALLTIME:-2-12:00:00}"
-GPU_TYPE="${PRISM_GPU_TYPE:-h200}"
-GPU_LANES="${PRISM_GPU_LANES:-2}"
-CPUS_PER_TASK="${PRISM_CPUS_PER_TASK:-12}"
-HOST_MEMORY="${PRISM_SLURM_MEMORY:-320G}"
-STEP_MEMORY="${PRISM_STEP_MEMORY:-150G}"
+WALLTIME="${PRISM_SLURM_WALLTIME:-${DEFAULT_WALLTIME}}"
+GPU_TYPE="${PRISM_GPU_TYPE:-${DEFAULT_GPU_TYPE}}"
+GPU_LANES="${PRISM_GPU_LANES:-${DEFAULT_GPU_LANES}}"
+CPUS_PER_TASK="${PRISM_CPUS_PER_TASK:-${DEFAULT_CPUS_PER_TASK}}"
+HOST_MEMORY="${PRISM_SLURM_MEMORY:-${DEFAULT_HOST_MEMORY}}"
+STEP_MEMORY="${PRISM_STEP_MEMORY:-${DEFAULT_STEP_MEMORY}}"
 GPU_GRES="${PRISM_SLURM_GRES:-gpu:${GPU_TYPE}:${GPU_LANES}}"
 STEP_GRES="${PRISM_SLURM_STEP_GRES:-gpu:${GPU_TYPE}:1}"
 
@@ -63,12 +79,18 @@ if [[ "${COVERAGE_PROFILE}" != paper-breadth \
     && "${COVERAGE_PROFILE}" != regime-map \
     && "${COVERAGE_PROFILE}" != baseline-reproduction \
     && "${COVERAGE_PROFILE}" != baseline-reproduction-cached \
-    && "${COVERAGE_PROFILE}" != glue-slaclip-screen ]]; then
+    && "${COVERAGE_PROFILE}" != glue-slaclip-screen \
+    && "${COVERAGE_PROFILE}" != glue-high-c-refinement ]]; then
   echo "error: unsupported PRISM_COVERAGE_PROFILE" >&2
   exit 2
 fi
 if [[ "${GPU_LANES}" != 1 && "${GPU_LANES}" != 2 ]]; then
   echo "error: PRISM_GPU_LANES must be 1 or 2" >&2
+  exit 2
+fi
+if [[ "${COVERAGE_PROFILE}" == glue-high-c-refinement \
+    && "${GPU_LANES}" != 1 ]]; then
+  echo "error: glue-high-c-refinement requires PRISM_GPU_LANES=1" >&2
   exit 2
 fi
 for numeric in "${CPUS_PER_TASK}"; do
@@ -109,7 +131,8 @@ check_model() {
   }
 }
 check_model google/gemma-3-4b-pt "${MODEL_4B_REVISION}"
-if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen ]]; then
+if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
+    && "${COVERAGE_PROFILE}" != glue-high-c-refinement ]]; then
   check_model google/gemma-2-9b "${MODEL_9B_REVISION}"
 fi
 if [[ "${COVERAGE_PROFILE}" == baseline-reproduction ]]; then

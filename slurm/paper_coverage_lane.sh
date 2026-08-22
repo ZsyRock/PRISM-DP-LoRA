@@ -16,6 +16,7 @@ GLUE_EVAL_ROOT="${8:?missing pinned GLUE evaluation assets}"
 COVERAGE_PROFILE="${9:?missing coverage profile}"
 MODEL_12B_REVISION="${10:?missing Gemma-3-12B revision}"
 EXPECTED_CPUS_PER_TASK="${11:?missing CPUs per task}"
+RUN_REAL_SMOKE="${12:-true}"
 
 PYTHON_BIN="${ENV_PREFIX}/bin/python"
 JOB_ID="${SLURM_JOB_ID:-manual}"
@@ -23,6 +24,11 @@ LANE_TMP="${JOB_TMP_ROOT}/lane-${LANE}"
 LANE_STATUS="${CAMPAIGN_ROOT}/status/lane-${LANE}.txt"
 CURRENT_ARM="bootstrap"
 CURRENT_ARM_STATUS=""
+
+is_focused_glue_profile() {
+  [[ "${COVERAGE_PROFILE}" == glue-slaclip-screen \
+      || "${COVERAGE_PROFILE}" == glue-high-c-refinement ]]
+}
 
 write_lane_status() {
   local state="$1" exit_code="$2" temporary="${LANE_STATUS}.tmp.$$"
@@ -123,7 +129,7 @@ run_training() {
   local adapter_dir="${arm_root}/adapter" result_dir="${arm_root}/results"
   local status_file="${arm_root}/orchestration-status.txt"
   local protocol_stage=final validation_rows=0 validation_interval=0 run_eval=true
-  if [[ "${COVERAGE_PROFILE}" == glue-slaclip-screen ]]; then
+  if is_focused_glue_profile; then
     protocol_stage=selection
     validation_rows=800
     validation_interval=50
@@ -202,7 +208,7 @@ run_training() {
     echo "error: fixed arm unexpectedly includes SlaClip parameters" >&2
     return 2
   fi
-  if [[ "${COVERAGE_PROFILE}" == glue-slaclip-screen ]]; then
+  if is_focused_glue_profile; then
     args+=(--validation_data_is_public)
   fi
   if [[ "${dataset}" == glue8 ]]; then
@@ -225,12 +231,11 @@ run_training() {
     echo "error: arm completed without required artifacts: ${arm_id}" >&2
     return 3
   fi
-  if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
-      && ! -s "${result_dir}/summary.csv" ]]; then
+  if ! is_focused_glue_profile && ! -s "${result_dir}/summary.csv"; then
     echo "error: evaluated arm completed without a summary: ${arm_id}" >&2
     return 3
   fi
-  if [[ "${COVERAGE_PROFILE}" == glue-slaclip-screen ]]; then
+  if is_focused_glue_profile; then
     for validation_artifact in \
       "${result_dir}/validation/split_manifest.json" \
       "${result_dir}/validation/validation_metrics.json" \
@@ -245,12 +250,13 @@ run_training() {
       "${result_dir}/validation/split_manifest.json" \
       "${result_dir}/validation/validation_metrics.json" \
       "${result_dir}/validation/validation_curve.jsonl" \
-      "${arm_id}" <<'PY'
+      "${arm_id}" "${steps}" <<'PY'
 import json
 import math
 import sys
 
-status_path, split_path, metrics_path, curve_path, arm_id = sys.argv[1:]
+status_path, split_path, metrics_path, curve_path, arm_id, planned_steps = sys.argv[1:]
+planned_steps = int(planned_steps)
 status = json.load(open(status_path, encoding="utf-8"))
 split = json.load(open(split_path, encoding="utf-8"))
 metrics = json.load(open(metrics_path, encoding="utf-8"))
@@ -273,7 +279,10 @@ if status.get("validation") != metrics:
 if split.get("manifest_sha256") != metrics.get("manifest_sha256"):
     raise SystemExit(f"{arm_id}: validation manifest mismatch")
 curves = [json.loads(line) for line in open(curve_path, encoding="utf-8") if line.strip()]
-if [row.get("step") for row in curves] != [0, 50, 100, 150]:
+expected_curve_steps = list(range(0, planned_steps + 1, 50))
+if expected_curve_steps[-1] != planned_steps:
+    expected_curve_steps.append(planned_steps)
+if [row.get("step") for row in curves] != expected_curve_steps:
     raise SystemExit(f"{arm_id}: validation curve steps are incomplete")
 if any(
     row.get("run_id") != status.get("run_id")
@@ -315,7 +324,7 @@ run_one_real_smoke() {
     mkdir -p "${root}/adapter" "${root}/results"
     local smoke_stage=pilot smoke_validation_rows=0 smoke_validation_interval=0
     local -a smoke_public_args=()
-    if [[ "${COVERAGE_PROFILE}" == glue-slaclip-screen ]]; then
+    if is_focused_glue_profile; then
       smoke_stage=selection
       smoke_validation_rows=8
       smoke_validation_interval=1
@@ -338,8 +347,7 @@ run_one_real_smoke() {
     if [[ "${method}" == slaclip ]]; then
       args+=(--slaclip_target_non_small_clip_fraction 0.9 --slaclip_eta 0.05 --slaclip_c_min 0.1 --slaclip_c_max 15)
     fi
-    if [[ "${dataset}" == glue8 \
-        && "${COVERAGE_PROFILE}" != glue-slaclip-screen ]]; then
+    if [[ "${dataset}" == glue8 ]] && ! is_focused_glue_profile; then
       args+=(
         --run_eval true --fast_dev_run 2 --eval_batch_size 2 --num_beams 1
         --max_new_tokens 8 --max_input_length 384
@@ -348,7 +356,7 @@ run_one_real_smoke() {
     fi
     "${args[@]}" >"${root}/train-${JOB_ID}.out" 2>"${root}/train-${JOB_ID}.err"
     [[ -s "${root}/adapter/adapter_model.safetensors" ]] || return 3
-    if [[ "${COVERAGE_PROFILE}" == glue-slaclip-screen ]]; then
+    if is_focused_glue_profile; then
       "${PYTHON_BIN}" - "${root}/adapter/run_status.json" \
         "${root}/results/validation/validation_curve.jsonl" <<'PY'
 import json
@@ -372,7 +380,7 @@ PY
 }
 
 run_real_smoke() {
-  if [[ "${COVERAGE_PROFILE}" == glue-slaclip-screen ]]; then
+  if is_focused_glue_profile; then
     run_one_real_smoke \
       glue8 gemma-3-4b-pt google/gemma-3-4b-pt \
       cc012e0a6d0787b4adcc0fa2c4da74402494554d configs/glue8_paper.json
@@ -408,7 +416,12 @@ run_real_smoke() {
 
 CURRENT_ARM="real-model-smoke"
 write_lane_status running 0
-run_real_smoke
+if [[ "${RUN_REAL_SMOKE}" == true ]]; then
+  run_real_smoke
+elif [[ "${RUN_REAL_SMOKE}" != false ]]; then
+  echo "error: RUN_REAL_SMOKE must be true or false" >&2
+  exit 2
+fi
 
 actual="$(awk 'NF {n++} END {print n+0}' "${PLAN}")"
 if (( actual < 1 )); then

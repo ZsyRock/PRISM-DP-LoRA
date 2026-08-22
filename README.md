@@ -242,6 +242,40 @@ This screen is single-seed exploratory evidence, not the journal result. Its
 selected Full SlaClip and tuned-fixed candidates must next be locked and rerun
 for the full 500 updates on fresh paired seeds before official evaluation.
 
+The follow-up `glue-high-c-refinement` profile is a fail-closed two-stage
+boundary refinement for the same GLUE8/Gemma-3-4B/epsilon-6/rank-16 setting.
+It first runs fixed `C in {3,5,7.5,10,15}` for 200 updates with seed 44.  Only
+after all five fixed arms and their `0/50/100/150/200` holdout curves validate
+does the campaign atomically lock the step-200 winner.  The lock derives five
+conditional SlaClip targets from that winner's step-51--200 reference-clipping
+`q10/q25/q50/q75/q90`, clamps them to `[0.20,0.90]`, and rejects the campaign
+unless the resulting values are unique.  Stage 2 then runs five primary Full
+SlaClip arms at the winning `C_0` and `eta=0.02`, plus a central-target
+`eta=0.05` controller-speed control and a central-target half-`C_0` control.
+Both stages use the same deterministic 800-row holdout and run serially inside
+one A100 allocation.  The endpoint loss is primary; normalized full-curve and
+step-100--200 AUCs plus complete clipping/CDF/bias--noise/controller telemetry
+are secondary.  The manifest also pins and revalidates the immutable ten
+primary arms from the preceding screen; its two initial-`C` controls do not
+participate in the refinement decision.
+
+The Stage-2 targets are selected from exact `research_raw` Stage-1 gradient
+statistics on the same training split.  This is explicitly NON-PRIVATE,
+data-dependent calibration: epsilon 6/delta `1e-5` describes each training run
+conditional on its chosen hyperparameters, not an end-to-end privacy guarantee
+for the search procedure.  The target lock and combined telemetry artifacts
+carry the corresponding NON_PRIVATE warning and must not be released as DP
+outputs.
+
+```bash
+PRISM_COVERAGE_PROFILE=glue-high-c-refinement \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+```
+
+This refinement remains a single-seed, short-run selection experiment.  Its
+winner must still be paired against the tuned fixed comparator for 500 updates
+on fresh seeds before a confirmatory or journal-level claim.
+
 For fixed-C baseline reproduction and target-rate calibration, use
 `baseline-reproduction`. It runs the ten distinct DP-PRISM settings obtained
 by deduplicating Tables 2--4: four GLUE8 settings and six Math-10K settings,

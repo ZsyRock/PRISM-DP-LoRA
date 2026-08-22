@@ -116,7 +116,8 @@ export HF_HUB_DISABLE_XET=1
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 mkdir -p "${CAMPAIGN_ROOT}/artifacts" "${CAMPAIGN_ROOT}/plans" \
-  "${CAMPAIGN_ROOT}/preflight" "${CAMPAIGN_ROOT}/smoke" "${STATUS_ROOT}" "${JOB_TMP}"
+  "${CAMPAIGN_ROOT}/preflight" "${CAMPAIGN_ROOT}/selection" \
+  "${CAMPAIGN_ROOT}/smoke" "${STATUS_ROOT}" "${JOB_TMP}"
 
 CURRENT_PHASE=preflight
 write_status running 0
@@ -152,13 +153,30 @@ single_gpu_step() {
     "$@"
 }
 
+verify_plan_sidecar() {
+  local plan="${1:?missing plan path}" sidecar
+  sidecar="${plan}.sha256"
+  if [[ ! -s "${plan}" || ! -s "${sidecar}" ]]; then
+    echo "error: immutable plan or SHA sidecar is missing: ${plan}" >&2
+    return 2
+  fi
+  (
+    cd -- "$(dirname -- "${plan}")"
+    sha256sum --check --status "$(basename -- "${sidecar}")"
+  ) || {
+    echo "error: immutable plan SHA check failed: ${plan}" >&2
+    return 2
+  }
+}
+
 single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
   --dataset glue8 \
   --data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/glue8_1250.json" \
   --expected-data-sha256 281bad3305e8be7a7660b64b22704a9462f983b90df5d6f0c1c4abb649d6d091 \
   --output-root "${CAMPAIGN_ROOT}/preflight/glue8" \
   --require-cuda --model-id google/gemma-3-4b-pt --model-revision "${MODEL_4B_REVISION}"
-if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen ]]; then
+if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
+    && "${COVERAGE_PROFILE}" != glue-high-c-refinement ]]; then
   single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
     --dataset math10k \
     --data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/math_10k.json" \
@@ -190,7 +208,40 @@ write_status running 0
 CURRENT_PHASE=parallel-paper-coverage
 write_status running 0
 LANE_SCRIPT="${REPO_ROOT}/slurm/paper_coverage_lane.sh"
-if [[ "${ALLOCATION_LANES}" == 1 ]]; then
+if [[ "${COVERAGE_PROFILE}" == glue-high-c-refinement ]]; then
+  if [[ "${ALLOCATION_LANES}" != 1 ]]; then
+    echo "error: glue-high-c-refinement requires one sequential GPU lane" >&2
+    exit 2
+  fi
+  CURRENT_PHASE=stage1-high-c-fixed-screen
+  write_status running 0
+  verify_plan_sidecar "${CAMPAIGN_ROOT}/plans/stage1-fixed.tsv"
+  srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
+    --nodes=1 --ntasks=1 --cpus-per-task="${EXPECTED_CPUS_PER_TASK}" \
+    --mem="${STEP_MEMORY}" --gres="${STEP_GRES}" \
+    "${LANE_SCRIPT}" 0 "${CAMPAIGN_ROOT}/plans/stage1-fixed.tsv" "${REPO_ROOT}" \
+    "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
+    "${GLUE_EVAL_ROOT}" "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" \
+    "${EXPECTED_CPUS_PER_TASK}" true
+
+  CURRENT_PHASE=stage1-selection-lock
+  write_status running 0
+  "${PYTHON_BIN}" scripts/build_paper_coverage_campaign.py \
+    lock-high-c-refinement --campaign-root "${CAMPAIGN_ROOT}" \
+    >"${CAMPAIGN_ROOT}/selection/lock-${JOB_ID}.out" \
+    2>"${CAMPAIGN_ROOT}/selection/lock-${JOB_ID}.err"
+
+  CURRENT_PHASE=stage2-derived-full-slaclip-screen
+  write_status running 0
+  verify_plan_sidecar "${CAMPAIGN_ROOT}/plans/stage2-slaclip.tsv"
+  srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
+    --nodes=1 --ntasks=1 --cpus-per-task="${EXPECTED_CPUS_PER_TASK}" \
+    --mem="${STEP_MEMORY}" --gres="${STEP_GRES}" \
+    "${LANE_SCRIPT}" 0 "${CAMPAIGN_ROOT}/plans/stage2-slaclip.tsv" "${REPO_ROOT}" \
+    "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
+    "${GLUE_EVAL_ROOT}" "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" \
+    "${EXPECTED_CPUS_PER_TASK}" false
+elif [[ "${ALLOCATION_LANES}" == 1 ]]; then
   srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
     --nodes=1 --ntasks=1 --cpus-per-task="${EXPECTED_CPUS_PER_TASK}" \
     --mem="${STEP_MEMORY}" --gres="${STEP_GRES}" \
