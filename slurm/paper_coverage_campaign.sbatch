@@ -178,12 +178,19 @@ single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
 if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
     && "${COVERAGE_PROFILE}" != glue-r8-slack-screen ]]; then
+  math_preflight_model=google/gemma-2-9b
+  math_preflight_revision="${MODEL_9B_REVISION}"
+  if [[ "${COVERAGE_PROFILE}" == baseline-gap-fill-cached ]]; then
+    math_preflight_model=google/gemma-3-4b-pt
+    math_preflight_revision="${MODEL_4B_REVISION}"
+  fi
   single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
     --dataset math10k \
     --data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/math_10k.json" \
     --expected-data-sha256 0342d0d860ad8592b579329337c90e42eefd3d9f2898043140cbd120630418b8 \
     --output-root "${CAMPAIGN_ROOT}/preflight/math10k" \
-    --require-cuda --model-id google/gemma-2-9b --model-revision "${MODEL_9B_REVISION}"
+    --require-cuda --model-id "${math_preflight_model}" \
+    --model-revision "${math_preflight_revision}"
 fi
 
 CURRENT_PHASE=synthetic-smoke

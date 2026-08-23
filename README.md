@@ -345,6 +345,35 @@ and coefficients, norm summaries, clipped/unclipped signal, clipping bias,
 realized noise, SNR, bias/noise diagnostics, reference small-gradient mass,
 and privacy accounting for plotting and later target-rate preregistration.
 
+If a 24-hour cached-model run has already completed the first seven settings,
+use `baseline-gap-fill-cached` instead of rerunning them. It contains exactly
+the missing full-length paper-default `C=1`, seed-42 GLUE8/4B/rank-32 and
+Math-10K/4B/rank-32 arms, serially in one allocation. The unavailable 12B row
+remains explicitly excluded.
+
+```bash
+PRISM_COVERAGE_PROFILE=baseline-gap-fill-cached \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=baseline-gap-fill-cached \
+  bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+`scripts/analyze_baseline_landscape.py` combines one or more registered
+campaign manifests into an English CSV/JSON discovery table. It reports every
+registered arm, including incomplete/excluded rows, and recommends a setting
+only when clipping is unsaturated, the trajectory changes materially, the
+small-gradient proxy is distinguishable from expected Slack-release noise,
+and five conditional-rho quantiles remain unique after projection. This step
+consumes exact `NON_PRIVATE` telemetry and is hypothesis generation, not an
+end-to-end DP release or confirmatory result.
+
+```bash
+python scripts/analyze_baseline_landscape.py \
+  --campaign-root "$PRISM_RUN_ROOT/campaigns/<original-baseline-campaign>" \
+  --campaign-root "$PRISM_RUN_ROOT/campaigns/<gap-fill-campaign>" \
+  --output-dir "$PRISM_RUN_ROOT/analysis/<landscape-id>"
+```
+
 The wrapper resolves the account-specific home/scratch paths, pins both model
 revisions and the Git SHA, materializes a content-hashed official GLUE
 validation snapshot before submission, stages immutable source, and runs the

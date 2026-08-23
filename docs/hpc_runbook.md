@@ -353,6 +353,22 @@ supports `--resume-submit` only after a terminally unsuccessful allocation.
 The exact per-step research telemetry is `NON_PRIVATE` even though model
 training follows the configured DP mechanism.
 
+For a timed-out cached paper-baseline campaign whose seven completed arms are
+already retained, submit the two-arm gap fill instead of restarting all nine:
+
+```bash
+PRISM_COVERAGE_PROFILE=baseline-gap-fill-cached \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=baseline-gap-fill-cached \
+  bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+The request defaults to one A100, 80 GiB host RAM, and 24 hours; both arms run
+serially inside that allocation. After completion, pass the original and
+gap-fill campaign roots to `scripts/analyze_baseline_landscape.py`. Its
+eligibility decision and five-rho recommendation are derived only from
+manifest-registered arms and are explicitly NONPRIVATE calibration artifacts.
+
 Useful environment overrides include:
 
 ```text

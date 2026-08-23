@@ -4,6 +4,7 @@ import importlib.util
 import hashlib
 import json
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -157,6 +158,40 @@ def test_cached_baseline_profile_is_explicitly_incomplete() -> None:
     assert all(line.startswith("0|") for line in sequential)
 
 
+def test_cached_baseline_gap_profile_runs_only_two_missing_4b_settings() -> None:
+    manifest = campaign.build_manifest(
+        CODE_SHA, REV_4B, REV_9B, profile="baseline-gap-fill-cached"
+    )
+    arms = manifest["arms"]
+    assert [arm["setting_id"] for arm in arms] == [
+        "glue8-4b-eps6-r32",
+        "math10k-4b-eps6-r32",
+    ]
+    assert [arm["steps"] for arm in arms] == [500, 300]
+    assert all(
+        arm["model_id"] == campaign.MODEL_4B
+        and arm["model_revision"] == REV_4B
+        and arm["method"] == "baseline"
+        and arm["initial_c"] == 1.0
+        and arm["seed"] == 42
+        and arm["eval_limit"] == 0
+        for arm in arms
+    )
+    metadata = manifest["baseline_reproduction"]
+    assert metadata["full_length"] is True
+    assert metadata["covered_settings"] == 2
+    assert metadata["gap_fill"] == {
+        "settings": ["glue8-4b-eps6-r32", "math10k-4b-eps6-r32"],
+        "completed_external_settings": 7,
+        "expected_cached_coverage_after_merge": 9,
+        "merge_requires_hash_validated_external_evidence": True,
+    }
+    assert "12B" in metadata["excluded_setting"]
+    assert len(
+        campaign._plan_bytes(manifest, 0, include_all=True).decode().splitlines()
+    ) == 2
+
+
 def test_glue_slaclip_screen_is_predeclared_and_balanced() -> None:
     paper_config = json.loads((ROOT / "configs" / "glue8_paper.json").read_text())
     assert paper_config["slaclip_target_non_small_clip_fraction"] == 0.5
@@ -307,6 +342,12 @@ def test_glue_r8_slack_screen_predeclares_fresh_seed_two_stage_recipe() -> None:
         0.10, 0.25, 0.50, 0.75, 0.90,
     ]
     assert screen["stage2_recipe"]["rho_bounds"] == [0.05, 0.95]
+    assert "not assumed bounded" in screen["stage2_recipe"][
+        "rho_source_value_domain"
+    ]
+    assert screen["stage2_recipe"]["rho_transform"] == (
+        "compute five raw quantiles, then project each to [0.05,0.95]"
+    )
     assert screen["stage2_recipe"]["primary"] == {
         "arms": 5,
         "initial_C": "stage1_best_fixed_C",
@@ -624,7 +665,7 @@ def _write_high_c_stage1_and_lock(tmp_path: Path) -> dict:
     )
 
 
-def _write_r8_stage1_and_lock(
+def _write_r8_stage1(
     tmp_path: Path, *, boundary_winner: bool = False
 ) -> dict:
     losses = {
@@ -635,16 +676,49 @@ def _write_r8_stage1_and_lock(
         "fixed-c10p0": 0.45,
         "fixed-c15p0": 0.35 if boundary_winner else 0.46,
     }
-    _write_focused_campaign(
+    return _write_focused_campaign(
         tmp_path,
         profile="glue-r8-slack-screen",
         validation_losses=losses,
     )
+
+
+def _write_r8_stage1_and_lock(
+    tmp_path: Path, *, boundary_winner: bool = False
+) -> dict:
+    _write_r8_stage1(tmp_path, boundary_winner=boundary_winner)
     campaign.lock_glue_r8_slack_screen(tmp_path)
     campaign.lock_glue_r8_slack_screen(tmp_path)
     return json.loads(
         (tmp_path / "selection" / "r8_slack_stage1_lock.json").read_text()
     )
+
+
+def _replace_r8_winner_conditional_proxy(
+    tmp_path: Path,
+    manifest: dict,
+    value_for_post_burn_in_index: Callable[[int], float],
+) -> None:
+    winner = next(
+        arm for arm in manifest["arms"] if arm["candidate_id"] == "fixed-c5p0"
+    )
+    raw_path = (
+        tmp_path / winner["relative_root"]
+        / "results" / "research_raw" / "NON_PRIVATE_train_log.jsonl"
+    )
+    records = [json.loads(line) for line in raw_path.read_text().splitlines()]
+    for record in records:
+        step = int(record["step"])
+        if step >= 51:
+            record["raw_reference_conditional_clip_fraction"] = (
+                value_for_post_burn_in_index(step - 51)
+            )
+    raw_text = "".join(json.dumps(record) + "\n" for record in records)
+    raw_path.write_text(raw_text, encoding="utf-8")
+    summary_path = raw_path.with_name("telemetry_summary.json")
+    summary = json.loads(summary_path.read_text())
+    summary["source"]["raw_sha256"] = hashlib.sha256(raw_text.encode()).hexdigest()
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
 
 
 def test_r8_slack_lock_builds_fresh_seed_comparator_and_dynamic_plan(
@@ -688,6 +762,45 @@ def test_r8_slack_lock_builds_fresh_seed_comparator_and_dynamic_plan(
     assert lock["stage2_plan_sha256"] == hashlib.sha256(
         (tmp_path / "plans" / "stage2-slaclip.tsv").read_bytes()
     ).hexdigest()
+
+
+def test_r8_slack_lock_projects_finite_proxy_above_one_after_quantiles(
+    tmp_path: Path,
+) -> None:
+    manifest = _write_r8_stage1(tmp_path)
+    _replace_r8_winner_conditional_proxy(
+        tmp_path,
+        manifest,
+        lambda index: 0.3 + 0.8 * index / 149.0,
+    )
+
+    campaign.lock_glue_r8_slack_screen(tmp_path)
+    lock = json.loads(
+        (tmp_path / "selection" / "r8_slack_stage1_lock.json").read_text()
+    )
+    raw = lock["raw_conditional_clip_proxy_quantiles"]
+    projected = lock["rho_quantiles"]
+    assert raw["q90"] > 1.0
+    assert projected["q90"] == 0.95
+    assert list(projected.values()) == sorted(projected.values())
+    assert len(set(projected.values())) == 5
+
+
+def test_r8_slack_lock_rejects_duplicate_rhos_after_projection(
+    tmp_path: Path,
+) -> None:
+    manifest = _write_r8_stage1(tmp_path)
+    _replace_r8_winner_conditional_proxy(
+        tmp_path,
+        manifest,
+        lambda index: 0.8 + 0.4 * index / 149.0,
+    )
+
+    with pytest.raises(
+        campaign.CampaignError,
+        match="rho grid is not unique after clamping",
+    ):
+        campaign.lock_glue_r8_slack_screen(tmp_path)
 
 
 def test_r8_slack_analyzer_uses_fresh_comparator_and_strict_gate(
@@ -946,9 +1059,11 @@ def test_high_c_lock_rejects_nonunique_clamped_rho_grid(tmp_path: Path) -> None:
         campaign.lock_high_c_refinement(tmp_path)
 
 
-@pytest.mark.parametrize("invalid_fraction", [-0.01, 1.01])
-def test_high_c_lock_rejects_out_of_range_conditional_fraction(
-    tmp_path: Path, invalid_fraction: float
+@pytest.mark.parametrize(
+    "nonfinite_proxy", [float("nan"), float("inf"), float("-inf")]
+)
+def test_high_c_lock_rejects_nonfinite_conditional_proxy(
+    tmp_path: Path, nonfinite_proxy: float
 ) -> None:
     losses = {
         "fixed-c3p0": 0.50,
@@ -970,14 +1085,14 @@ def test_high_c_lock_rejects_out_of_range_conditional_fraction(
         / "results" / "research_raw" / "NON_PRIVATE_train_log.jsonl"
     )
     records = [json.loads(line) for line in raw_path.read_text().splitlines()]
-    records[50]["raw_reference_conditional_clip_fraction"] = invalid_fraction
+    records[50]["raw_reference_conditional_clip_fraction"] = nonfinite_proxy
     raw_text = "".join(json.dumps(record) + "\n" for record in records)
     raw_path.write_text(raw_text, encoding="utf-8")
     summary_path = raw_path.with_name("telemetry_summary.json")
     summary = json.loads(summary_path.read_text())
     summary["source"]["raw_sha256"] = hashlib.sha256(raw_text.encode()).hexdigest()
     summary_path.write_text(json.dumps(summary), encoding="utf-8")
-    with pytest.raises(campaign.CampaignError, match="out-of-range"):
+    with pytest.raises(campaign.CampaignError, match="not finite"):
         campaign.lock_high_c_refinement(tmp_path)
 
 
@@ -1021,6 +1136,7 @@ def test_paper_coverage_shell_contract_uses_queue_friendly_a100_defaults() -> No
     lane = (ROOT / "slurm" / "paper_coverage_lane.sh").read_text()
     assert "glue-high-c-refinement" in wrapper
     assert "glue-r8-slack-screen" in wrapper
+    assert "baseline-gap-fill-cached" in wrapper
     assert "DEFAULT_PARTITION=a100" in wrapper
     assert "DEFAULT_WALLTIME=1-00:00:00" in wrapper
     assert "DEFAULT_GPU_TYPE=a100" in wrapper

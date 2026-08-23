@@ -194,6 +194,20 @@ REGIME_SETTINGS = (
     },
 )
 
+# Job 1402286 completed seven of the nine cached-model paper baselines before
+# its 24-hour allocation expired.  These are the two registered settings that
+# still need full paper-length C=1/seed-42 runs.  Keeping the gap explicit
+# avoids paying again for the seven complete arms and leaves the unavailable
+# gated 12B checkpoint out of the queued job.
+BASELINE_GAP_SETTING_IDS = (
+    "glue8-4b-eps6-r32",
+    "math10k-4b-eps6-r32",
+)
+BASELINE_GAP_SETTINGS = tuple(
+    next(setting for setting in REGIME_SETTINGS if setting["id"] == setting_id)
+    for setting_id in BASELINE_GAP_SETTING_IDS
+)
+
 BASELINE_12B_SETTING = {
     "id": "math10k-12b-eps6-r16",
     "lane": 1,
@@ -828,8 +842,16 @@ def build_manifest(
         screen_steps = GLUE_R8_SLACK_STEPS
         eval_limit = 0
         screen_seed = GLUE_R8_SLACK_STAGE1_SEED
-    elif profile in {"baseline-reproduction", "baseline-reproduction-cached"}:
-        settings = REGIME_SETTINGS
+    elif profile in {
+        "baseline-reproduction",
+        "baseline-reproduction-cached",
+        "baseline-gap-fill-cached",
+    }:
+        settings = (
+            BASELINE_GAP_SETTINGS
+            if profile == "baseline-gap-fill-cached"
+            else REGIME_SETTINGS
+        )
         if profile == "baseline-reproduction":
             if model_12b_revision is None:
                 raise CampaignError("baseline-reproduction requires a pinned 12B revision")
@@ -893,12 +915,24 @@ def build_manifest(
         ),
         "baseline_reproduction": {
             "paper_default_fixed_C": 1.0,
-            "full_length": profile.startswith("baseline-reproduction"),
+            "full_length": profile.startswith("baseline-reproduction")
+            or profile == "baseline-gap-fill-cached",
             "covered_settings": len(settings),
             "paper_total_settings": 10,
             "excluded_setting": (
                 "Math-10K/Gemma-3-12B-pt/epsilon=6/rank=16: gated checkpoint not staged"
-                if profile == "baseline-reproduction-cached" else None
+                if profile in {
+                    "baseline-reproduction-cached", "baseline-gap-fill-cached",
+                } else None
+            ),
+            "gap_fill": (
+                {
+                    "settings": list(BASELINE_GAP_SETTING_IDS),
+                    "completed_external_settings": 7,
+                    "expected_cached_coverage_after_merge": 9,
+                    "merge_requires_hash_validated_external_evidence": True,
+                }
+                if profile == "baseline-gap-fill-cached" else None
             ),
             "purpose": "estimate clipping trajectories and predeclare later SlaClip target grids",
         },
@@ -1031,9 +1065,14 @@ def build_manifest(
                         "winner fixed-C raw_reference_conditional_clip_fraction "
                         "over steps 51 through 200"
                     ),
+                    "rho_source_value_domain": (
+                        "finite real-valued proxy; not assumed bounded to [0,1]"
+                    ),
                     "rho_quantiles": list(GLUE_HIGH_C_RHO_QUANTILES),
                     "rho_bounds": list(GLUE_HIGH_C_RHO_BOUNDS),
-                    "rho_transform": "clamp each quantile to [0.20,0.90]",
+                    "rho_transform": (
+                        "compute five raw quantiles, then project each to [0.20,0.90]"
+                    ),
                     "require_unique_rho_values": True,
                     "primary": {
                         "arms": 5,
@@ -1145,9 +1184,14 @@ def build_manifest(
                         "Stage-1 winner raw_reference_conditional_clip_fraction "
                         "over steps 51 through 200"
                     ),
+                    "rho_source_value_domain": (
+                        "finite real-valued proxy; not assumed bounded to [0,1]"
+                    ),
                     "rho_quantiles": list(GLUE_R8_SLACK_RHO_QUANTILES),
                     "rho_bounds": list(GLUE_R8_SLACK_RHO_BOUNDS),
-                    "rho_transform": "clamp each quantile to [0.05,0.95]",
+                    "rho_transform": (
+                        "compute five raw quantiles, then project each to [0.05,0.95]"
+                    ),
                     "require_unique_rho_values": True,
                     "fresh_fixed_comparator": {
                         "arms": 1,
@@ -2262,17 +2306,15 @@ def lock_high_c_refinement(root: Path) -> None:
             record.get("raw_reference_conditional_clip_fraction"),
             f"{best['arm_id']}:step{step}:conditional_clip_fraction",
         )
-        if not 0.0 <= conditional_value <= 1.0:
-            raise CampaignError(
-                "best fixed arm has out-of-range conditional clipping proxy "
-                f"at step {step}: {conditional_value}"
-            )
         conditional.append(conditional_value)
     rho_min, rho_max = GLUE_HIGH_C_RHO_BOUNDS
     labels = ("q10", "q25", "q50", "q75", "q90")
-    rho_values = [
-        max(rho_min, min(rho_max, _quantile(conditional, fraction)))
+    raw_rho_values = [
+        _quantile(conditional, fraction)
         for fraction in GLUE_HIGH_C_RHO_QUANTILES
+    ]
+    rho_values = [
+        max(rho_min, min(rho_max, value)) for value in raw_rho_values
     ]
     if len({float(value).hex() for value in rho_values}) != 5:
         raise CampaignError(
@@ -2376,6 +2418,10 @@ def lock_high_c_refinement(root: Path) -> None:
         "best_fixed": best,
         "burn_in_steps_excluded": [1, 50],
         "conditional_clip_proxy_records": len(conditional),
+        "raw_conditional_clip_proxy_quantiles": {
+            label: value
+            for label, value in zip(labels, raw_rho_values, strict=True)
+        },
         "rho_quantiles": {
             label: value for label, value in zip(labels, rho_values, strict=True)
         },
@@ -2496,17 +2542,15 @@ def lock_glue_r8_slack_screen(root: Path) -> None:
             record.get("raw_reference_conditional_clip_fraction"),
             f"{best['arm_id']}:step{step}:conditional_clip_fraction",
         )
-        if not 0.0 <= value <= 1.0:
-            raise CampaignError(
-                "rank-8 winner has out-of-range conditional clipping proxy "
-                f"at step {step}: {value}"
-            )
         conditional.append(value)
     labels = ("q10", "q25", "q50", "q75", "q90")
     rho_min, rho_max = GLUE_R8_SLACK_RHO_BOUNDS
-    rho_values = [
-        max(rho_min, min(rho_max, _quantile(conditional, fraction)))
+    raw_rho_values = [
+        _quantile(conditional, fraction)
         for fraction in GLUE_R8_SLACK_RHO_QUANTILES
+    ]
+    rho_values = [
+        max(rho_min, min(rho_max, value)) for value in raw_rho_values
     ]
     if len({float(value).hex() for value in rho_values}) != 5:
         raise CampaignError(
@@ -2647,6 +2691,10 @@ def lock_glue_r8_slack_screen(root: Path) -> None:
         ),
         "burn_in_steps_excluded": [1, 50],
         "conditional_clip_proxy_records": len(conditional),
+        "raw_conditional_clip_proxy_quantiles": {
+            label: value
+            for label, value in zip(labels, raw_rho_values, strict=True)
+        },
         "rho_quantiles": {
             label: value for label, value in zip(labels, rho_values, strict=True)
         },
@@ -3524,7 +3572,8 @@ def parser() -> argparse.ArgumentParser:
         "--profile",
         choices=(
             "paper-breadth", "regime-map", "baseline-reproduction",
-            "baseline-reproduction-cached", "glue-slaclip-screen",
+            "baseline-reproduction-cached", "baseline-gap-fill-cached",
+            "glue-slaclip-screen",
             "glue-high-c-refinement", "glue-r8-slack-screen",
         ),
         default="paper-breadth",
