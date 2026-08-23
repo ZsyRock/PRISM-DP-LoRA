@@ -78,7 +78,8 @@ if [[ "${COVERAGE_PROFILE}" != paper-breadth \
     && "${COVERAGE_PROFILE}" != baseline-reproduction \
     && "${COVERAGE_PROFILE}" != baseline-reproduction-cached \
     && "${COVERAGE_PROFILE}" != glue-slaclip-screen \
-    && "${COVERAGE_PROFILE}" != glue-high-c-refinement ]]; then
+    && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
+    && "${COVERAGE_PROFILE}" != glue-r8-slack-screen ]]; then
   echo "error: unsupported PRISM_COVERAGE_PROFILE" >&2
   exit 2
 fi
@@ -86,9 +87,10 @@ if [[ "${GPU_LANES}" != 1 && "${GPU_LANES}" != 2 ]]; then
   echo "error: PRISM_GPU_LANES must be 1 or 2" >&2
   exit 2
 fi
-if [[ "${COVERAGE_PROFILE}" == glue-high-c-refinement \
+if [[ ( "${COVERAGE_PROFILE}" == glue-high-c-refinement \
+      || "${COVERAGE_PROFILE}" == glue-r8-slack-screen ) \
     && "${GPU_LANES}" != 1 ]]; then
-  echo "error: glue-high-c-refinement requires PRISM_GPU_LANES=1" >&2
+  echo "error: ${COVERAGE_PROFILE} requires PRISM_GPU_LANES=1" >&2
   exit 2
 fi
 for numeric in "${CPUS_PER_TASK}"; do
@@ -130,7 +132,8 @@ check_model() {
 }
 check_model google/gemma-3-4b-pt "${MODEL_4B_REVISION}"
 if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
-    && "${COVERAGE_PROFILE}" != glue-high-c-refinement ]]; then
+    && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
+    && "${COVERAGE_PROFILE}" != glue-r8-slack-screen ]]; then
   check_model google/gemma-2-9b "${MODEL_9B_REVISION}"
 fi
 if [[ "${COVERAGE_PROFILE}" == baseline-reproduction ]]; then

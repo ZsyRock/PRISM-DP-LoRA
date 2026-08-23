@@ -278,6 +278,59 @@ def test_glue_high_c_refinement_predeclares_dynamic_two_stage_recipe() -> None:
     assert len(plan) == 5 and all(line.startswith("0|") for line in plan)
 
 
+def test_glue_r8_slack_screen_predeclares_fresh_seed_two_stage_recipe() -> None:
+    manifest = campaign.build_manifest(
+        CODE_SHA, REV_4B, REV_9B, profile="glue-r8-slack-screen"
+    )
+    arms = manifest["arms"]
+    assert len(arms) == 6
+    assert manifest["seed"] == 45
+    assert manifest["inference_class"].startswith("two_seed_exploratory")
+    assert {arm["setting_id"] for arm in arms} == {"glue8-4b-eps6-r8"}
+    assert {arm["lora_r"] for arm in arms} == {8}
+    assert {arm["initial_c"] for arm in arms} == {
+        0.5, 1.0, 2.0, 5.0, 10.0, 15.0,
+    }
+    assert all(
+        arm["method"] == "baseline"
+        and arm["role"] == "slack_fixed_candidate"
+        and arm["stage"] == 1
+        and arm["seed"] == 45
+        and arm["steps"] == 200
+        and arm["lane"] == 0
+        for arm in arms
+    )
+    screen = manifest["glue_r8_slack_screen"]
+    assert screen["stage2_recipe"]["seed"] == 46
+    assert screen["stage2_recipe"]["fresh_relative_to_stage1"] is True
+    assert screen["stage2_recipe"]["rho_quantiles"] == [
+        0.10, 0.25, 0.50, 0.75, 0.90,
+    ]
+    assert screen["stage2_recipe"]["rho_bounds"] == [0.05, 0.95]
+    assert screen["stage2_recipe"]["primary"] == {
+        "arms": 5,
+        "initial_C": "stage1_best_fixed_C",
+        "eta": 0.02,
+    }
+    assert screen["primary_gate"] == {
+        "endpoint": "best_slaclip_strictly_lower_than_fresh_fixed",
+        "full_auc": "best_slaclip_not_higher_than_fresh_fixed",
+        "late_auc": "best_slaclip_not_higher_than_fresh_fixed",
+        "boundary_block": "stage1_best_fixed_C_at_grid_boundary",
+    }
+    assert screen["motivation_sources"]["rank16_negative_decision"]["job_id"] == (
+        "1413408"
+    )
+    baseline = screen["motivation_sources"]["rank8_complete_baseline"]
+    assert baseline["job_id"] == "1402286"
+    assert baseline["parent_job_terminal_state"] == "TIMEOUT"
+    assert baseline["raw_records"] == 500
+    assert baseline["official_glue_validation_average"] == pytest.approx(
+        0.7662401098508378
+    )
+    assert len(campaign._plan_bytes(manifest, 0, include_all=True).splitlines()) == 6
+
+
 def _write_focused_campaign(
     root_path: Path,
     *,
@@ -571,6 +624,162 @@ def _write_high_c_stage1_and_lock(tmp_path: Path) -> dict:
     )
 
 
+def _write_r8_stage1_and_lock(
+    tmp_path: Path, *, boundary_winner: bool = False
+) -> dict:
+    losses = {
+        "fixed-c0p5": 0.60,
+        "fixed-c1p0": 0.55,
+        "fixed-c2p0": 0.50,
+        "fixed-c5p0": 0.40,
+        "fixed-c10p0": 0.45,
+        "fixed-c15p0": 0.35 if boundary_winner else 0.46,
+    }
+    _write_focused_campaign(
+        tmp_path,
+        profile="glue-r8-slack-screen",
+        validation_losses=losses,
+    )
+    campaign.lock_glue_r8_slack_screen(tmp_path)
+    campaign.lock_glue_r8_slack_screen(tmp_path)
+    return json.loads(
+        (tmp_path / "selection" / "r8_slack_stage1_lock.json").read_text()
+    )
+
+
+def test_r8_slack_lock_builds_fresh_seed_comparator_and_dynamic_plan(
+    tmp_path: Path,
+) -> None:
+    lock = _write_r8_stage1_and_lock(tmp_path)
+    assert lock["best_fixed"]["candidate_id"] == "fixed-c5p0"
+    assert lock["best_fixed"]["fixed_C"] == 5.0
+    assert lock["stage1_seed"] == 45
+    assert lock["stage2_seed"] == 46
+    assert lock["stage2_seed_is_fresh"] is True
+    assert lock["conditional_clip_proxy_records"] == 150
+    assert lock["stage1_fixed_winner_at_search_boundary"] is False
+    assert lock["stage1_fixed_winner_at_grid_min"] is False
+    assert lock["stage1_fixed_winner_at_grid_max"] is False
+    assert lock["stage1_boundary_warning"] is None
+    rhos = list(lock["rho_quantiles"].values())
+    assert rhos == sorted(rhos) and len(set(rhos)) == 5
+    assert all(0.05 <= rho <= 0.95 for rho in rhos)
+    arms = lock["stage2_arms"]
+    fresh = [arm for arm in arms if arm["role"] == "fresh_fixed_comparator"]
+    primary = [arm for arm in arms if arm["role"] == "slaclip_target_candidate"]
+    controls = [
+        arm for arm in arms
+        if arm["role"] in {
+            "controller_speed_control", "initial_C_sensitivity_control",
+        }
+    ]
+    assert len(fresh) == 1 and len(primary) == 5 and len(controls) == 2
+    assert fresh[0]["method"] == "baseline"
+    assert fresh[0]["initial_c"] == 5.0
+    assert fresh[0]["seed"] == 46
+    assert all(
+        arm["method"] == "slaclip"
+        and arm["initial_c"] == 5.0
+        and arm["eta"] == 0.02
+        and arm["seed"] == 46
+        for arm in primary
+    )
+    assert len((tmp_path / "plans" / "stage2-slaclip.tsv").read_text().splitlines()) == 8
+    assert lock["stage2_plan_sha256"] == hashlib.sha256(
+        (tmp_path / "plans" / "stage2-slaclip.tsv").read_bytes()
+    ).hexdigest()
+
+
+def test_r8_slack_analyzer_uses_fresh_comparator_and_strict_gate(
+    tmp_path: Path,
+) -> None:
+    lock = _write_r8_stage1_and_lock(tmp_path)
+    stage2_losses = {
+        arm["candidate_id"]: 0.42 + index / 100.0
+        for index, arm in enumerate(lock["stage2_arms"])
+    }
+    fresh = next(
+        arm for arm in lock["stage2_arms"]
+        if arm["role"] == "fresh_fixed_comparator"
+    )
+    best = next(
+        arm for arm in lock["stage2_arms"]
+        if arm["candidate_id"] == "full-sla-q10-eta002"
+    )
+    stage2_losses[fresh["candidate_id"]] = 0.40
+    stage2_losses[best["candidate_id"]] = 0.35
+    _write_focused_campaign(
+        tmp_path,
+        profile="glue-r8-slack-screen",
+        validation_losses=stage2_losses,
+        arms_override=lock["stage2_arms"],
+        index_offset=100,
+    )
+    campaign.analyze(tmp_path)
+    ranking = json.loads(
+        (tmp_path / "artifacts" / "glue_r8_slack_screen_ranking.json").read_text()
+    )
+    assert ranking["stage1_best_fixed"]["candidate"] == "fixed-c5p0"
+    assert ranking["fresh_fixed"]["candidate"] == fresh["candidate_id"]
+    assert ranking["best_slaclip"]["candidate"] == best["candidate_id"]
+    assert ranking["best_slaclip"]["delta_vs_setting_best_fixed"] == pytest.approx(
+        0.05
+    )
+    assert ranking["primary_gate"] == {
+        "endpoint_strictly_lower": True,
+        "full_auc_not_worse": True,
+        "late_auc_not_worse": True,
+        "performance_gate_passed": True,
+        "boundary_blocked": False,
+        "confirmation_allowed": True,
+        "block_reasons": [],
+    }
+    assert len(ranking["arm_artifact_sha256"]) == 14
+    assert len(
+        (tmp_path / "artifacts" / "baseline_telemetry_steps.csv")
+        .read_text().splitlines()
+    ) == 1 + 14 * 200
+
+
+def test_r8_slack_boundary_winner_blocks_later_confirmation(
+    tmp_path: Path,
+) -> None:
+    lock = _write_r8_stage1_and_lock(tmp_path, boundary_winner=True)
+    assert lock["best_fixed"]["fixed_C"] == 15.0
+    assert lock["stage1_fixed_winner_at_search_boundary"] is True
+    assert lock["stage1_fixed_winner_at_grid_min"] is False
+    assert lock["stage1_fixed_winner_at_grid_max"] is True
+    stage2_losses = {
+        arm["candidate_id"]: 0.42 + index / 100.0
+        for index, arm in enumerate(lock["stage2_arms"])
+    }
+    fresh = next(
+        arm for arm in lock["stage2_arms"]
+        if arm["role"] == "fresh_fixed_comparator"
+    )
+    best = next(
+        arm for arm in lock["stage2_arms"]
+        if arm["candidate_id"] == "full-sla-q10-eta002"
+    )
+    stage2_losses[fresh["candidate_id"]] = 0.40
+    stage2_losses[best["candidate_id"]] = 0.35
+    _write_focused_campaign(
+        tmp_path,
+        profile="glue-r8-slack-screen",
+        validation_losses=stage2_losses,
+        arms_override=lock["stage2_arms"],
+        index_offset=100,
+    )
+    campaign.analyze(tmp_path)
+    gate = json.loads(
+        (tmp_path / "artifacts" / "glue_r8_slack_screen_ranking.json").read_text()
+    )["primary_gate"]
+    assert gate["performance_gate_passed"] is True
+    assert gate["boundary_blocked"] is True
+    assert gate["confirmation_allowed"] is False
+    assert gate["block_reasons"] == ["stage1_fixed_winner_at_search_boundary"]
+
+
 def test_high_c_stage1_lock_derives_unique_stage2_plan(tmp_path: Path) -> None:
     lock = _write_high_c_stage1_and_lock(tmp_path)
     assert lock["best_fixed"]["candidate_id"] == "fixed-c10p0"
@@ -811,6 +1020,7 @@ def test_paper_coverage_shell_contract_uses_queue_friendly_a100_defaults() -> No
     worker = (ROOT / "slurm" / "paper_coverage_campaign.sbatch").read_text()
     lane = (ROOT / "slurm" / "paper_coverage_lane.sh").read_text()
     assert "glue-high-c-refinement" in wrapper
+    assert "glue-r8-slack-screen" in wrapper
     assert "DEFAULT_PARTITION=a100" in wrapper
     assert "DEFAULT_WALLTIME=1-00:00:00" in wrapper
     assert "DEFAULT_GPU_TYPE=a100" in wrapper
@@ -827,6 +1037,7 @@ def test_paper_coverage_shell_contract_uses_queue_friendly_a100_defaults() -> No
     assert "requires PRISM_GPU_LANES=1" in wrapper
     assert "stage1-high-c-fixed-screen" in worker
     assert "lock-high-c-refinement" in worker
+    assert "lock-r8-slack-screen" in worker
     assert "stage2-derived-full-slaclip-screen" in worker
     assert "stage1-fixed.tsv" in worker and "stage2-slaclip.tsv" in worker
     assert worker.count("verify_plan_sidecar") >= 3

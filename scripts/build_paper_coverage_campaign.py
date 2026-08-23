@@ -7,7 +7,9 @@ the paper's available dataset, privacy, rank, and 4B/9B axes; and
 ``glue-slaclip-screen`` focuses on the first baseline setting whose fixed-C
 trajectory exhibited non-saturated clipping and measurable slack.
 ``glue-high-c-refinement`` then performs a dynamically locked fixed-C boundary
-scan and conditional-target refinement.  All arms run inside one immutable
+scan and conditional-target refinement.  ``glue-r8-slack-screen`` moves to the
+paper's rank-8 GLUE setting, locks two completed source campaigns, and uses a
+fresh-seed Stage-2 comparator after a dynamic fixed-C selection.  All arms run inside one immutable
 one- or two-lane Slurm allocation, and measured clipping strata are reported
 without pretending they are pre-established SlaClip failure thresholds.
 """
@@ -297,6 +299,14 @@ GLUE_HIGH_C_RHO_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
 GLUE_HIGH_C_RHO_BOUNDS = (0.20, 0.90)
 GLUE_HIGH_C_PRIMARY_ETA = 0.02
 GLUE_HIGH_C_FAST_ETA = 0.05
+GLUE_R8_SLACK_STAGE1_SEED = 45
+GLUE_R8_SLACK_STAGE2_SEED = 46
+GLUE_R8_SLACK_STEPS = 200
+GLUE_R8_SLACK_FIXED_GRID = (0.5, 1.0, 2.0, 5.0, 10.0, 15.0)
+GLUE_R8_SLACK_RHO_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
+GLUE_R8_SLACK_RHO_BOUNDS = (0.05, 0.95)
+GLUE_R8_SLACK_PRIMARY_ETA = 0.02
+GLUE_R8_SLACK_FAST_ETA = 0.05
 GLUE_SLACLIP_VALIDATION_SEED = 1729
 GLUE_SLACLIP_VALIDATION_ROWS = 800
 GLUE_SLACLIP_VALIDATION_INDICES_SHA256 = (
@@ -362,6 +372,105 @@ GLUE_HIGH_C_FIXED_CANDIDATES = tuple(
     }
     for value in GLUE_HIGH_C_FIXED_GRID
 )
+
+GLUE_R8_SLACK_SETTING = next(
+    setting for setting in REGIME_SETTINGS
+    if setting["id"] == "glue8-4b-eps6-r8"
+)
+GLUE_R8_SLACK_FIXED_CANDIDATES = tuple(
+    {
+        "id": f"fixed-c{_candidate_id_value(value)}",
+        "method": "baseline",
+        "initial_c": value,
+        "rho": None,
+        "eta": None,
+        "role": "slack_fixed_candidate",
+        "stage": 1,
+        "lane": 0,
+    }
+    for value in GLUE_R8_SLACK_FIXED_GRID
+)
+
+# Job 1413408 is the immutable negative decision source for leaving the
+# rank-16/high-C branch.  Hash both the plan/selection chain and the final
+# ranking so a later source edit cannot silently change this decision.
+GLUE_R8_NEGATIVE_DECISION_SOURCE = {
+    "campaign_id": "paper-coverage-74b74a88f044-glue-high-c-refinement-v2",
+    "job_id": "1413408",
+    "code_sha": "74b74a88f044fcab75124faabd26ee559c94782a",
+    "profile": "glue-high-c-refinement",
+    "artifact_sha256": {
+        "submission_receipt.json": "9d4d7216664ca4d6c3cbeb488f2713b4266c4dfd178e940a6265bbee72f2a568",
+        "plans/manifest.json": "10e3ab0455f5dcae4f43e2b16de6f68654c35bb174fa3f0aed8ba9aacd25cc56",
+        "selection/high_c_stage1_lock.json": "44bd90947d62e4fb5c54317d7662654e6ecfb50f5d08adb346592d510ca55ac6",
+        "plans/stage2-slaclip.tsv": "76f417c8ec967e1cf67624bb725d15eed7cbfd0bf96526a551eab322eaf3b57b",
+        "artifacts/glue_high_c_refinement_ranking.json": "4f46b5fd11531705124784ef0ca8850103c0e7e699d140ccea64f690c9a470a4",
+        "artifacts/paper_coverage_summary.csv": "bd444a1d370d62ed05cd0be15ecf5aaad0b6082b09474477a484ddd58d9a983b",
+        "status/job-1413408.txt": "ea60b83c06f2df8a66024c2c31e30ae343618d1f66edc33571826ed7c9448cc0",
+    },
+    "stage1_lock_sha256": "44bd90947d62e4fb5c54317d7662654e6ecfb50f5d08adb346592d510ca55ac6",
+    "stage2_plan_sha256": "76f417c8ec967e1cf67624bb725d15eed7cbfd0bf96526a551eab322eaf3b57b",
+    "expected_best_fixed": "fixed-c15p0",
+    "expected_best_fixed_loss": 0.28900413651950657,
+    "expected_best_slaclip": "full-sla-q10-eta002",
+    "expected_best_slaclip_loss": 0.2973122682981193,
+}
+
+# The completed rank-8 arm is usable even though its nine-arm parent campaign
+# later timed out: the arm has a completed 500-step status, complete exact
+# telemetry, and all pinned official GLUE-validation outputs.  The parent job
+# state is deliberately not required to be COMPLETED.
+GLUE_R8_BASELINE_SOURCE = {
+    "campaign_id": "paper-coverage-8495ac8f0c07-baseline-reproduction-cached-v2",
+    "relative_arm_root": "runs/glue8-4b-eps6-r8/fixed-c1-paper-default/seed-42",
+    "job_id": "1402286",
+    "parent_job_terminal_state": "TIMEOUT",
+    "code_sha": "8495ac8f0c07addf910d8f3a2e7eec6a88884a92",
+    "run_id": "paper-coverage-glue8-4b-eps6-r8-baseline-seed42_C1_47550ae8cf",
+    "config_fingerprint": "47550ae8cf0d88c6cc39f4cfb3fb71771032849140139c2ef11e17378ab8840d",
+    "data_sha256": "281bad3305e8be7a7660b64b22704a9462f983b90df5d6f0c1c4abb649d6d091",
+    "model_id": MODEL_4B,
+    "model_revision": "cc012e0a6d0787b4adcc0fa2c4da74402494554d",
+    "raw_records": 500,
+    "artifact_sha256": {
+        "submission_receipt.json": "3f299a6fb8094e69c53d5a24a435b8d6299e83fc9542732cb5c7df9b33659fdd",
+        "plans/manifest.json": "933507b20afbe734f88addee33c710d3bc1834e3816a955e75d59bfc726ef664",
+        "adapter/run_status.json": "2034563a132b334fcca293729a9cc42b3949c2cb54b8b9caf5306bb4e5efd99a",
+        "adapter/adapter_model.safetensors": "9d68d92b22f029612c9c4855c2cd79b683b723d2a11c6e17e2e0fb4dd6a397b9",
+        "results/run_status.json": "17c84326301a01b24f8f77e5a4c2defcfa73aa1a414cebda23cbd22814c839a5",
+        "results/research_raw/NON_PRIVATE_train_log.jsonl": "5141126a0cff0e4865b53bf5ce8b27a49dc7810dede68de8f228cd0ddf3fb179",
+        "results/research_raw/telemetry_steps.csv": "837911bb231c1ccb3f5c10254611811496873d8b8ac69faa8301c2706029e708",
+        "results/research_raw/telemetry_summary.json": "ab48ea38ed3cf6d1e599e07a5f5004787ba62f19341c90141de36fa291a8e864",
+        "results/validation/split_manifest.json": "e10042a93c76f0534b9501e62e6ef3c80d93e0a7465efcb0c365febcfa5dc07d",
+        "results/evaluation_config.json": "2f6a7aa27586eeb30b2cf79088315c067f254a57c0d5b4c9d7fed4e9b72d9f4c",
+        "results/summary.csv": "15e74572136fb963f439c774f4812a013a0710ad53024f5250da5bdff73753b0",
+        "results/details.csv": "d495649c4ebe9b11a31998fec0b4c6fe2df276773416404d63c5ae3ba604759b",
+        "results/cola.json": "5cc4066bff69ae26ad90a1b0cde4f01ecbdd1ef9f31160d3e2fb75491cf798ed",
+        "results/sst2.json": "a1dbf4639fdd953a55afb44d80d8027cd38cd26c0cadd46ecc081288e68565d9",
+        "results/mrpc.json": "184f737a8e5617b331408c098d3e793bb654811bdd9bfa734a1e9fea7df32462",
+        "results/stsb.json": "8492cb19e29bf55bebd522a8159f3f0655e05a85f9140c86a4e14be63d1b112d",
+        "results/qqp.json": "dcec0f103d91afc1a4bc2d9a8ddbc9b74bd0a8854049a6476a6de912349883a1",
+        "results/mnli.json": "4cf206bf3b53e0b51a61f8041576ef2a82fab49fd1b64a611b7f6548e9c0b69c",
+        "results/qnli.json": "81aa504f336ee0b8ec01139d930cd964e1abd8cdfd233140e0b36d7dda31eb2c",
+        "results/rte.json": "c1694ef9744d343bd59d331607e35cd13921fdd846fd14ca18289ee39755b9cb",
+        "orchestration-status.txt": "c8428b8682b9e47f382934c0ce716120e632bb3892f8b2f77f41412f4871a5b9",
+    },
+    "post_burn_in_records": 450,
+    "post_burn_in_clip_fraction_mean": 0.48935359997850886,
+    "post_burn_in_clip_fraction_median": 0.4909090909090909,
+    "post_burn_in_small_gradient_proxy_mean": 0.2137261623205744,
+    "post_burn_in_small_gradient_proxy_median": 0.21058819990851185,
+    "post_burn_in_conditional_clip_fraction_quantiles": {
+        "q10": 0.5221464409097681,
+        "q25": 0.5652740332850836,
+        "q50": 0.6218267282148673,
+        "q75": 0.6790500711141583,
+        "q90": 0.731064119780448,
+    },
+    "official_glue_validation_average": 0.7662401098508378,
+    "official_glue_dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+    "official_glue_content_sha256": "6cedcb0bc71ed180ed50468406f3295a28ace450f0ae8f970abdcc77616af9ef",
+}
 
 # Job 1411662's five fixed and five primary Full-SlaClip arms were complete
 # before its two C0 controls.  Those ten completed arms are sufficient to
@@ -713,6 +822,12 @@ def build_manifest(
         screen_steps = GLUE_HIGH_C_REFINEMENT_STEPS
         eval_limit = 0
         screen_seed = GLUE_HIGH_C_REFINEMENT_SEED
+    elif profile == "glue-r8-slack-screen":
+        settings = (GLUE_R8_SLACK_SETTING,)
+        candidates = GLUE_R8_SLACK_FIXED_CANDIDATES
+        screen_steps = GLUE_R8_SLACK_STEPS
+        eval_limit = 0
+        screen_seed = GLUE_R8_SLACK_STAGE1_SEED
     elif profile in {"baseline-reproduction", "baseline-reproduction-cached"}:
         settings = REGIME_SETTINGS
         if profile == "baseline-reproduction":
@@ -751,7 +866,11 @@ def build_manifest(
         "schema_version": SCHEMA_VERSION,
         "protocol": f"prism_paper_coverage_{profile.replace('-', '_')}_v2",
         "profile": profile,
-        "inference_class": "single_seed_exploratory_breadth_screen_requires_fresh_seed_confirmation",
+        "inference_class": (
+            "two_seed_exploratory_screen_requires_multi_seed_full_length_confirmation"
+            if profile == "glue-r8-slack-screen"
+            else "single_seed_exploratory_breadth_screen_requires_fresh_seed_confirmation"
+        ),
         "code_sha": code_sha,
         "seed": screen_seed,
         "privacy": {"delta": 1e-5, "accountant": "prv", "secure_mode": False},
@@ -765,7 +884,10 @@ def build_manifest(
             "The focused GLUE screen uses only a fixed public training holdout and does "
             "not run official task evaluation. Any promising setting must be repeated "
             "at full length on fresh seeds with a locked tuned-fixed comparator."
-            if profile in {"glue-slaclip-screen", "glue-high-c-refinement"}
+            if profile in {
+                "glue-slaclip-screen", "glue-high-c-refinement",
+                "glue-r8-slack-screen",
+            }
             else "Task-test metrics are descriptive only. Any promising setting must be "
             "repeated on fresh seeds with a locked tuned-fixed comparator."
         ),
@@ -782,7 +904,8 @@ def build_manifest(
         },
         "regime_map": {
             "exploratory": profile in {
-                "regime-map", "glue-slaclip-screen", "glue-high-c-refinement"
+                "regime-map", "glue-slaclip-screen", "glue-high-c-refinement",
+                "glue-r8-slack-screen",
             },
             "screen_steps": screen_steps,
             "per_task_eval_limit": eval_limit,
@@ -791,6 +914,8 @@ def build_manifest(
                 if profile == "glue-slaclip-screen"
                 else list(GLUE_HIGH_C_FIXED_GRID)
                 if profile == "glue-high-c-refinement"
+                else list(GLUE_R8_SLACK_FIXED_GRID)
+                if profile == "glue-r8-slack-screen"
                 else [0.5, 1.0, 2.0, 3.0, 5.0]
                 if profile == "regime-map"
                 else [1.0]
@@ -799,7 +924,7 @@ def build_manifest(
                 list(GLUE_SLACLIP_RHO_GRID)
                 if profile == "glue-slaclip-screen"
                 else "derived_from_stage1_q10_q25_q50_q75_q90"
-                if profile == "glue-high-c-refinement"
+                if profile in {"glue-high-c-refinement", "glue-r8-slack-screen"}
                 else [0.5, 0.7, 0.8, 0.9, 0.98]
                 if profile == "regime-map"
                 else [0.9, 0.98]
@@ -813,13 +938,22 @@ def build_manifest(
                     "eta": GLUE_HIGH_C_PRIMARY_ETA,
                 }
                 if profile == "glue-high-c-refinement"
+                else {
+                    "C_0": "max(0.1,stage1_best_fixed_C/2)",
+                    "rho": "stage1_q50",
+                    "eta": GLUE_R8_SLACK_PRIMARY_ETA,
+                }
+                if profile == "glue-r8-slack-screen"
                 else {"C_0": 2.0, "rho": 0.9, "eta": 0.05}
                 if profile == "regime-map"
                 else None
             ),
             "interpretation": (
-                "descriptive one-seed screen; clipping-rate bins are measured outcomes, "
-                "not predeclared failure thresholds or confirmatory evidence"
+                "descriptive two-seed staged screen; clipping-rate bins are measured "
+                "outcomes, not predeclared failure thresholds or confirmatory evidence"
+                if profile == "glue-r8-slack-screen"
+                else "descriptive one-seed screen; clipping-rate bins are measured "
+                "outcomes, not predeclared failure thresholds or confirmatory evidence"
             ),
         },
         "glue_slaclip_screen": {
@@ -974,6 +1108,125 @@ def build_manifest(
                 if profile == "glue-high-c-refinement" else None
             ),
         },
+        "glue_r8_slack_screen": {
+            "enabled": profile == "glue-r8-slack-screen",
+            "motivation_sources": (
+                {
+                    "rank16_negative_decision": GLUE_R8_NEGATIVE_DECISION_SOURCE,
+                    "rank8_complete_baseline": GLUE_R8_BASELINE_SOURCE,
+                }
+                if profile == "glue-r8-slack-screen" else None
+            ),
+            "stage1": (
+                {
+                    "seed": GLUE_R8_SLACK_STAGE1_SEED,
+                    "steps": GLUE_R8_SLACK_STEPS,
+                    "fixed_C_grid": list(GLUE_R8_SLACK_FIXED_GRID),
+                    "burn_in_rule": (
+                        "exclude steps 1 through 50; summarize steps 51 through 200"
+                    ),
+                    "winner_rule": (
+                        "ascending step-200 public-holdout response-only per-record "
+                        "loss, then ascending C, then candidate id"
+                    ),
+                    "boundary_rule": (
+                        "record a warning and block later confirmation when either "
+                        "fixed-C grid boundary wins; "
+                        "do not abort this two-stage screen"
+                    ),
+                }
+                if profile == "glue-r8-slack-screen" else None
+            ),
+            "stage2_recipe": (
+                {
+                    "seed": GLUE_R8_SLACK_STAGE2_SEED,
+                    "fresh_relative_to_stage1": True,
+                    "rho_source": (
+                        "Stage-1 winner raw_reference_conditional_clip_fraction "
+                        "over steps 51 through 200"
+                    ),
+                    "rho_quantiles": list(GLUE_R8_SLACK_RHO_QUANTILES),
+                    "rho_bounds": list(GLUE_R8_SLACK_RHO_BOUNDS),
+                    "rho_transform": "clamp each quantile to [0.05,0.95]",
+                    "require_unique_rho_values": True,
+                    "fresh_fixed_comparator": {
+                        "arms": 1,
+                        "C": "stage1_best_fixed_C",
+                    },
+                    "primary": {
+                        "arms": 5,
+                        "initial_C": "stage1_best_fixed_C",
+                        "eta": GLUE_R8_SLACK_PRIMARY_ETA,
+                    },
+                    "controls": [
+                        {
+                            "role": "controller_speed_control",
+                            "rho": "q50",
+                            "initial_C": "stage1_best_fixed_C",
+                            "eta": GLUE_R8_SLACK_FAST_ETA,
+                        },
+                        {
+                            "role": "initial_C_sensitivity_control",
+                            "rho": "q50",
+                            "initial_C": "max(0.1,stage1_best_fixed_C/2)",
+                            "eta": GLUE_R8_SLACK_PRIMARY_ETA,
+                        },
+                    ],
+                }
+                if profile == "glue-r8-slack-screen" else None
+            ),
+            "selection": (
+                {
+                    "public_holdout_rows": GLUE_SLACLIP_VALIDATION_ROWS,
+                    "public_holdout_seed": GLUE_SLACLIP_VALIDATION_SEED,
+                    "public_holdout_indices_sha256": (
+                        GLUE_SLACLIP_VALIDATION_INDICES_SHA256
+                    ),
+                    "public_holdout_records_sha256": (
+                        GLUE_SLACLIP_VALIDATION_RECORDS_SHA256
+                    ),
+                    "validation_curve_steps": [0, 50, 100, 150, 200],
+                    "primary_metric": "step_200_response_only_mean_per_record_loss",
+                    "secondary_metrics": [
+                        "full_normalized_validation_loss_auc",
+                        "late_window_normalized_validation_loss_auc_steps_100_to_200",
+                    ],
+                    "official_task_evaluation": False,
+                }
+                if profile == "glue-r8-slack-screen" else None
+            ),
+            "primary_gate": (
+                {
+                    "endpoint": "best_slaclip_strictly_lower_than_fresh_fixed",
+                    "full_auc": "best_slaclip_not_higher_than_fresh_fixed",
+                    "late_auc": "best_slaclip_not_higher_than_fresh_fixed",
+                    "boundary_block": "stage1_best_fixed_C_at_grid_boundary",
+                }
+                if profile == "glue-r8-slack-screen" else None
+            ),
+            "privacy_scope": (
+                {
+                    "target_selection": (
+                        "NON_PRIVATE data-dependent calibration from exact Stage-1 "
+                        "per-record gradient telemetry"
+                    ),
+                    "per_run_accounting": (
+                        "epsilon=6, delta=1e-5 for each run conditional on its "
+                        "already-selected hyperparameters"
+                    ),
+                    "end_to_end_dp_claim": False,
+                    "publication_warning": (
+                        "research_raw telemetry and derived target locks are NON_PRIVATE"
+                    ),
+                }
+                if profile == "glue-r8-slack-screen" else None
+            ),
+            "inference": (
+                "two-seed exploratory slack screen; no official-GLUE or "
+                "multi-seed confirmation claim"
+                if profile == "glue-r8-slack-screen" else None
+            ),
+        },
         "arms": arms,
     }
 
@@ -1049,6 +1302,8 @@ def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision
         _verify_glue_slaclip_source(root)
     elif profile == "glue-high-c-refinement":
         _verify_high_c_preceding_primary_source(root)
+    elif profile == "glue-r8-slack-screen":
+        _verify_glue_r8_slack_sources(root)
     manifest = build_manifest(
         code_sha,
         model_4b_revision,
@@ -1060,7 +1315,7 @@ def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision
     _with_sha(root / "plans" / "lane-0.tsv", _plan_bytes(manifest, 0))
     _with_sha(root / "plans" / "lane-1.tsv", _plan_bytes(manifest, 1))
     _with_sha(root / "plans" / "sequential.tsv", _plan_bytes(manifest, 0, include_all=True))
-    if profile == "glue-high-c-refinement":
+    if profile in {"glue-high-c-refinement", "glue-r8-slack-screen"}:
         _with_sha(
             root / "plans" / "stage1-fixed.tsv",
             _plan_bytes(manifest, 0, include_all=True),
@@ -1583,6 +1838,362 @@ def _verify_high_c_preceding_primary_source(campaign_root: Path) -> None:
         raise CampaignError("preceding primary ranking does not match its lock")
 
 
+def _verify_glue_r8_negative_decision_source(campaign_root: Path) -> None:
+    """Fail closed unless job 1413408 still proves the rank-16 gate failed."""
+
+    source = GLUE_R8_NEGATIVE_DECISION_SOURCE
+    source_root = campaign_root.parent / source["campaign_id"]
+    for relative, expected in source["artifact_sha256"].items():
+        actual = _file_sha256(source_root / relative)
+        if actual != expected:
+            raise CampaignError(
+                f"rank-16 negative-decision source hash mismatch: {relative}; "
+                f"expected={expected}, actual={actual}"
+            )
+    try:
+        receipt = json.loads(
+            (source_root / "submission_receipt.json").read_text(encoding="utf-8")
+        )
+        manifest = json.loads(
+            (source_root / "plans" / "manifest.json").read_text(encoding="utf-8")
+        )
+        lock = json.loads(
+            (source_root / "selection" / "high_c_stage1_lock.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        ranking = json.loads(
+            (
+                source_root
+                / "artifacts"
+                / "glue_high_c_refinement_ranking.json"
+            ).read_text(encoding="utf-8")
+        )
+        job_status = dict(
+            line.split("=", 1)
+            for line in (source_root / "status" / "job-1413408.txt")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if "=" in line
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise CampaignError("cannot read rank-16 negative-decision source") from exc
+    if (
+        receipt.get("campaign_id") != source["campaign_id"]
+        or str(receipt.get("current_job_id")) != source["job_id"]
+        or receipt.get("code_sha") != source["code_sha"]
+        or receipt.get("coverage_profile") != source["profile"]
+        or manifest.get("profile") != source["profile"]
+        or manifest.get("code_sha") != source["code_sha"]
+        or job_status.get("job_id") != source["job_id"]
+        or job_status.get("state") != "completed"
+        or job_status.get("phase") != "complete"
+        or job_status.get("exit_code") != "0"
+        or job_status.get("code_sha") != source["code_sha"]
+    ):
+        raise CampaignError("rank-16 negative-decision source identity mismatch")
+    if (
+        lock.get("profile") != source["profile"]
+        or lock.get("code_sha") != source["code_sha"]
+        or lock.get("manifest_sha256")
+        != source["artifact_sha256"]["plans/manifest.json"]
+        or lock.get("stage2_plan_sha256") != source["stage2_plan_sha256"]
+        or _file_sha256(source_root / "selection" / "high_c_stage1_lock.json")
+        != source["stage1_lock_sha256"]
+    ):
+        raise CampaignError("rank-16 negative-decision selection lock mismatch")
+    best_fixed = ranking.get("best_fixed", {})
+    best_slaclip = ranking.get("best_slaclip", {})
+    if (
+        ranking.get("stage1_lock_sha256") != source["stage1_lock_sha256"]
+        or ranking.get("stage2_plan_sha256") != source["stage2_plan_sha256"]
+        or ranking.get("slaclip_beats_best_fixed_primary") is not False
+        or ranking.get("fixed_winner_at_allowed_C_max") is not True
+        or ranking.get("task_test_or_official_glue_evaluation_used") is not False
+        or best_fixed.get("candidate") != source["expected_best_fixed"]
+        or best_slaclip.get("candidate") != source["expected_best_slaclip"]
+        or not math.isclose(
+            _finite(best_fixed.get("public_validation_loss"), "rank16 fixed loss"),
+            source["expected_best_fixed_loss"],
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        )
+        or not math.isclose(
+            _finite(
+                best_slaclip.get("public_validation_loss"), "rank16 SlaClip loss"
+            ),
+            source["expected_best_slaclip_loss"],
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        )
+    ):
+        raise CampaignError("rank-16 negative-decision ranking mismatch")
+    if not best_slaclip["public_validation_loss"] > best_fixed["public_validation_loss"]:
+        raise CampaignError("rank-16 source no longer records a negative primary result")
+
+
+def _verify_glue_r8_complete_baseline_source(campaign_root: Path) -> None:
+    """Validate the completed rank-8 arm independently of its timed-out job."""
+
+    source = GLUE_R8_BASELINE_SOURCE
+    campaign = campaign_root.parent / source["campaign_id"]
+    arm_root = campaign / source["relative_arm_root"]
+    for relative, expected in source["artifact_sha256"].items():
+        path = (
+            campaign / relative
+            if relative in {"submission_receipt.json", "plans/manifest.json"}
+            else arm_root / relative
+        )
+        actual = _file_sha256(path)
+        if actual != expected:
+            raise CampaignError(
+                f"rank-8 baseline source hash mismatch: {relative}; "
+                f"expected={expected}, actual={actual}"
+            )
+    try:
+        receipt = json.loads(
+            (campaign / "submission_receipt.json").read_text(encoding="utf-8")
+        )
+        manifest = json.loads(
+            (campaign / "plans" / "manifest.json").read_text(encoding="utf-8")
+        )
+        status = json.loads(
+            (arm_root / "adapter" / "run_status.json").read_text(encoding="utf-8")
+        )
+        result_status = json.loads(
+            (arm_root / "results" / "run_status.json").read_text(encoding="utf-8")
+        )
+        telemetry = json.loads(
+            (
+                arm_root
+                / "results"
+                / "research_raw"
+                / "telemetry_summary.json"
+            ).read_text(encoding="utf-8")
+        )
+        evaluation = json.loads(
+            (arm_root / "results" / "evaluation_config.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CampaignError("cannot read complete rank-8 baseline source") from exc
+    if (
+        receipt.get("campaign_id") != source["campaign_id"]
+        or str(receipt.get("current_job_id")) != source["job_id"]
+        or receipt.get("code_sha") != source["code_sha"]
+        or receipt.get("coverage_profile") != "baseline-reproduction-cached"
+        or manifest.get("profile") != "baseline-reproduction-cached"
+        or manifest.get("code_sha") != source["code_sha"]
+    ):
+        raise CampaignError("rank-8 baseline campaign identity mismatch")
+    matching = [
+        arm for arm in manifest.get("arms", [])
+        if arm.get("relative_root") == source["relative_arm_root"]
+    ]
+    if (
+        len(matching) != 1
+        or matching[0].get("setting_id") != "glue8-4b-eps6-r8"
+        or matching[0].get("candidate_id") != "fixed-c1-paper-default"
+        or matching[0].get("seed") != 42
+        or matching[0].get("steps") != source["raw_records"]
+        or matching[0].get("lora_r") != 8
+    ):
+        raise CampaignError("rank-8 baseline source arm is absent from its manifest")
+    expected_status = {
+        "state": "completed",
+        "update_steps": source["raw_records"],
+        "dataset": "glue8",
+        "method": "baseline",
+        "privacy": "dp",
+        "base_model": source["model_id"],
+        "model_revision": source["model_revision"],
+        "resolved_model_revision": source["model_revision"],
+        "data_content_sha256": source["data_sha256"],
+        "run_id": source["run_id"],
+        "config_fingerprint": source["config_fingerprint"],
+        "telemetry_mode": "research_raw",
+        "non_private_telemetry": True,
+        "training_lora_r": 8,
+    }
+    for payload_name, payload in (("adapter", status), ("result", result_status)):
+        for key, expected in expected_status.items():
+            if payload.get(key) != expected:
+                raise CampaignError(
+                    f"rank-8 {payload_name} status mismatch for {key}: "
+                    f"expected={expected!r}, actual={payload.get(key)!r}"
+                )
+    config = status.get("config")
+    if not isinstance(config, dict) or result_status.get("config") != config:
+        raise CampaignError("rank-8 status/config artifacts are not identical")
+    expected_config = {
+        "implementation_git_sha": source["code_sha"],
+        "implementation_git_dirty": False,
+        "dataset": "glue8",
+        "method": "baseline",
+        "privacy": "dp",
+        "base_model": source["model_id"],
+        "model_revision": source["model_revision"],
+        "seed": 42,
+        "lora_r": 8,
+        "total_update_steps": source["raw_records"],
+        "batch_size": 64,
+        "micro_batch_size": 4,
+        "learning_rate": 0.0002,
+        "cutoff_len": 384,
+        "train_on_inputs": False,
+        "dp_epsilon": 6.0,
+        "dp_delta": 1e-5,
+        "dp_max_grad_norm": 1.0,
+        "dp_accountant": "prv",
+        "protocol_stage": "final",
+        "val_set_size": 0,
+        "run_train": True,
+        "run_eval": True,
+        "telemetry_mode": "research_raw",
+        "allow_non_private_telemetry": True,
+    }
+    for key, expected in expected_config.items():
+        if config.get(key) != expected:
+            raise CampaignError(
+                f"rank-8 baseline config mismatch for {key}: "
+                f"expected={expected!r}, actual={config.get(key)!r}"
+            )
+    raw_sha = source["artifact_sha256"][
+        "results/research_raw/NON_PRIVATE_train_log.jsonl"
+    ]
+    if (
+        telemetry.get("summary_schema_version") != 4
+        or telemetry.get("NON_PRIVATE_TELEMETRY") is not True
+        or telemetry.get("source", {}).get("raw_sha256") != raw_sha
+        or telemetry.get("source", {}).get("raw_physical_records")
+        != source["raw_records"]
+        or telemetry.get("source", {}).get("raw_unique_steps")
+        != source["raw_records"]
+        or telemetry.get("source", {}).get("raw_duplicate_records") != 0
+    ):
+        raise CampaignError("rank-8 telemetry summary is not bound to its raw log")
+    expected_tasks = ["cola", "sst2", "mrpc", "stsb", "qqp", "mnli", "qnli", "rte"]
+    assets = evaluation.get("glue_eval_assets", {})
+    if (
+        evaluation.get("evaluation_schema_version") != 1
+        or evaluation.get("config_fingerprint") != source["config_fingerprint"]
+        or evaluation.get("base_model") != source["model_id"]
+        or evaluation.get("requested_model_revision") != source["model_revision"]
+        or evaluation.get("resolved_model_revision") != source["model_revision"]
+        or evaluation.get("tasks") != expected_tasks
+        or evaluation.get("fast_dev_run") != 0
+        or assets.get("dataset_revision")
+        != source["official_glue_dataset_revision"]
+        or assets.get("content_sha256") != source["official_glue_content_sha256"]
+    ):
+        raise CampaignError("rank-8 official GLUE-validation identity mismatch")
+    average = _task_average(arm_root / "results" / "summary.csv")
+    if not math.isclose(
+        average,
+        source["official_glue_validation_average"],
+        rel_tol=0.0,
+        abs_tol=1e-15,
+    ):
+        raise CampaignError("rank-8 official GLUE-validation average mismatch")
+    try:
+        detail_rows = list(
+            csv.DictReader(
+                (arm_root / "results" / "details.csv").open(
+                    encoding="utf-8", newline=""
+                )
+            )
+        )
+    except OSError as exc:
+        raise CampaignError("cannot read rank-8 GLUE details") from exc
+    if [row.get("task") for row in detail_rows] != expected_tasks:
+        raise CampaignError("rank-8 GLUE details task order mismatch")
+
+    raw_path = (
+        arm_root / "results" / "research_raw" / "NON_PRIVATE_train_log.jsonl"
+    )
+    records: dict[int, dict[str, Any]] = {}
+    try:
+        with raw_path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                record = json.loads(line)
+                step = int(record.get("step", -1))
+                if step in records:
+                    raise CampaignError(f"duplicate rank-8 source step {step}")
+                for key, expected in (
+                    ("NON_PRIVATE_TELEMETRY", True),
+                    ("run_id", source["run_id"]),
+                    ("config_fingerprint", source["config_fingerprint"]),
+                    ("method", "baseline"),
+                    ("privacy", "dp"),
+                    ("dataset", "glue8"),
+                    ("base_model", source["model_id"]),
+                    ("model_revision", source["model_revision"]),
+                ):
+                    if record.get(key) != expected:
+                        raise CampaignError(
+                            f"rank-8 raw identity mismatch at line {line_number}: {key}"
+                        )
+                records[step] = record
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise CampaignError("cannot parse rank-8 baseline telemetry") from exc
+    if set(records) != set(range(1, source["raw_records"] + 1)):
+        raise CampaignError("rank-8 telemetry does not contain exactly steps 1 through 500")
+    post = [records[step] for step in range(51, source["raw_records"] + 1)]
+    if len(post) != source["post_burn_in_records"]:
+        raise CampaignError("rank-8 burn-in slice has the wrong length")
+    try:
+        clip = [float(record["raw_clip_fraction"]) for record in post]
+        small = [
+            float(record["raw_reference_small_gradient_proxy"]) for record in post
+        ]
+        conditional = [
+            float(record["raw_reference_conditional_clip_fraction"])
+            for record in post
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CampaignError("rank-8 source lacks a target statistic") from exc
+    if not all(
+        record.get("raw_reference_conditional_clip_fraction_valid") is True
+        for record in post
+    ) or not all(
+        math.isfinite(value) and 0.0 <= value <= 1.0
+        for values in (clip, small, conditional)
+        for value in values
+    ):
+        raise CampaignError("rank-8 source target statistics are invalid")
+    observed = {
+        "post_burn_in_clip_fraction_mean": math.fsum(clip) / len(clip),
+        "post_burn_in_clip_fraction_median": _quantile(clip, 0.5),
+        "post_burn_in_small_gradient_proxy_mean": math.fsum(small) / len(small),
+        "post_burn_in_small_gradient_proxy_median": _quantile(small, 0.5),
+    }
+    for key, actual in observed.items():
+        if not math.isclose(
+            actual, float(source[key]), rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise CampaignError(
+                f"rank-8 source statistic mismatch for {key}: "
+                f"expected={source[key]}, actual={actual}"
+            )
+    labels = ("q10", "q25", "q50", "q75", "q90")
+    for label, fraction in zip(
+        labels, GLUE_R8_SLACK_RHO_QUANTILES, strict=True
+    ):
+        actual = _quantile(conditional, fraction)
+        expected = source["post_burn_in_conditional_clip_fraction_quantiles"][label]
+        if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-12):
+            raise CampaignError(
+                f"rank-8 conditional quantile mismatch for {label}: "
+                f"expected={expected}, actual={actual}"
+            )
+
+
+def _verify_glue_r8_slack_sources(campaign_root: Path) -> None:
+    _verify_glue_r8_negative_decision_source(campaign_root)
+    _verify_glue_r8_complete_baseline_source(campaign_root)
+
+
 def lock_high_c_refinement(root: Path) -> None:
     """Lock the Stage-1 winner and materialize the deterministic Stage-2 plan."""
 
@@ -1796,6 +2407,275 @@ def lock_high_c_refinement(root: Path) -> None:
     )
 
 
+def lock_glue_r8_slack_screen(root: Path) -> None:
+    """Lock rank-8 Stage 1 and write the fresh-seed Stage-2 plan."""
+
+    manifest_path = root / "plans" / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CampaignError("cannot read rank-8 slack-screen manifest") from exc
+    if manifest.get("profile") != "glue-r8-slack-screen":
+        raise CampaignError(
+            "rank-8 slack lock requires glue-r8-slack-screen profile"
+        )
+    stage1_arms = manifest.get("arms")
+    if (
+        not isinstance(stage1_arms, list)
+        or len(stage1_arms) != 6
+        or {arm.get("initial_c") for arm in stage1_arms}
+        != set(GLUE_R8_SLACK_FIXED_GRID)
+        or any(
+            arm.get("setting_id") != "glue8-4b-eps6-r8"
+            or arm.get("lora_r") != 8
+            or arm.get("method") != "baseline"
+            or arm.get("role") != "slack_fixed_candidate"
+            or arm.get("stage") != 1
+            or arm.get("seed") != GLUE_R8_SLACK_STAGE1_SEED
+            or arm.get("steps") != GLUE_R8_SLACK_STEPS
+            or arm.get("lane") != 0
+            for arm in stage1_arms
+        )
+    ):
+        raise CampaignError("rank-8 Stage-1 manifest does not match its recipe")
+
+    ranked = []
+    loaded: dict[
+        str,
+        tuple[
+            dict[str, Any], dict[int, dict[str, Any]],
+            dict[int, dict[str, Any]], dict[str, str],
+        ],
+    ] = {}
+    for arm in stage1_arms:
+        bound = _load_focused_arm(root, arm, manifest["code_sha"])
+        loaded[arm["arm_id"]] = bound
+        status, _records, curves, hashes = bound
+        endpoint = _finite(
+            status["validation"].get("loss_mean"),
+            f"{arm['arm_id']}:stage1 endpoint",
+        )
+        ranked.append(
+            {
+                "arm_id": arm["arm_id"],
+                "candidate_id": arm["candidate_id"],
+                "fixed_C": arm["initial_c"],
+                "endpoint_loss": endpoint,
+                "curve_loss": {
+                    str(step): _finite(curve.get("loss_mean"), "rank8 stage1 curve")
+                    for step, curve in sorted(curves.items())
+                },
+                "artifact_sha256": hashes,
+            }
+        )
+    ranked.sort(
+        key=lambda row: (row["endpoint_loss"], row["fixed_C"], row["candidate_id"])
+    )
+    best = ranked[0]
+    best_arm = next(
+        arm for arm in stage1_arms if arm["arm_id"] == best["arm_id"]
+    )
+    winner_at_grid_min = math.isclose(
+        float(best["fixed_C"]), min(GLUE_R8_SLACK_FIXED_GRID),
+        rel_tol=0.0, abs_tol=1e-12,
+    )
+    winner_at_grid_max = math.isclose(
+        float(best["fixed_C"]), max(GLUE_R8_SLACK_FIXED_GRID),
+        rel_tol=0.0, abs_tol=1e-12,
+    )
+    winner_at_boundary = winner_at_grid_min or winner_at_grid_max
+    best_records = loaded[best["arm_id"]][1]
+    conditional = []
+    for step in range(51, GLUE_R8_SLACK_STEPS + 1):
+        record = best_records[step]
+        if record.get("raw_reference_conditional_clip_fraction_valid") is not True:
+            raise CampaignError(
+                f"rank-8 winner has invalid conditional clipping proxy at step {step}"
+            )
+        value = _finite(
+            record.get("raw_reference_conditional_clip_fraction"),
+            f"{best['arm_id']}:step{step}:conditional_clip_fraction",
+        )
+        if not 0.0 <= value <= 1.0:
+            raise CampaignError(
+                "rank-8 winner has out-of-range conditional clipping proxy "
+                f"at step {step}: {value}"
+            )
+        conditional.append(value)
+    labels = ("q10", "q25", "q50", "q75", "q90")
+    rho_min, rho_max = GLUE_R8_SLACK_RHO_BOUNDS
+    rho_values = [
+        max(rho_min, min(rho_max, _quantile(conditional, fraction)))
+        for fraction in GLUE_R8_SLACK_RHO_QUANTILES
+    ]
+    if len({float(value).hex() for value in rho_values}) != 5:
+        raise CampaignError(
+            "derived rank-8 rho grid is not unique after clamping to [0.05,0.95]"
+        )
+    if any(
+        not rho_values[index] < rho_values[index + 1]
+        for index in range(len(rho_values) - 1)
+    ):
+        raise CampaignError("derived rank-8 rho grid is not strictly increasing")
+
+    shared = {
+        key: best_arm[key]
+        for key in (
+            "paper_reference", "dataset", "model_slug", "model_id", "epsilon",
+            "lora_r", "learning_rate", "cutoff_len", "train_on_inputs",
+            "setting_id", "model_revision",
+        )
+    }
+    fixed_id = f"fresh-fixed-c{_candidate_id_value(float(best['fixed_C']))}"
+    stage2_arms = [
+        {
+            **shared,
+            "id": fixed_id,
+            "candidate_id": fixed_id,
+            "arm_id": (
+                f"{best_arm['setting_id']}--{fixed_id}--"
+                f"seed{GLUE_R8_SLACK_STAGE2_SEED}"
+            ),
+            "method": "baseline",
+            "initial_c": float(best["fixed_C"]),
+            "rho": None,
+            "eta": None,
+            "role": "fresh_fixed_comparator",
+            "stage": 2,
+            "lane": 0,
+            "seed": GLUE_R8_SLACK_STAGE2_SEED,
+            "steps": GLUE_R8_SLACK_STEPS,
+            "eval_limit": 0,
+            "relative_root": (
+                f"runs/{best_arm['setting_id']}/{fixed_id}/"
+                f"seed-{GLUE_R8_SLACK_STAGE2_SEED}"
+            ),
+        }
+    ]
+    for label, rho in zip(labels, rho_values, strict=True):
+        candidate_id = f"full-sla-{label}-eta002"
+        stage2_arms.append(
+            {
+                **shared,
+                "id": candidate_id,
+                "candidate_id": candidate_id,
+                "arm_id": (
+                    f"{best_arm['setting_id']}--{candidate_id}--"
+                    f"seed{GLUE_R8_SLACK_STAGE2_SEED}"
+                ),
+                "method": "slaclip",
+                "initial_c": float(best["fixed_C"]),
+                "rho": rho,
+                "eta": GLUE_R8_SLACK_PRIMARY_ETA,
+                "role": "slaclip_target_candidate",
+                "stage": 2,
+                "rho_source_quantile": label,
+                "lane": 0,
+                "seed": GLUE_R8_SLACK_STAGE2_SEED,
+                "steps": GLUE_R8_SLACK_STEPS,
+                "eval_limit": 0,
+                "relative_root": (
+                    f"runs/{best_arm['setting_id']}/{candidate_id}/"
+                    f"seed-{GLUE_R8_SLACK_STAGE2_SEED}"
+                ),
+            }
+        )
+    central_rho = rho_values[2]
+    controls = (
+        (
+            "full-sla-q50-eta005-control",
+            float(best["fixed_C"]),
+            GLUE_R8_SLACK_FAST_ETA,
+            "controller_speed_control",
+        ),
+        (
+            "full-sla-q50-c0half-eta002-control",
+            max(0.1, float(best["fixed_C"]) / 2.0),
+            GLUE_R8_SLACK_PRIMARY_ETA,
+            "initial_C_sensitivity_control",
+        ),
+    )
+    primary_template = stage2_arms[3]
+    for candidate_id, initial_c, eta, role in controls:
+        arm = dict(primary_template)
+        arm.update(
+            {
+                "id": candidate_id,
+                "candidate_id": candidate_id,
+                "arm_id": (
+                    f"{best_arm['setting_id']}--{candidate_id}--"
+                    f"seed{GLUE_R8_SLACK_STAGE2_SEED}"
+                ),
+                "initial_c": initial_c,
+                "rho": central_rho,
+                "eta": eta,
+                "role": role,
+                "relative_root": (
+                    f"runs/{best_arm['setting_id']}/{candidate_id}/"
+                    f"seed-{GLUE_R8_SLACK_STAGE2_SEED}"
+                ),
+            }
+        )
+        stage2_arms.append(arm)
+    if len(stage2_arms) != 8 or len({arm["arm_id"] for arm in stage2_arms}) != 8:
+        raise CampaignError("rank-8 Stage-2 recipe did not produce eight unique arms")
+
+    stage2_manifest = {**manifest, "arms": stage2_arms}
+    stage2_plan_data = _plan_bytes(stage2_manifest, 0, include_all=True)
+    stage2_plan_sha256 = hashlib.sha256(stage2_plan_data).hexdigest()
+    lock_payload = {
+        "schema_version": 1,
+        "profile": "glue-r8-slack-screen",
+        "code_sha": manifest["code_sha"],
+        "manifest_sha256": _file_sha256(manifest_path),
+        "stage1_seed": GLUE_R8_SLACK_STAGE1_SEED,
+        "stage2_seed": GLUE_R8_SLACK_STAGE2_SEED,
+        "stage2_seed_is_fresh": True,
+        "selection_metric": "step_200_response_only_mean_per_record_loss",
+        "ranking_rule": (
+            "ascending endpoint loss, then ascending fixed C, then candidate id"
+        ),
+        "stage1_ranking": ranked,
+        "best_fixed": best,
+        "stage1_fixed_winner_at_grid_min": winner_at_grid_min,
+        "stage1_fixed_winner_at_grid_max": winner_at_grid_max,
+        "stage1_fixed_winner_at_search_boundary": winner_at_boundary,
+        "stage1_boundary_warning": (
+            "best fixed C is a search-grid boundary; this screen may finish but "
+            "must not advance to later confirmation"
+            if winner_at_boundary else None
+        ),
+        "burn_in_steps_excluded": [1, 50],
+        "conditional_clip_proxy_records": len(conditional),
+        "rho_quantiles": {
+            label: value for label, value in zip(labels, rho_values, strict=True)
+        },
+        "rho_bounds": list(GLUE_R8_SLACK_RHO_BOUNDS),
+        "rho_values_unique_after_clamp": True,
+        "stage2_arms": stage2_arms,
+        "stage2_plan_sha256": stage2_plan_sha256,
+        "primary_endpoint": "step_200_response_only_mean_per_record_loss",
+        "secondary_endpoints": {
+            "full_normalized_auc": "trapezoid_steps_0_to_200_divided_by_200",
+            "late_window_normalized_auc": (
+                "trapezoid_steps_100_to_200_divided_by_100"
+            ),
+        },
+        "official_task_evaluation_used": False,
+        "NON_PRIVATE_DATA_DEPENDENT_SELECTION": True,
+        "privacy_scope": manifest["glue_r8_slack_screen"]["privacy_scope"],
+        "inference": "two_seed_exploratory_rank8_slack_screen",
+    }
+    lock_path = root / "selection" / "r8_slack_stage1_lock.json"
+    _with_sha(lock_path, _json_bytes(lock_payload))
+    _with_sha(root / "plans" / "stage2-slaclip.tsv", stage2_plan_data)
+    print(
+        f"locked_rank8_best_fixed={best['candidate_id']} C={best['fixed_C']} "
+        f"boundary={str(winner_at_boundary).lower()} "
+        f"stage2_arms={len(stage2_arms)}"
+    )
+
+
 def _normalized_trapezoid_auc(
     losses_by_step: dict[int, float], start: int, end: int
 ) -> float:
@@ -1818,6 +2698,7 @@ def analyze(root: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     analysis_arms = list(manifest.get("arms", []))
     high_c_lock = None
+    r8_slack_lock = None
     if manifest.get("profile") == "glue-high-c-refinement":
         # Recompute the dynamic provenance gate at analysis time.  The
         # immutable writer accepts byte-identical replay but refuses any change
@@ -1845,6 +2726,32 @@ def analyze(root: Path) -> None:
             {arm["arm_id"] for arm in analysis_arms}
         ) != 12:
             raise CampaignError("high-C refinement must analyze 12 unique arms")
+    elif manifest.get("profile") == "glue-r8-slack-screen":
+        lock_glue_r8_slack_screen(root)
+        lock_path = root / "selection" / "r8_slack_stage1_lock.json"
+        stage2_plan_path = root / "plans" / "stage2-slaclip.tsv"
+        try:
+            r8_slack_lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CampaignError("rank-8 slack screen lacks its Stage-1 lock") from exc
+        if (
+            r8_slack_lock.get("profile") != manifest["profile"]
+            or r8_slack_lock.get("code_sha") != manifest["code_sha"]
+            or r8_slack_lock.get("manifest_sha256") != _file_sha256(manifest_path)
+            or r8_slack_lock.get("stage1_seed") != GLUE_R8_SLACK_STAGE1_SEED
+            or r8_slack_lock.get("stage2_seed") != GLUE_R8_SLACK_STAGE2_SEED
+            or r8_slack_lock.get("stage2_seed_is_fresh") is not True
+            or not isinstance(r8_slack_lock.get("stage2_arms"), list)
+            or len(r8_slack_lock["stage2_arms"]) != 8
+            or r8_slack_lock.get("stage2_plan_sha256")
+            != _file_sha256(stage2_plan_path)
+        ):
+            raise CampaignError("rank-8 slack-screen selection lock is stale")
+        analysis_arms.extend(r8_slack_lock["stage2_arms"])
+        if len(analysis_arms) != 14 or len(
+            {arm["arm_id"] for arm in analysis_arms}
+        ) != 14:
+            raise CampaignError("rank-8 slack screen must analyze 14 unique arms")
     results = []
     trajectory_rows = []
     validation_curve_rows = []
@@ -1863,7 +2770,8 @@ def analyze(root: Path) -> None:
         if status.get("state") != "completed" or status.get("config", {}).get("implementation_git_sha") != manifest["code_sha"]:
             raise CampaignError(f"arm is not completed at the locked SHA: {arm['arm_id']}")
         focused_screen = manifest.get("profile") in {
-            "glue-slaclip-screen", "glue-high-c-refinement"
+            "glue-slaclip-screen", "glue-high-c-refinement",
+            "glue-r8-slack-screen",
         }
         raw_records = None
         if focused_screen:
@@ -2144,6 +3052,7 @@ def analyze(root: Path) -> None:
                 "initial_C": arm["initial_c"],
                 "rho": arm["rho"],
                 "eta": arm["eta"],
+                "seed": arm["seed"],
                 "selection_metric": selection_metric,
                 "selection_value": selection_value,
                 "selection_score": selection_score,
@@ -2256,7 +3165,11 @@ def analyze(root: Path) -> None:
         )
     best_fixed = {}
     for row in results:
-        if row["method"] == "baseline":
+        paired_rank8_fixed = (
+            manifest.get("profile") != "glue-r8-slack-screen"
+            or row["candidate_role"] == "fresh_fixed_comparator"
+        )
+        if row["method"] == "baseline" and paired_rank8_fixed:
             best_fixed[row["setting_id"]] = max(
                 best_fixed.get(row["setting_id"], float("-inf")), row["selection_score"]
             )
@@ -2305,7 +3218,11 @@ def analyze(root: Path) -> None:
     _with_sha(out / "clipping_regime_summary.json", _json_bytes({
         "schema_version": 1,
         "NON_PRIVATE_TELEMETRY": True,
-        "inference": "exploratory_one_seed_descriptive_only",
+        "inference": (
+            "exploratory_two_seed_staged_descriptive_only"
+            if manifest.get("profile") == "glue-r8-slack-screen"
+            else "exploratory_one_seed_descriptive_only"
+        ),
         "rows": regime_rows,
     }))
     if manifest.get("profile") == "glue-slaclip-screen":
@@ -2438,6 +3355,160 @@ def analyze(root: Path) -> None:
             out / "glue_high_c_refinement_ranking.json",
             _json_bytes(selection_payload),
         )
+    elif manifest.get("profile") == "glue-r8-slack-screen":
+        stage1_ranked = sorted(
+            (
+                row for row in results
+                if row["candidate_role"] == "slack_fixed_candidate"
+            ),
+            key=lambda row: (
+                -row["selection_score"], row["initial_C"], row["candidate"]
+            ),
+        )
+        fresh_fixed_rows = [
+            row for row in results
+            if row["candidate_role"] == "fresh_fixed_comparator"
+        ]
+        slaclip_ranked = sorted(
+            (
+                row for row in results
+                if row["candidate_role"] == "slaclip_target_candidate"
+            ),
+            key=lambda row: (-row["selection_score"], row["candidate"]),
+        )
+        controls = [
+            row for row in results
+            if row["candidate_role"] in {
+                "controller_speed_control", "initial_C_sensitivity_control"
+            }
+        ]
+        if (
+            len(stage1_ranked) != 6
+            or len(fresh_fixed_rows) != 1
+            or len(slaclip_ranked) != 5
+            or len(controls) != 2
+        ):
+            raise CampaignError(
+                "rank-8 slack screen must rank six Stage-1 fixed arms, one "
+                "fresh fixed comparator, five primary SlaClip arms, and two controls"
+            )
+        if r8_slack_lock is None:
+            raise CampaignError("rank-8 analyzer lost its selection lock")
+        locked_best = r8_slack_lock.get("best_fixed", {})
+        if (
+            locked_best.get("candidate_id") != stage1_ranked[0]["candidate"]
+            or not math.isclose(
+                _finite(
+                    locked_best.get("endpoint_loss"),
+                    "locked rank-8 Stage-1 endpoint",
+                ),
+                stage1_ranked[0]["public_validation_loss"],
+                rel_tol=1e-9,
+                abs_tol=1e-8,
+            )
+        ):
+            raise CampaignError(
+                "rank-8 final Stage-1 ranking disagrees with its lock"
+            )
+        fresh_fixed = fresh_fixed_rows[0]
+        best_slaclip = slaclip_ranked[0]
+        if (
+            fresh_fixed["seed"] != GLUE_R8_SLACK_STAGE2_SEED
+            or best_slaclip["seed"] != GLUE_R8_SLACK_STAGE2_SEED
+            or fresh_fixed["initial_C"] != float(locked_best["fixed_C"])
+        ):
+            raise CampaignError("rank-8 Stage-2 fresh comparator identity mismatch")
+        endpoint_pass = (
+            best_slaclip["public_validation_loss"]
+            < fresh_fixed["public_validation_loss"]
+        )
+        full_auc_pass = (
+            best_slaclip["full_normalized_validation_loss_auc"]
+            <= fresh_fixed["full_normalized_validation_loss_auc"]
+        )
+        late_auc_pass = (
+            best_slaclip["late_window_normalized_validation_loss_auc"]
+            <= fresh_fixed["late_window_normalized_validation_loss_auc"]
+        )
+        performance_gate = endpoint_pass and full_auc_pass and late_auc_pass
+        boundary_block = (
+            r8_slack_lock.get("stage1_fixed_winner_at_search_boundary") is True
+        )
+        block_reasons = []
+        if not endpoint_pass:
+            block_reasons.append("best_slaclip_endpoint_not_strictly_lower")
+        if not full_auc_pass:
+            block_reasons.append("best_slaclip_full_auc_higher")
+        if not late_auc_pass:
+            block_reasons.append("best_slaclip_late_auc_higher")
+        if boundary_block:
+            block_reasons.append("stage1_fixed_winner_at_search_boundary")
+        selection_payload = {
+            "schema_version": 1,
+            "inference": "two_seed_200_step_exploratory_rank8_slack_screen",
+            "stage1_seed": GLUE_R8_SLACK_STAGE1_SEED,
+            "stage2_seed": GLUE_R8_SLACK_STAGE2_SEED,
+            "stage2_seed_is_fresh": True,
+            "selection_metric": "step_200_response_only_mean_per_record_loss",
+            "ranking_rule": "ascending endpoint loss, then candidate id",
+            "primary_endpoint": "step_200_response_only_mean_per_record_loss",
+            "secondary_endpoints": {
+                "full_normalized_validation_loss_auc": (
+                    "trapezoid steps 0 through 200 divided by 200"
+                ),
+                "late_window_normalized_validation_loss_auc": (
+                    "trapezoid steps 100 through 200 divided by 100"
+                ),
+                "gate_role": "both must be no worse than fresh fixed",
+            },
+            "task_test_or_official_glue_evaluation_used": False,
+            "privacy_scope": manifest["glue_r8_slack_screen"]["privacy_scope"],
+            "stage1_lock_sha256": _file_sha256(
+                root / "selection" / "r8_slack_stage1_lock.json"
+            ),
+            "stage2_plan_sha256": _file_sha256(
+                root / "plans" / "stage2-slaclip.tsv"
+            ),
+            "arm_artifact_sha256": focused_artifact_hashes,
+            "stage1_best_fixed": stage1_ranked[0],
+            "stage1_fixed_ranking": stage1_ranked,
+            "stage1_fixed_winner_at_grid_min": r8_slack_lock.get(
+                "stage1_fixed_winner_at_grid_min"
+            ),
+            "stage1_fixed_winner_at_grid_max": r8_slack_lock.get(
+                "stage1_fixed_winner_at_grid_max"
+            ),
+            "stage1_fixed_winner_at_search_boundary": boundary_block,
+            "stage1_boundary_warning": r8_slack_lock.get(
+                "stage1_boundary_warning"
+            ),
+            "fresh_fixed": fresh_fixed,
+            "best_slaclip": best_slaclip,
+            "slaclip_ranking": slaclip_ranked,
+            "controls": controls,
+            "best_slaclip_loss_delta_vs_fresh_fixed": (
+                best_slaclip["public_validation_loss"]
+                - fresh_fixed["public_validation_loss"]
+            ),
+            "primary_gate": {
+                "endpoint_strictly_lower": endpoint_pass,
+                "full_auc_not_worse": full_auc_pass,
+                "late_auc_not_worse": late_auc_pass,
+                "performance_gate_passed": performance_gate,
+                "boundary_blocked": boundary_block,
+                "confirmation_allowed": performance_gate and not boundary_block,
+                "block_reasons": block_reasons,
+            },
+            "fresh_seed_confirmation_gate": (
+                "advance only when the endpoint is strictly lower and both full "
+                "and late AUC are no worse than the fresh fixed comparator, and "
+                "the Stage-1 fixed winner is not a search-grid boundary"
+            ),
+        }
+        _with_sha(
+            out / "glue_r8_slack_screen_ranking.json",
+            _json_bytes(selection_payload),
+        )
     print(f"analyzed_arms={len(results)}")
 
 
@@ -2454,13 +3525,15 @@ def parser() -> argparse.ArgumentParser:
         choices=(
             "paper-breadth", "regime-map", "baseline-reproduction",
             "baseline-reproduction-cached", "glue-slaclip-screen",
-            "glue-high-c-refinement",
+            "glue-high-c-refinement", "glue-r8-slack-screen",
         ),
         default="paper-breadth",
     )
     prep.add_argument("--model-12b-revision")
     lock = sub.add_parser("lock-high-c-refinement")
     lock.add_argument("--campaign-root", required=True, type=Path)
+    lock_r8 = sub.add_parser("lock-r8-slack-screen")
+    lock_r8.add_argument("--campaign-root", required=True, type=Path)
     report = sub.add_parser("analyze")
     report.add_argument("--campaign-root", required=True, type=Path)
     return value
@@ -2479,6 +3552,8 @@ def main() -> None:
         )
     elif args.command == "lock-high-c-refinement":
         lock_high_c_refinement(args.campaign_root)
+    elif args.command == "lock-r8-slack-screen":
+        lock_glue_r8_slack_screen(args.campaign_root)
     else:
         analyze(args.campaign_root)
 

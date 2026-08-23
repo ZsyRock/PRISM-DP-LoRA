@@ -27,7 +27,8 @@ CURRENT_ARM_STATUS=""
 
 is_focused_glue_profile() {
   [[ "${COVERAGE_PROFILE}" == glue-slaclip-screen \
-      || "${COVERAGE_PROFILE}" == glue-high-c-refinement ]]
+      || "${COVERAGE_PROFILE}" == glue-high-c-refinement \
+      || "${COVERAGE_PROFILE}" == glue-r8-slack-screen ]]
 }
 
 write_lane_status() {

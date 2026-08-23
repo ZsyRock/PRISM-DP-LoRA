@@ -176,7 +176,8 @@ single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
   --output-root "${CAMPAIGN_ROOT}/preflight/glue8" \
   --require-cuda --model-id google/gemma-3-4b-pt --model-revision "${MODEL_4B_REVISION}"
 if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
-    && "${COVERAGE_PROFILE}" != glue-high-c-refinement ]]; then
+    && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
+    && "${COVERAGE_PROFILE}" != glue-r8-slack-screen ]]; then
   single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
     --dataset math10k \
     --data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/math_10k.json" \
@@ -208,12 +209,19 @@ write_status running 0
 CURRENT_PHASE=parallel-paper-coverage
 write_status running 0
 LANE_SCRIPT="${REPO_ROOT}/slurm/paper_coverage_lane.sh"
-if [[ "${COVERAGE_PROFILE}" == glue-high-c-refinement ]]; then
+if [[ "${COVERAGE_PROFILE}" == glue-high-c-refinement \
+    || "${COVERAGE_PROFILE}" == glue-r8-slack-screen ]]; then
   if [[ "${ALLOCATION_LANES}" != 1 ]]; then
-    echo "error: glue-high-c-refinement requires one sequential GPU lane" >&2
+    echo "error: ${COVERAGE_PROFILE} requires one sequential GPU lane" >&2
     exit 2
   fi
-  CURRENT_PHASE=stage1-high-c-fixed-screen
+  lock_command=lock-high-c-refinement
+  stage1_phase=stage1-high-c-fixed-screen
+  if [[ "${COVERAGE_PROFILE}" == glue-r8-slack-screen ]]; then
+    lock_command=lock-r8-slack-screen
+    stage1_phase=stage1-r8-fixed-screen
+  fi
+  CURRENT_PHASE="${stage1_phase}"
   write_status running 0
   verify_plan_sidecar "${CAMPAIGN_ROOT}/plans/stage1-fixed.tsv"
   srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
@@ -227,7 +235,7 @@ if [[ "${COVERAGE_PROFILE}" == glue-high-c-refinement ]]; then
   CURRENT_PHASE=stage1-selection-lock
   write_status running 0
   "${PYTHON_BIN}" scripts/build_paper_coverage_campaign.py \
-    lock-high-c-refinement --campaign-root "${CAMPAIGN_ROOT}" \
+    "${lock_command}" --campaign-root "${CAMPAIGN_ROOT}" \
     >"${CAMPAIGN_ROOT}/selection/lock-${JOB_ID}.out" \
     2>"${CAMPAIGN_ROOT}/selection/lock-${JOB_ID}.err"
 

@@ -282,6 +282,41 @@ This refinement remains a single-seed, short-run selection experiment.  Its
 winner must still be paired against the tuned fixed comparator for 500 updates
 on fresh seeds before a confirmatory or journal-level claim.
 
+Job 1413408 completed this rank-16 refinement, but it did not pass that gate.
+The best Full SlaClip arm improved the normalized early/full loss AUC slightly,
+while its step-200 loss was 2.87% worse than fixed `C=15`; it also spent most of
+the run at the `C=15` upper bound.  The preregistered next branch is therefore
+`glue-r8-slack-screen`, not another rank-16 target sweep.  It is motivated by
+the independently completed paper-default GLUE8/Gemma-3-4B/epsilon-6/rank-8
+arm, whose post-burn-in clipping rate is about 49% and whose small-gradient mass
+is about 21%, leaving substantially more usable slack than the rank-16/high-C
+setting.
+
+The rank-8 screen uses one allocation and two sequential stages. Stage 1 runs
+six 200-update fixed candidates `C in {0.5,1,2,5,10,15}` with seed 45. After
+all artifacts validate, it locks the endpoint-loss winner and derives five
+conditional targets from that arm's step-51--200 clipping
+`q10/q25/q50/q75/q90`. Stage 2 uses fresh seed 46 and reruns the selected fixed
+comparator alongside five primary Full SlaClip arms at `eta=0.02`, one central
+target `eta=0.05` controller-speed control, and one half-`C_0` sensitivity
+control. Thus all 14 arms remain serial inside one queued A100 job. The screen
+advances only if a primary Full SlaClip arm has lower endpoint loss and no worse
+full or late loss AUC than the fresh-seed fixed comparator, and the Stage-1
+fixed winner is not either search-grid boundary. Only then should a separate
+500-update, multi-seed official-GLUE confirmation be submitted.
+
+```bash
+PRISM_COVERAGE_PROFILE=glue-r8-slack-screen \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=glue-r8-slack-screen \
+  bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+Like the earlier screens, target derivation and public-holdout selection use
+exact NON_PRIVATE research telemetry. Per-run epsilon accounting remains valid
+conditional on the chosen hyperparameters, but the adaptive search is not an
+end-to-end differentially private release or confirmatory journal evidence.
+
 For fixed-C baseline reproduction and target-rate calibration, use
 `baseline-reproduction`. It runs the ten distinct DP-PRISM settings obtained
 by deduplicating Tables 2--4: four GLUE8 settings and six Math-10K settings,
