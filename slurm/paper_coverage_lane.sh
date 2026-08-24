@@ -33,7 +33,8 @@ is_focused_glue_profile() {
 
 is_baseline_only_profile() {
   [[ "${COVERAGE_PROFILE}" == baseline-reproduction* \
-      || "${COVERAGE_PROFILE}" == baseline-gap-fill-cached ]]
+      || "${COVERAGE_PROFILE}" == baseline-gap-fill-cached \
+      || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached ]]
 }
 
 write_lane_status() {
@@ -396,7 +397,8 @@ run_real_smoke() {
     run_one_real_smoke \
       glue8 gemma-3-4b-pt google/gemma-3-4b-pt \
       cc012e0a6d0787b4adcc0fa2c4da74402494554d configs/glue8_paper.json
-    if [[ "${COVERAGE_PROFILE}" == baseline-gap-fill-cached ]]; then
+    if [[ "${COVERAGE_PROFILE}" == baseline-gap-fill-cached \
+        || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached ]]; then
       run_one_real_smoke \
         math10k gemma-3-4b-pt google/gemma-3-4b-pt \
         cc012e0a6d0787b4adcc0fa2c4da74402494554d configs/math10k_paper.json
@@ -405,7 +407,8 @@ run_real_smoke() {
         math10k gemma-2-9b google/gemma-2-9b \
         33c193028431c2fde6c6e51f29e6f17b60cbfac6 configs/math10k_paper.json
     fi
-    if [[ "${COVERAGE_PROFILE}" == baseline-reproduction ]]; then
+    if [[ "${COVERAGE_PROFILE}" == baseline-reproduction \
+        || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached ]]; then
       run_one_real_smoke \
         math10k gemma-3-12b-pt google/gemma-3-12b-pt \
         "${MODEL_12B_REVISION}" configs/math10k_paper.json

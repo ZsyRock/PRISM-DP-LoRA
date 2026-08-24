@@ -78,6 +78,7 @@ if [[ "${COVERAGE_PROFILE}" != paper-breadth \
     && "${COVERAGE_PROFILE}" != baseline-reproduction \
     && "${COVERAGE_PROFILE}" != baseline-reproduction-cached \
     && "${COVERAGE_PROFILE}" != baseline-gap-fill-cached \
+    && "${COVERAGE_PROFILE}" != baseline-gap-fill-all-cached \
     && "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
     && "${COVERAGE_PROFILE}" != glue-r8-slack-screen ]]; then
@@ -90,7 +91,8 @@ if [[ "${GPU_LANES}" != 1 && "${GPU_LANES}" != 2 ]]; then
 fi
 if [[ ( "${COVERAGE_PROFILE}" == glue-high-c-refinement \
       || "${COVERAGE_PROFILE}" == glue-r8-slack-screen \
-      || "${COVERAGE_PROFILE}" == baseline-gap-fill-cached ) \
+      || "${COVERAGE_PROFILE}" == baseline-gap-fill-cached \
+      || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached ) \
     && "${GPU_LANES}" != 1 ]]; then
   echo "error: ${COVERAGE_PROFILE} requires PRISM_GPU_LANES=1" >&2
   exit 2
@@ -136,15 +138,17 @@ check_model google/gemma-3-4b-pt "${MODEL_4B_REVISION}"
 if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
     && "${COVERAGE_PROFILE}" != glue-r8-slack-screen \
-    && "${COVERAGE_PROFILE}" != baseline-gap-fill-cached ]]; then
+    && "${COVERAGE_PROFILE}" != baseline-gap-fill-cached \
+    && "${COVERAGE_PROFILE}" != baseline-gap-fill-all-cached ]]; then
   check_model google/gemma-2-9b "${MODEL_9B_REVISION}"
 fi
-if [[ "${COVERAGE_PROFILE}" == baseline-reproduction ]]; then
+if [[ "${COVERAGE_PROFILE}" == baseline-reproduction \
+    || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached ]]; then
   if ! check_model google/gemma-3-12b-pt "${MODEL_12B_REVISION}"; then
     if [[ "${MODE}" == --test-only ]]; then
       echo "warning: scheduler test continues without the gated 12B snapshot" >&2
     else
-      echo "error: full baseline reproduction requires the pinned 12B snapshot" >&2
+      echo "error: ${COVERAGE_PROFILE} requires the pinned 12B snapshot" >&2
       exit 2
     fi
   fi
@@ -293,7 +297,13 @@ payload = {
     "models": {
         "google/gemma-3-4b-pt": "cc012e0a6d0787b4adcc0fa2c4da74402494554d",
         "google/gemma-2-9b": "33c193028431c2fde6c6e51f29e6f17b60cbfac6",
-        "google/gemma-3-12b-pt": model_12b_revision if coverage_profile == "baseline-reproduction" else None,
+        "google/gemma-3-12b-pt": (
+            model_12b_revision
+            if coverage_profile in {
+                "baseline-reproduction", "baseline-gap-fill-all-cached"
+            }
+            else None
+        ),
     },
     "glue_eval_assets": glue_eval_root,
     "coverage_profile": coverage_profile,

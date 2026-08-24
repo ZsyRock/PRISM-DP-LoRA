@@ -75,6 +75,12 @@ if [[ "${ALLOCATION_LANES}" != 1 && "${ALLOCATION_LANES}" != 2 ]]; then
   echo "error: allocation lane count must be 1 or 2" >&2
   exit 2
 fi
+if [[ ( "${COVERAGE_PROFILE}" == baseline-gap-fill-cached \
+      || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached ) \
+    && "${ALLOCATION_LANES}" != 1 ]]; then
+  echo "error: ${COVERAGE_PROFILE} requires one sequential GPU lane" >&2
+  exit 2
+fi
 if [[ "${SLURM_NTASKS:-${ALLOCATION_LANES}}" != "${ALLOCATION_LANES}" \
     || "${SLURM_CPUS_PER_TASK:-${EXPECTED_CPUS_PER_TASK}}" != "${EXPECTED_CPUS_PER_TASK}" ]]; then
   echo "error: allocation task/CPU shape differs from the submission lock" >&2
@@ -178,19 +184,30 @@ single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
 if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
     && "${COVERAGE_PROFILE}" != glue-r8-slack-screen ]]; then
-  math_preflight_model=google/gemma-2-9b
-  math_preflight_revision="${MODEL_9B_REVISION}"
+  run_math_preflight() {
+    local model_id="${1:?missing Math preflight model}" \
+      model_revision="${2:?missing Math preflight revision}" \
+      output_name="${3:?missing Math preflight output name}"
+    single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
+      --dataset math10k \
+      --data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/math_10k.json" \
+      --expected-data-sha256 0342d0d860ad8592b579329337c90e42eefd3d9f2898043140cbd120630418b8 \
+      --output-root "${CAMPAIGN_ROOT}/preflight/${output_name}" \
+      --require-cuda --model-id "${model_id}" \
+      --model-revision "${model_revision}"
+  }
   if [[ "${COVERAGE_PROFILE}" == baseline-gap-fill-cached ]]; then
-    math_preflight_model=google/gemma-3-4b-pt
-    math_preflight_revision="${MODEL_4B_REVISION}"
+    run_math_preflight \
+      google/gemma-3-4b-pt "${MODEL_4B_REVISION}" math10k
+  elif [[ "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached ]]; then
+    run_math_preflight \
+      google/gemma-3-4b-pt "${MODEL_4B_REVISION}" math10k-4b
+    run_math_preflight \
+      google/gemma-3-12b-pt "${MODEL_12B_REVISION}" math10k-12b
+  else
+    run_math_preflight \
+      google/gemma-2-9b "${MODEL_9B_REVISION}" math10k
   fi
-  single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
-    --dataset math10k \
-    --data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/math_10k.json" \
-    --expected-data-sha256 0342d0d860ad8592b579329337c90e42eefd3d9f2898043140cbd120630418b8 \
-    --output-root "${CAMPAIGN_ROOT}/preflight/math10k" \
-    --require-cuda --model-id "${math_preflight_model}" \
-    --model-revision "${math_preflight_revision}"
 fi
 
 CURRENT_PHASE=synthetic-smoke

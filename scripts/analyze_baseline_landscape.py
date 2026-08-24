@@ -681,7 +681,10 @@ def _inspect_completed_arm(
     profile = str(manifest.get("profile", ""))
     requires_official_summary = (
         profile.startswith("baseline-reproduction")
-        or profile == "baseline-gap-fill-cached"
+        or profile in {
+            "baseline-gap-fill-cached",
+            "baseline-gap-fill-all-cached",
+        }
     )
     if utility_summary_path.is_file():
         try:

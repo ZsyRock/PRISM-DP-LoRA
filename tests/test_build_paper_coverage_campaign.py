@@ -21,6 +21,7 @@ SPEC.loader.exec_module(campaign)
 CODE_SHA = "1" * 40
 REV_4B = "2" * 40
 REV_9B = "3" * 40
+REV_12B = "4" * 40
 
 
 def test_manifest_covers_paper_settings_and_full_slaclip() -> None:
@@ -190,6 +191,78 @@ def test_cached_baseline_gap_profile_runs_only_two_missing_4b_settings() -> None
     assert len(
         campaign._plan_bytes(manifest, 0, include_all=True).decode().splitlines()
     ) == 2
+
+
+def test_all_cached_baseline_gap_profile_runs_exact_three_missing_settings() -> None:
+    manifest = campaign.build_manifest(
+        CODE_SHA,
+        REV_4B,
+        REV_9B,
+        profile="baseline-gap-fill-all-cached",
+        model_12b_revision=REV_12B,
+    )
+    arms = manifest["arms"]
+    assert [arm["setting_id"] for arm in arms] == [
+        "glue8-4b-eps6-r32",
+        "math10k-4b-eps6-r32",
+        "math10k-12b-eps6-r16",
+    ]
+    assert [arm["steps"] for arm in arms] == [500, 300, 300]
+    assert [arm["lane"] for arm in arms] == [0, 0, 0]
+    assert [arm["model_id"] for arm in arms] == [
+        campaign.MODEL_4B,
+        campaign.MODEL_4B,
+        campaign.MODEL_12B,
+    ]
+    assert [arm["model_revision"] for arm in arms] == [
+        REV_4B,
+        REV_4B,
+        REV_12B,
+    ]
+    assert all(
+        arm["method"] == "baseline"
+        and arm["candidate_id"] == "fixed-c1-paper-default"
+        and arm["initial_c"] == 1.0
+        and arm["rho"] is None
+        and arm["eta"] is None
+        and arm["seed"] == 42
+        and arm["eval_limit"] == 0
+        for arm in arms
+    )
+    assert arms[0]["dataset"] == "glue8"
+    assert arms[0]["learning_rate"] == 0.0002
+    assert arms[0]["cutoff_len"] == 384
+    assert arms[0]["train_on_inputs"] is False
+    assert all(
+        arm["dataset"] == "math10k"
+        and arm["learning_rate"] == 0.0003
+        and arm["cutoff_len"] == 256
+        and arm["train_on_inputs"] is True
+        for arm in arms[1:]
+    )
+    metadata = manifest["baseline_reproduction"]
+    assert metadata["full_length"] is True
+    assert metadata["covered_settings"] == 3
+    assert metadata["excluded_setting"] is None
+    assert metadata["gap_fill"] == {
+        "settings": [
+            "glue8-4b-eps6-r32",
+            "math10k-4b-eps6-r32",
+            "math10k-12b-eps6-r16",
+        ],
+        "completed_external_settings": 7,
+        "expected_cached_coverage_after_merge": 10,
+        "merge_requires_hash_validated_external_evidence": True,
+    }
+    sequential = campaign._plan_bytes(
+        manifest, 0, include_all=True
+    ).decode().splitlines()
+    assert [line.split("|")[2] for line in sequential] == [
+        "glue8-4b-eps6-r32",
+        "math10k-4b-eps6-r32",
+        "math10k-12b-eps6-r16",
+    ]
+    assert all(line.startswith("0|") for line in sequential)
 
 
 def test_glue_slaclip_screen_is_predeclared_and_balanced() -> None:
@@ -1103,6 +1176,28 @@ def test_full_baseline_profile_requires_pinned_12b_revision() -> None:
         )
 
 
+def test_all_cached_gap_profile_requires_pinned_12b_revision() -> None:
+    with pytest.raises(campaign.CampaignError, match="requires a pinned 12B"):
+        campaign.build_manifest(
+            CODE_SHA,
+            REV_4B,
+            REV_9B,
+            profile="baseline-gap-fill-all-cached",
+        )
+
+
+@pytest.mark.parametrize("bad", ["main", "A" * 40, "0" * 39, "g" * 40])
+def test_all_cached_gap_profile_rejects_unpinned_12b_revision(bad: str) -> None:
+    with pytest.raises(campaign.CampaignError, match="full lowercase commit SHA"):
+        campaign.build_manifest(
+            CODE_SHA,
+            REV_4B,
+            REV_9B,
+            profile="baseline-gap-fill-all-cached",
+            model_12b_revision=bad,
+        )
+
+
 def test_task_average_supports_glue_and_math_headers(tmp_path: Path) -> None:
     glue = tmp_path / "glue.csv"
     glue.write_text("method,GLUE8_Avg\nslaclip,0.75\n", encoding="utf-8")
@@ -1137,6 +1232,9 @@ def test_paper_coverage_shell_contract_uses_queue_friendly_a100_defaults() -> No
     assert "glue-high-c-refinement" in wrapper
     assert "glue-r8-slack-screen" in wrapper
     assert "baseline-gap-fill-cached" in wrapper
+    assert "baseline-gap-fill-all-cached" in wrapper
+    assert "baseline-gap-fill-all-cached" in worker
+    assert "baseline-gap-fill-all-cached" in lane
     assert "DEFAULT_PARTITION=a100" in wrapper
     assert "DEFAULT_WALLTIME=1-00:00:00" in wrapper
     assert "DEFAULT_GPU_TYPE=a100" in wrapper
@@ -1160,3 +1258,23 @@ def test_paper_coverage_shell_contract_uses_queue_friendly_a100_defaults() -> No
     assert "sbatch" not in worker
     assert 'RUN_REAL_SMOKE="${12:-true}"' in lane
     assert "expected_curve_steps" in lane
+
+
+def test_all_cached_gap_shell_contract_is_single_lane_and_checks_both_models() -> None:
+    wrapper = (ROOT / "scripts" / "submit_paper_coverage_campaign.sh").read_text()
+    worker = (ROOT / "slurm" / "paper_coverage_campaign.sbatch").read_text()
+    lane = (ROOT / "slurm" / "paper_coverage_lane.sh").read_text()
+    profile = "baseline-gap-fill-all-cached"
+
+    assert profile in wrapper
+    assert profile in worker
+    assert profile in lane
+    assert 'check_model google/gemma-3-4b-pt "${MODEL_4B_REVISION}"' in wrapper
+    assert 'check_model google/gemma-3-12b-pt "${MODEL_12B_REVISION}"' in wrapper
+    assert "requires PRISM_GPU_LANES=1" in wrapper
+    assert "requires one sequential GPU lane" in worker
+    assert 'google/gemma-3-4b-pt "${MODEL_4B_REVISION}" math10k-4b' in worker
+    assert 'google/gemma-3-12b-pt "${MODEL_12B_REVISION}" math10k-12b' in worker
+    assert "is_baseline_only_profile" in lane
+    assert "math10k gemma-3-4b-pt google/gemma-3-4b-pt" in lane
+    assert "math10k gemma-3-12b-pt google/gemma-3-12b-pt" in lane

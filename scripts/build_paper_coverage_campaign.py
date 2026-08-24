@@ -223,6 +223,23 @@ BASELINE_12B_SETTING = {
     "train_on_inputs": True,
 }
 
+# Once the separately licensed 12B snapshot is staged, this additive profile
+# closes all three gaps left by the seven completed arms from job 1402286.  It
+# is intentionally distinct from ``baseline-gap-fill-cached`` so the older
+# two-arm campaign remains byte-for-byte reproducible and never silently gains
+# a much larger model or a new access prerequisite.
+BASELINE_GAP_ALL_SETTING_IDS = (
+    *BASELINE_GAP_SETTING_IDS,
+    BASELINE_12B_SETTING["id"],
+)
+BASELINE_GAP_ALL_SETTINGS = tuple(
+    {**setting, "lane": 0}
+    for setting in (
+        *BASELINE_GAP_SETTINGS,
+        BASELINE_12B_SETTING,
+    )
+)
+
 REGIME_CANDIDATES = tuple(
     {
         "id": f"fixed-c{str(value).replace('.', 'p')}",
@@ -846,20 +863,26 @@ def build_manifest(
         "baseline-reproduction",
         "baseline-reproduction-cached",
         "baseline-gap-fill-cached",
+        "baseline-gap-fill-all-cached",
     }:
-        settings = (
-            BASELINE_GAP_SETTINGS
-            if profile == "baseline-gap-fill-cached"
-            else REGIME_SETTINGS
-        )
-        if profile == "baseline-reproduction":
+        if profile == "baseline-gap-fill-cached":
+            settings = BASELINE_GAP_SETTINGS
+        elif profile == "baseline-gap-fill-all-cached":
+            settings = BASELINE_GAP_ALL_SETTINGS
+        else:
+            settings = REGIME_SETTINGS
+        if profile in {
+            "baseline-reproduction",
+            "baseline-gap-fill-all-cached",
+        }:
             if model_12b_revision is None:
-                raise CampaignError("baseline-reproduction requires a pinned 12B revision")
+                raise CampaignError(f"{profile} requires a pinned 12B revision")
             if len(model_12b_revision) != FULL_SHA_LENGTH or any(
                 ch not in "0123456789abcdef" for ch in model_12b_revision
             ):
                 raise CampaignError("model_12b_revision must be a full lowercase commit SHA")
             revisions[MODEL_12B] = model_12b_revision
+        if profile == "baseline-reproduction":
             settings = (*settings, BASELINE_12B_SETTING)
         candidates = BASELINE_CANDIDATES
         screen_steps = None
@@ -916,7 +939,10 @@ def build_manifest(
         "baseline_reproduction": {
             "paper_default_fixed_C": 1.0,
             "full_length": profile.startswith("baseline-reproduction")
-            or profile == "baseline-gap-fill-cached",
+            or profile in {
+                "baseline-gap-fill-cached",
+                "baseline-gap-fill-all-cached",
+            },
             "covered_settings": len(settings),
             "paper_total_settings": 10,
             "excluded_setting": (
@@ -932,7 +958,15 @@ def build_manifest(
                     "expected_cached_coverage_after_merge": 9,
                     "merge_requires_hash_validated_external_evidence": True,
                 }
-                if profile == "baseline-gap-fill-cached" else None
+                if profile == "baseline-gap-fill-cached"
+                else {
+                    "settings": list(BASELINE_GAP_ALL_SETTING_IDS),
+                    "completed_external_settings": 7,
+                    "expected_cached_coverage_after_merge": 10,
+                    "merge_requires_hash_validated_external_evidence": True,
+                }
+                if profile == "baseline-gap-fill-all-cached"
+                else None
             ),
             "purpose": "estimate clipping trajectories and predeclare later SlaClip target grids",
         },
@@ -1300,18 +1334,28 @@ def _plan_bytes(manifest: dict[str, Any], lane: int, include_all: bool = False) 
     rows = []
     arms = manifest["arms"]
     if include_all:
-        priority = {setting: index for index, setting in enumerate(SEQUENTIAL_SETTING_ORDER)}
-        declaration_order = {
-            arm["arm_id"]: index for index, arm in enumerate(manifest["arms"])
-        }
-        arms = sorted(
-            arms,
-            key=lambda arm: (
-                priority.get(arm["setting_id"], len(priority)),
-                arm.get("role") == "initial_C_sensitivity_control",
-                declaration_order[arm["arm_id"]],
-            ),
-        )
+        # The all-cached gap fill is deliberately ordered as declared: finish
+        # the two already-known 4B gaps before the newly available 12B arm.  A
+        # timeout can therefore never make the new profile less complete than
+        # the historical two-arm gap fill.  Other profiles retain their
+        # established global paper-setting order.
+        if manifest.get("profile") != "baseline-gap-fill-all-cached":
+            priority = {
+                setting: index
+                for index, setting in enumerate(SEQUENTIAL_SETTING_ORDER)
+            }
+            declaration_order = {
+                arm["arm_id"]: index
+                for index, arm in enumerate(manifest["arms"])
+            }
+            arms = sorted(
+                arms,
+                key=lambda arm: (
+                    priority.get(arm["setting_id"], len(priority)),
+                    arm.get("role") == "initial_C_sensitivity_control",
+                    declaration_order[arm["arm_id"]],
+                ),
+            )
     for arm in arms:
         if not include_all and arm["lane"] != lane:
             continue
@@ -3573,6 +3617,7 @@ def parser() -> argparse.ArgumentParser:
         choices=(
             "paper-breadth", "regime-map", "baseline-reproduction",
             "baseline-reproduction-cached", "baseline-gap-fill-cached",
+            "baseline-gap-fill-all-cached",
             "glue-slaclip-screen",
             "glue-high-c-refinement", "glue-r8-slack-screen",
         ),

@@ -369,6 +369,27 @@ gap-fill campaign roots to `scripts/analyze_baseline_landscape.py`. Its
 eligibility decision and five-rho recommendation are derived only from
 manifest-registered arms and are explicitly NONPRIVATE calibration artifacts.
 
+If the exact pinned Gemma-3-12B-pt revision has since been staged under the
+same `PRISM_HF_HOME`, use the additive three-arm profile instead:
+
+```bash
+PRISM_COVERAGE_PROFILE=baseline-gap-fill-all-cached \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=baseline-gap-fill-all-cached \
+  bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+`baseline-gap-fill-all-cached` does not change the historical two-arm profile.
+It runs, sequentially, GLUE8/4B/epsilon-6/rank-32 for 500 updates,
+Math-10K/4B/epsilon-6/rank-32 for 300 updates, and
+Math-10K/12B/epsilon-6/rank-16 for 300 updates. All three use seed 42, fixed
+`C=1`, paper task defaults, full official evaluation, and immutable model
+revisions. The submitter requires one A100 lane, verifies both the 4B and 12B
+staging markers before a real submission, and the allocation runs real-model
+smokes for both model sizes before beginning the long arms. Combining this
+campaign with the seven validated external arms yields all ten paper settings;
+do not also count duplicate outputs from the two-arm gap campaign.
+
 Useful environment overrides include:
 
 ```text

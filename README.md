@@ -358,6 +358,28 @@ PRISM_COVERAGE_PROFILE=baseline-gap-fill-cached \
   bash scripts/submit_paper_coverage_campaign.sh --submit
 ```
 
+When the pinned Gemma-3-12B-pt snapshot is also staged, use the separate
+`baseline-gap-fill-all-cached` profile to close all remaining gaps in one
+queue item. It preserves the two-arm profile above unchanged and contains
+exactly three paper-default arms, in this fail-safe order: GLUE8/4B/rank-32
+for 500 updates, Math-10K/4B/rank-32 for 300 updates, and
+Math-10K/12B/rank-16 for 300 updates. Every arm uses seed 42, fixed `C=1`,
+the paper task defaults, exact research telemetry, and full official
+evaluation. The launcher requires one sequential GPU lane and fails real
+submission unless the exact pinned 12B revision has a completed staging
+marker; it never substitutes a 4B or 9B checkpoint.
+
+```bash
+PRISM_COVERAGE_PROFILE=baseline-gap-fill-all-cached \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=baseline-gap-fill-all-cached \
+  bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+Merge either the original seven-arm campaign plus this three-arm campaign, or
+the original campaign plus the historical two-arm gap fill and a separately
+registered 12B run. Do not count duplicate rank-32 arms twice.
+
 `scripts/analyze_baseline_landscape.py` combines one or more registered
 campaign manifests into an English CSV/JSON discovery table. It reports every
 registered arm, including incomplete/excluded rows, and recommends a setting
