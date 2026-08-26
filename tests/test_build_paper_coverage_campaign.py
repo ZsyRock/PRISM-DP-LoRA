@@ -265,6 +265,57 @@ def test_all_cached_baseline_gap_profile_runs_exact_three_missing_settings() -> 
     assert all(line.startswith("0|") for line in sequential)
 
 
+def test_math_only_gap_profile_runs_only_the_two_unstarted_arms() -> None:
+    manifest = campaign.build_manifest(
+        CODE_SHA,
+        REV_4B,
+        REV_9B,
+        profile="baseline-gap-fill-math-only-cached",
+        model_12b_revision=REV_12B,
+    )
+    arms = manifest["arms"]
+    assert [arm["setting_id"] for arm in arms] == [
+        "math10k-4b-eps6-r32",
+        "math10k-12b-eps6-r16",
+    ]
+    assert [arm["steps"] for arm in arms] == [300, 300]
+    assert [arm["lane"] for arm in arms] == [0, 0]
+    assert [arm["model_id"] for arm in arms] == [
+        campaign.MODEL_4B,
+        campaign.MODEL_12B,
+    ]
+    assert [arm["model_revision"] for arm in arms] == [REV_4B, REV_12B]
+    assert all(
+        arm["dataset"] == "math10k"
+        and arm["method"] == "baseline"
+        and arm["candidate_id"] == "fixed-c1-paper-default"
+        and arm["initial_c"] == 1.0
+        and arm["rho"] is None
+        and arm["eta"] is None
+        and arm["seed"] == 42
+        and arm["eval_limit"] == 0
+        for arm in arms
+    )
+    metadata = manifest["baseline_reproduction"]
+    assert metadata["full_length"] is True
+    assert metadata["covered_settings"] == 2
+    assert metadata["excluded_setting"] is None
+    assert metadata["gap_fill"] == {
+        "settings": ["math10k-4b-eps6-r32", "math10k-12b-eps6-r16"],
+        "completed_external_settings": 8,
+        "expected_cached_coverage_after_merge": 10,
+        "merge_requires_hash_validated_external_evidence": True,
+    }
+    sequential = campaign._plan_bytes(
+        manifest, 0, include_all=True
+    ).decode().splitlines()
+    assert [line.split("|")[2] for line in sequential] == [
+        "math10k-4b-eps6-r32",
+        "math10k-12b-eps6-r16",
+    ]
+    assert all(line.startswith("0|") for line in sequential)
+
+
 def test_glue_slaclip_screen_is_predeclared_and_balanced() -> None:
     paper_config = json.loads((ROOT / "configs" / "glue8_paper.json").read_text())
     assert paper_config["slaclip_target_non_small_clip_fraction"] == 0.5
@@ -1186,6 +1237,16 @@ def test_all_cached_gap_profile_requires_pinned_12b_revision() -> None:
         )
 
 
+def test_math_only_gap_profile_requires_pinned_12b_revision() -> None:
+    with pytest.raises(campaign.CampaignError, match="requires a pinned 12B"):
+        campaign.build_manifest(
+            CODE_SHA,
+            REV_4B,
+            REV_9B,
+            profile="baseline-gap-fill-math-only-cached",
+        )
+
+
 @pytest.mark.parametrize("bad", ["main", "A" * 40, "0" * 39, "g" * 40])
 def test_all_cached_gap_profile_rejects_unpinned_12b_revision(bad: str) -> None:
     with pytest.raises(campaign.CampaignError, match="full lowercase commit SHA"):
@@ -1225,6 +1286,12 @@ def test_paper_coverage_timeout_signal_reaches_job_steps() -> None:
     assert 'write_arm_status completed 0\n  CURRENT_ARM_STATUS=""' in lane
 
 
+def test_paper_coverage_summary_guard_uses_a_shell_file_test() -> None:
+    lane = (ROOT / "slurm" / "paper_coverage_lane.sh").read_text()
+    assert '&& ! -s "${result_dir}/summary.csv"' not in lane
+    assert '&& [[ ! -s "${result_dir}/summary.csv" ]]' in lane
+
+
 def test_paper_coverage_shell_contract_uses_queue_friendly_a100_defaults() -> None:
     wrapper = (ROOT / "scripts" / "submit_paper_coverage_campaign.sh").read_text()
     worker = (ROOT / "slurm" / "paper_coverage_campaign.sbatch").read_text()
@@ -1235,6 +1302,9 @@ def test_paper_coverage_shell_contract_uses_queue_friendly_a100_defaults() -> No
     assert "baseline-gap-fill-all-cached" in wrapper
     assert "baseline-gap-fill-all-cached" in worker
     assert "baseline-gap-fill-all-cached" in lane
+    assert "baseline-gap-fill-math-only-cached" in wrapper
+    assert "baseline-gap-fill-math-only-cached" in worker
+    assert "baseline-gap-fill-math-only-cached" in lane
     assert "DEFAULT_PARTITION=a100" in wrapper
     assert "DEFAULT_WALLTIME=1-00:00:00" in wrapper
     assert "DEFAULT_GPU_TYPE=a100" in wrapper

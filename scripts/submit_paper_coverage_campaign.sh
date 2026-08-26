@@ -79,6 +79,7 @@ if [[ "${COVERAGE_PROFILE}" != paper-breadth \
     && "${COVERAGE_PROFILE}" != baseline-reproduction-cached \
     && "${COVERAGE_PROFILE}" != baseline-gap-fill-cached \
     && "${COVERAGE_PROFILE}" != baseline-gap-fill-all-cached \
+    && "${COVERAGE_PROFILE}" != baseline-gap-fill-math-only-cached \
     && "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
     && "${COVERAGE_PROFILE}" != glue-r8-slack-screen ]]; then
@@ -92,7 +93,8 @@ fi
 if [[ ( "${COVERAGE_PROFILE}" == glue-high-c-refinement \
       || "${COVERAGE_PROFILE}" == glue-r8-slack-screen \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-cached \
-      || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached ) \
+      || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached \
+      || "${COVERAGE_PROFILE}" == baseline-gap-fill-math-only-cached ) \
     && "${GPU_LANES}" != 1 ]]; then
   echo "error: ${COVERAGE_PROFILE} requires PRISM_GPU_LANES=1" >&2
   exit 2
@@ -120,9 +122,11 @@ for required in \
   [[ -f "${REPO_ROOT}/${required}" ]] || { echo "error: missing ${required}" >&2; exit 2; }
 done
 
-"${ENV_PREFIX}/bin/python" "${REPO_ROOT}/scripts/prepare_glue_eval_assets.py" \
-  --output-root "${GLUE_EVAL_ROOT}" \
-  --cache-dir "${SHARED_HF_HOME}/datasets"
+if [[ "${COVERAGE_PROFILE}" != baseline-gap-fill-math-only-cached ]]; then
+  "${ENV_PREFIX}/bin/python" "${REPO_ROOT}/scripts/prepare_glue_eval_assets.py" \
+    --output-root "${GLUE_EVAL_ROOT}" \
+    --cache-dir "${SHARED_HF_HOME}/datasets"
+fi
 
 check_model() {
   local model_id="$1" revision="$2"
@@ -139,11 +143,13 @@ if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
     && "${COVERAGE_PROFILE}" != glue-r8-slack-screen \
     && "${COVERAGE_PROFILE}" != baseline-gap-fill-cached \
-    && "${COVERAGE_PROFILE}" != baseline-gap-fill-all-cached ]]; then
+    && "${COVERAGE_PROFILE}" != baseline-gap-fill-all-cached \
+    && "${COVERAGE_PROFILE}" != baseline-gap-fill-math-only-cached ]]; then
   check_model google/gemma-2-9b "${MODEL_9B_REVISION}"
 fi
 if [[ "${COVERAGE_PROFILE}" == baseline-reproduction \
-    || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached ]]; then
+    || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached \
+    || "${COVERAGE_PROFILE}" == baseline-gap-fill-math-only-cached ]]; then
   if ! check_model google/gemma-3-12b-pt "${MODEL_12B_REVISION}"; then
     if [[ "${MODE}" == --test-only ]]; then
       echo "warning: scheduler test continues without the gated 12B snapshot" >&2
@@ -300,7 +306,8 @@ payload = {
         "google/gemma-3-12b-pt": (
             model_12b_revision
             if coverage_profile in {
-                "baseline-reproduction", "baseline-gap-fill-all-cached"
+                "baseline-reproduction", "baseline-gap-fill-all-cached",
+                "baseline-gap-fill-math-only-cached"
             }
             else None
         ),

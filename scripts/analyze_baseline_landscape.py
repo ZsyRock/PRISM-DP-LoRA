@@ -684,6 +684,7 @@ def _inspect_completed_arm(
         or profile in {
             "baseline-gap-fill-cached",
             "baseline-gap-fill-all-cached",
+            "baseline-gap-fill-math-only-cached",
         }
     )
     if utility_summary_path.is_file():

@@ -76,7 +76,8 @@ if [[ "${ALLOCATION_LANES}" != 1 && "${ALLOCATION_LANES}" != 2 ]]; then
   exit 2
 fi
 if [[ ( "${COVERAGE_PROFILE}" == baseline-gap-fill-cached \
-      || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached ) \
+      || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached \
+      || "${COVERAGE_PROFILE}" == baseline-gap-fill-math-only-cached ) \
     && "${ALLOCATION_LANES}" != 1 ]]; then
   echo "error: ${COVERAGE_PROFILE} requires one sequential GPU lane" >&2
   exit 2
@@ -98,7 +99,8 @@ for required in \
   slurm/paper_coverage_lane.sh; do
   [[ -f "${REPO_ROOT}/${required}" ]] || { echo "error: missing ${required}" >&2; exit 2; }
 done
-"${PYTHON_BIN}" - "${GLUE_EVAL_ROOT}" <<'PY'
+if [[ "${COVERAGE_PROFILE}" != baseline-gap-fill-math-only-cached ]]; then
+  "${PYTHON_BIN}" - "${GLUE_EVAL_ROOT}" <<'PY'
 import sys
 from pathlib import Path
 from src.prism_cli.eval_glue import _load_glue_asset_manifest, _load_glue_dataset
@@ -109,6 +111,7 @@ for task in manifest['tasks']:
     _load_glue_dataset(task, root)
 print(f"offline_glue_assets={root} revision={manifest['dataset_revision']} content={manifest['content_sha256']}")
 PY
+fi
 
 cd -- "${REPO_ROOT}"
 export PRISM_REPO_ROOT="${REPO_ROOT}"
@@ -175,12 +178,14 @@ verify_plan_sidecar() {
   }
 }
 
-single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
-  --dataset glue8 \
-  --data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/glue8_1250.json" \
-  --expected-data-sha256 281bad3305e8be7a7660b64b22704a9462f983b90df5d6f0c1c4abb649d6d091 \
-  --output-root "${CAMPAIGN_ROOT}/preflight/glue8" \
-  --require-cuda --model-id google/gemma-3-4b-pt --model-revision "${MODEL_4B_REVISION}"
+if [[ "${COVERAGE_PROFILE}" != baseline-gap-fill-math-only-cached ]]; then
+  single_gpu_step "${PYTHON_BIN}" scripts/preflight_hpc.py \
+    --dataset glue8 \
+    --data-path "${REPO_ROOT}/LLM-Adapters/ft-training_set/glue8_1250.json" \
+    --expected-data-sha256 281bad3305e8be7a7660b64b22704a9462f983b90df5d6f0c1c4abb649d6d091 \
+    --output-root "${CAMPAIGN_ROOT}/preflight/glue8" \
+    --require-cuda --model-id google/gemma-3-4b-pt --model-revision "${MODEL_4B_REVISION}"
+fi
 if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
     && "${COVERAGE_PROFILE}" != glue-r8-slack-screen ]]; then
@@ -199,7 +204,8 @@ if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
   if [[ "${COVERAGE_PROFILE}" == baseline-gap-fill-cached ]]; then
     run_math_preflight \
       google/gemma-3-4b-pt "${MODEL_4B_REVISION}" math10k
-  elif [[ "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached ]]; then
+  elif [[ "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached \
+      || "${COVERAGE_PROFILE}" == baseline-gap-fill-math-only-cached ]]; then
     run_math_preflight \
       google/gemma-3-4b-pt "${MODEL_4B_REVISION}" math10k-4b
     run_math_preflight \

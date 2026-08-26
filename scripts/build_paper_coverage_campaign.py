@@ -240,6 +240,27 @@ BASELINE_GAP_ALL_SETTINGS = tuple(
     )
 )
 
+# Job 1430760 completed and evaluated the GLUE/rank-32 arm before a shell
+# postcondition typo stopped the lane.  This additive recovery profile runs
+# only the two Math arms that never started.  Both remain on lane 0 so the
+# campaign is one sequential allocation, and the 4B arm is deliberately first
+# so a wall-time interruption cannot hide its cheaper baseline behind 12B.
+BASELINE_MATH_GAP_SETTING_IDS = (
+    "math10k-4b-eps6-r32",
+    BASELINE_12B_SETTING["id"],
+)
+BASELINE_MATH_GAP_SETTINGS = tuple(
+    {**setting, "lane": 0}
+    for setting in (
+        next(
+            setting
+            for setting in REGIME_SETTINGS
+            if setting["id"] == "math10k-4b-eps6-r32"
+        ),
+        BASELINE_12B_SETTING,
+    )
+)
+
 REGIME_CANDIDATES = tuple(
     {
         "id": f"fixed-c{str(value).replace('.', 'p')}",
@@ -864,16 +885,20 @@ def build_manifest(
         "baseline-reproduction-cached",
         "baseline-gap-fill-cached",
         "baseline-gap-fill-all-cached",
+        "baseline-gap-fill-math-only-cached",
     }:
         if profile == "baseline-gap-fill-cached":
             settings = BASELINE_GAP_SETTINGS
         elif profile == "baseline-gap-fill-all-cached":
             settings = BASELINE_GAP_ALL_SETTINGS
+        elif profile == "baseline-gap-fill-math-only-cached":
+            settings = BASELINE_MATH_GAP_SETTINGS
         else:
             settings = REGIME_SETTINGS
         if profile in {
             "baseline-reproduction",
             "baseline-gap-fill-all-cached",
+            "baseline-gap-fill-math-only-cached",
         }:
             if model_12b_revision is None:
                 raise CampaignError(f"{profile} requires a pinned 12B revision")
@@ -942,6 +967,7 @@ def build_manifest(
             or profile in {
                 "baseline-gap-fill-cached",
                 "baseline-gap-fill-all-cached",
+                "baseline-gap-fill-math-only-cached",
             },
             "covered_settings": len(settings),
             "paper_total_settings": 10,
@@ -966,6 +992,13 @@ def build_manifest(
                     "merge_requires_hash_validated_external_evidence": True,
                 }
                 if profile == "baseline-gap-fill-all-cached"
+                else {
+                    "settings": list(BASELINE_MATH_GAP_SETTING_IDS),
+                    "completed_external_settings": 8,
+                    "expected_cached_coverage_after_merge": 10,
+                    "merge_requires_hash_validated_external_evidence": True,
+                }
+                if profile == "baseline-gap-fill-math-only-cached"
                 else None
             ),
             "purpose": "estimate clipping trajectories and predeclare later SlaClip target grids",
@@ -1339,7 +1372,10 @@ def _plan_bytes(manifest: dict[str, Any], lane: int, include_all: bool = False) 
         # timeout can therefore never make the new profile less complete than
         # the historical two-arm gap fill.  Other profiles retain their
         # established global paper-setting order.
-        if manifest.get("profile") != "baseline-gap-fill-all-cached":
+        if manifest.get("profile") not in {
+            "baseline-gap-fill-all-cached",
+            "baseline-gap-fill-math-only-cached",
+        }:
             priority = {
                 setting: index
                 for index, setting in enumerate(SEQUENTIAL_SETTING_ORDER)
@@ -3618,6 +3654,7 @@ def parser() -> argparse.ArgumentParser:
             "paper-breadth", "regime-map", "baseline-reproduction",
             "baseline-reproduction-cached", "baseline-gap-fill-cached",
             "baseline-gap-fill-all-cached",
+            "baseline-gap-fill-math-only-cached",
             "glue-slaclip-screen",
             "glue-high-c-refinement", "glue-r8-slack-screen",
         ),

@@ -328,14 +328,21 @@ def test_baseline_reproduction_requires_one_row_official_summary(tmp_path: Path)
     assert "missing official utility summary" in report["coverage"][0]["reason"]
 
 
-def test_all_cached_gap_requires_one_row_official_summary(tmp_path: Path) -> None:
-    campaign = tmp_path / "campaign"
-    arm = _arm("all-cached-gap-paper-baseline")
-    _manifest(campaign, [arm], profile="baseline-gap-fill-all-cached")
-    _write_completed(campaign, arm)
+def test_gap_recovery_profiles_require_one_row_official_summary(
+    tmp_path: Path,
+) -> None:
+    profiles = (
+        "baseline-gap-fill-all-cached",
+        "baseline-gap-fill-math-only-cached",
+    )
+    for profile in profiles:
+        campaign = tmp_path / profile
+        arm = _arm(f"{profile}-paper-baseline")
+        _manifest(campaign, [arm], profile=profile)
+        _write_completed(campaign, arm)
 
-    output = tmp_path / "out"
-    assert _main([campaign], output, "--allow-incomplete") == 2
-    report = json.loads((output / "baseline_landscape.json").read_text())
-    assert report["counts"]["invalid_arms"] == 1
-    assert "missing official utility summary" in report["coverage"][0]["reason"]
+        output = tmp_path / f"out-{profile}"
+        assert _main([campaign], output, "--allow-incomplete") == 2
+        report = json.loads((output / "baseline_landscape.json").read_text())
+        assert report["counts"]["invalid_arms"] == 1
+        assert "missing official utility summary" in report["coverage"][0]["reason"]
