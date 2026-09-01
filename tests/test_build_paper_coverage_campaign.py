@@ -496,6 +496,50 @@ def test_glue_r8_slack_screen_predeclares_fresh_seed_two_stage_recipe() -> None:
     assert len(campaign._plan_bytes(manifest, 0, include_all=True).splitlines()) == 6
 
 
+def test_glue_target_baseline_screen_is_compact_baseline_only_and_ordered() -> None:
+    manifest = campaign.build_manifest(
+        CODE_SHA, REV_4B, REV_9B, profile="glue-target-baseline-screen"
+    )
+    arms = manifest["arms"]
+    assert len(arms) == 10
+    assert manifest["seed"] == 47
+    assert manifest["inference_class"].startswith("single_seed_fixed_baseline")
+    assert [arm["setting_id"] for arm in arms[:5]] == [
+        "glue8-4b-eps6-r32"
+    ] * 5
+    assert [arm["setting_id"] for arm in arms[5:]] == [
+        "glue8-4b-eps3-r16"
+    ] * 5
+    assert {arm["initial_c"] for arm in arms} == {1.0, 5.0, 15.0, 30.0, 50.0}
+    assert all(
+        arm["method"] == "baseline"
+        and arm["role"] == "target_calibration_fixed_candidate"
+        and arm["stage"] == 1
+        and arm["seed"] == 47
+        and arm["steps"] == 200
+        and arm["lane"] == 0
+        and arm["rho"] is None
+        and arm["eta"] is None
+        for arm in arms
+    )
+    screen = manifest["glue_target_baseline_screen"]
+    assert screen["target_recipe"]["quantiles"] == [0.10, 0.25, 0.50, 0.75, 0.90]
+    assert screen["target_recipe"]["rho_bounds"] == [0.05, 0.95]
+    assert screen["target_recipe"]["normalization"] == (
+        "expected_batch_size_for_both_clip_mass_and_z_t"
+    )
+    assert screen["target_recipe"]["required_telemetry_schema_version"] == 7
+    assert screen["target_recipe"]["minimum_projected_rho_span"] == 0.10
+    assert screen["target_recipe"]["minimum_projected_rho_adjacent_gap"] == 0.02
+    assert screen["target_recipe"]["adaptive_arms_in_this_campaign"] == 0
+    assert screen["privacy_scope"]["next_stage_requires_fresh_seeds"] is True
+    plan = campaign._plan_bytes(manifest, 0, include_all=True).decode().splitlines()
+    assert len(plan) == 10
+    assert [line.split("|")[2] for line in plan[:5]] == [
+        "glue8-4b-eps6-r32"
+    ] * 5
+
+
 def _write_focused_campaign(
     root_path: Path,
     *,
@@ -599,6 +643,11 @@ def _write_focused_campaign(
                 "slaclip_c_min": 0.1,
                 "slaclip_c_max": 15.0,
             })
+        if manifest["profile"] == "glue-target-baseline-screen":
+            config.update({
+                "raw_hist_bins": 512,
+                "raw_hist_max": 200.0,
+            })
         status = {
             "state": "completed",
             "update_steps": steps,
@@ -623,6 +672,7 @@ def _write_focused_campaign(
         raw_records = [
             {
                 "NON_PRIVATE_TELEMETRY": True,
+                "telemetry_schema_version": 7,
                 "run_id": run_id,
                 "config_fingerprint": fingerprint,
                 "method": arm["method"],
@@ -633,10 +683,36 @@ def _write_focused_campaign(
                 "step": step,
                 "raw_clip_fraction": 0.4 + step / 1000.0,
                 "raw_reference_small_gradient_proxy": 0.2,
+                "raw_reference_remaining_mass_proxy": 0.8,
                 "raw_reference_conditional_clip_fraction": (
-                    0.30 + index / 100.0 + step / 2000.0
+                    (0.4 + step / 1000.0) / 0.8
                 ),
                 "raw_reference_conditional_clip_fraction_valid": True,
+                "raw_reference_conditional_normalization": "expected_batch_size",
+                "dp_noise_multiplier": 1.0,
+                "dp_expected_batch_size": 64.0,
+                "raw_realized_batch_size": 64,
+                "raw_reference_expected_batch_size_normalization": 64.0,
+                "raw_reference_realized_to_expected_batch_ratio": 1.0,
+                "raw_reference_expected_normalized_clip_mass": (
+                    0.4 + step / 1000.0
+                ),
+                "raw_reference_slaclip_num_slots": 15,
+                **(
+                    {
+                        "raw_global_norm_hist_counts": [64] + [0] * 511,
+                        "raw_global_norm_hist_edges": [
+                            200.0 * bin_index / 512
+                            for bin_index in range(513)
+                        ],
+                        "raw_global_norm_hist_overflow": 0,
+                    }
+                    if (
+                        manifest["profile"] == "glue-target-baseline-screen"
+                        and step == 1
+                    )
+                    else {}
+                ),
             }
             for step in range(1, steps + 1)
         ]
@@ -742,6 +818,51 @@ def test_glue_slaclip_analyzer_uses_locked_public_holdout(tmp_path: Path) -> Non
         tmp_path / "artifacts" / "public_validation_curve.csv"
     ).read_text().splitlines()
     assert len(validation_curve) == 1 + 12 * 4
+
+
+def test_glue_target_baseline_analyzer_derives_five_conditional_targets(
+    tmp_path: Path,
+) -> None:
+    losses = {
+        "fixed-c1p0": 0.60,
+        "fixed-c5p0": 0.50,
+        "fixed-c15p0": 0.40,
+        "fixed-c30p0": 0.45,
+        "fixed-c50p0": 0.55,
+    }
+    _write_focused_campaign(
+        tmp_path,
+        profile="glue-target-baseline-screen",
+        validation_losses=losses,
+    )
+
+    campaign.analyze(tmp_path)
+    selection = json.loads(
+        (
+            tmp_path / "artifacts" / "glue_target_baseline_selection.json"
+        ).read_text()
+    )
+    assert selection["adaptive_arms_in_campaign"] == 0
+    assert selection["fresh_seed_required_for_adaptive_screen"] is True
+    assert len(selection["arm_artifact_sha256"]) == 10
+    histogram = selection["norm_histogram_artifact"]
+    assert len(histogram["sha256"]) == 64
+    assert (tmp_path / "artifacts" / histogram["path"]).is_file()
+    assert len(selection["settings"]) == 2
+    for setting in selection["settings"]:
+        assert setting["best_fixed"]["initial_C"] == 15.0
+        assert setting["best_fixed_at_search_boundary"] is False
+        assert setting["post_burn_in_steps"] == 150
+        assert setting["conditional_proxy_valid_fraction"] == 1.0
+        assert setting["projected_conditional_rho_unique_count"] == 5
+        assert setting["projected_conditional_rho_span"] >= 0.10
+        assert setting["projected_conditional_rho_min_adjacent_gap"] >= 0.02
+        assert list(setting["full_slaclip_target_candidates"]) == [
+            "q10", "q25", "q50", "q75", "q90"
+        ]
+        assert setting["target_grid_identifiable"] is True
+        assert setting["adaptive_exploratory_screen_allowed"] is True
+        assert setting["journal_confirmation_ready"] is False
 
 
 def test_glue_slaclip_analyzer_rejects_candidate_identity_mismatch(tmp_path: Path) -> None:
@@ -1298,6 +1419,9 @@ def test_paper_coverage_shell_contract_uses_queue_friendly_a100_defaults() -> No
     lane = (ROOT / "slurm" / "paper_coverage_lane.sh").read_text()
     assert "glue-high-c-refinement" in wrapper
     assert "glue-r8-slack-screen" in wrapper
+    assert "glue-target-baseline-screen" in wrapper
+    assert "glue-target-baseline-screen" in worker
+    assert "glue-target-baseline-screen" in lane
     assert "baseline-gap-fill-cached" in wrapper
     assert "baseline-gap-fill-all-cached" in wrapper
     assert "baseline-gap-fill-all-cached" in worker
@@ -1328,6 +1452,11 @@ def test_paper_coverage_shell_contract_uses_queue_friendly_a100_defaults() -> No
     assert "sbatch" not in worker
     assert 'RUN_REAL_SMOKE="${12:-true}"' in lane
     assert "expected_curve_steps" in lane
+    assert "raw_hist_bins=512" in lane
+    assert "raw_hist_max=200.0" in lane
+    assert "target-baseline real smoke telemetry semantics mismatch" in lane
+    assert "raw_reference_expected_normalized_clip_mass" in lane
+    assert 'smoke_initial_c=50.0' in lane
 
 
 def test_all_cached_gap_shell_contract_is_single_lane_and_checks_both_models() -> None:

@@ -317,6 +317,47 @@ exact NON_PRIVATE research telemetry. Per-run epsilon accounting remains valid
 conditional on the chosen hyperparameters, but the adaptive search is not an
 end-to-end differentially private release or confirmatory journal evidence.
 
+The compact `glue-target-baseline-screen` profile fills the two remaining
+target-calibration gaps after all ten paper-default baselines have completed.
+The default landscape identifies all four GLUE8/Gemma-3-4B settings as
+non-saturated and target-identifiable, whereas all six Math settings have a
+fixed-`C=1` clipping median of 100% and no useful conditional-target spread.
+Rank 8 and epsilon-6/rank-16 already have fixed/adaptive screens whose fixed
+winners reached the old `C=15` boundary. This profile therefore runs only the
+unscanned epsilon-6/rank-32 and epsilon-3/rank-16 settings, in that failure-safe
+order, using seed 47 and five 200-update fixed candidates
+`C in {1,5,15,30,50}`. It has exactly ten baseline arms, no adaptive arms, and
+runs them sequentially in one queued allocation.
+
+Each arm records the same public 800-row response-only validation curve and
+exact NON_PRIVATE clipping/CDF/bias--noise telemetry. For thresholds as high as
+50, the research histogram is widened to `[0,200]` with 512 bins. Norms may
+still exceed 200, so every step retains its exact overflow count and fraction;
+the analyzer emits a separately hashed `NON_PRIVATE_norm_histograms.jsonl`
+instead of silently dropping that mass. After excluding steps 1--50, the
+analyzer ranks fixed candidates by step-200 holdout loss and emits
+`glue_target_baseline_selection.json`. It separately reports hard clipping and
+derives five Full SlaClip conditional targets from the winning fixed arm's
+`q10/q25/q50/q75/q90`, with `p*_t = rho * (1-z_t)`. Both the clipped-mass
+numerator and `z_t` use the controller's public expected-batch normalization;
+the realized-batch clipping fraction is reported separately and is never used
+directly as `rho`. Telemetry schema 7 records and validates that distinction.
+The target grid must also span at least 0.10 with adjacent targets at least
+0.02 apart. A boundary winner blocks the adaptive stage and requires an
+expanded fixed grid; an interior winner still requires local fixed-C
+refinement before a journal confirmation. Any later Full SlaClip screen must
+use a fresh seed.
+
+```bash
+PRISM_COVERAGE_PROFILE=glue-target-baseline-screen \
+PRISM_SLURM_PARTITION=a100 PRISM_GPU_TYPE=a100 PRISM_GPU_LANES=1 \
+PRISM_CPUS_PER_TASK=8 PRISM_SLURM_MEMORY=80G PRISM_STEP_MEMORY=76G \
+PRISM_SLURM_WALLTIME=1-00:00:00 \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=glue-target-baseline-screen \
+  bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
 For fixed-C baseline reproduction and target-rate calibration, use
 `baseline-reproduction`. It runs the ten distinct DP-PRISM settings obtained
 by deduplicating Tables 2--4: four GLUE8 settings and six Math-10K settings,
@@ -387,7 +428,12 @@ only when clipping is unsaturated, the trajectory changes materially, the
 small-gradient proxy is distinguishable from expected Slack-release noise,
 and five conditional-rho quantiles remain unique after projection. This step
 consumes exact `NON_PRIVATE` telemetry and is hypothesis generation, not an
-end-to-end DP release or confirmatory result.
+end-to-end DP release or confirmatory result. For legacy schema-6 runs it
+recomputes conditional rho as
+`raw_clip_fraction * realized_batch / expected_batch / (1-z_t)` whenever the
+realized batch was recorded; schema-7 runs additionally fail closed unless the
+logged expected-batch-normalized mass and conditional value agree with that
+identity.
 
 ```bash
 python scripts/analyze_baseline_landscape.py \

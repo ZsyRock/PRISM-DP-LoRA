@@ -82,7 +82,8 @@ if [[ "${COVERAGE_PROFILE}" != paper-breadth \
     && "${COVERAGE_PROFILE}" != baseline-gap-fill-math-only-cached \
     && "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
-    && "${COVERAGE_PROFILE}" != glue-r8-slack-screen ]]; then
+    && "${COVERAGE_PROFILE}" != glue-r8-slack-screen \
+    && "${COVERAGE_PROFILE}" != glue-target-baseline-screen ]]; then
   echo "error: unsupported PRISM_COVERAGE_PROFILE" >&2
   exit 2
 fi
@@ -92,6 +93,7 @@ if [[ "${GPU_LANES}" != 1 && "${GPU_LANES}" != 2 ]]; then
 fi
 if [[ ( "${COVERAGE_PROFILE}" == glue-high-c-refinement \
       || "${COVERAGE_PROFILE}" == glue-r8-slack-screen \
+      || "${COVERAGE_PROFILE}" == glue-target-baseline-screen \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-cached \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-math-only-cached ) \
@@ -142,6 +144,7 @@ check_model google/gemma-3-4b-pt "${MODEL_4B_REVISION}"
 if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
     && "${COVERAGE_PROFILE}" != glue-r8-slack-screen \
+    && "${COVERAGE_PROFILE}" != glue-target-baseline-screen \
     && "${COVERAGE_PROFILE}" != baseline-gap-fill-cached \
     && "${COVERAGE_PROFILE}" != baseline-gap-fill-all-cached \
     && "${COVERAGE_PROFILE}" != baseline-gap-fill-math-only-cached ]]; then

@@ -75,6 +75,7 @@ LANDSCAPE_FIELDS = (
     "remaining_proxy_median",
     "conditional_proxy_valid_records",
     "conditional_proxy_valid_fraction",
+    "conditional_proxy_normalization",
     "conditional_proxy_raw_q10",
     "conditional_proxy_raw_q25",
     "conditional_proxy_raw_median",
@@ -483,6 +484,7 @@ def _analyze_records(
     remaining: list[float] = []
     conditional: list[float] = []
     noise_std: list[float] = []
+    conditional_normalizations: set[str] = set()
     post_steps: list[int] = []
     for record in post:
         step = _integer(record.get("step"), "raw.step", minimum=1)
@@ -500,22 +502,6 @@ def _analyze_records(
         small.append(small_value)
         remaining.append(remaining_value)
         post_steps.append(step)
-        conditional_valid = record.get(
-            "raw_reference_conditional_clip_fraction_valid", True
-        )
-        conditional_value = record.get("raw_reference_conditional_clip_fraction")
-        if conditional_valid is True and conditional_value is not None:
-            value = _finite(conditional_value,
-                            f"raw step {step}.conditional_clip_fraction")
-            if value < 0.0:
-                raise ArmArtifactError(
-                    f"raw step {step}.conditional_clip_fraction is negative"
-                )
-            conditional.append(value)
-        elif conditional_valid not in (True, False):
-            raise ArmArtifactError(
-                f"raw step {step}.conditional validity flag must be boolean"
-            )
         multiplier = _finite(record.get("dp_noise_multiplier"),
                              f"raw step {step}.dp_noise_multiplier")
         expected_batch = _finite(record.get("dp_expected_batch_size"),
@@ -535,6 +521,74 @@ def _analyze_records(
         if normalization is not None:
             _require_number(normalization, expected_batch,
                             f"raw step {step}.expected_batch_normalization")
+        realized_batch = record.get("raw_realized_batch_size")
+        conditional_valid = record.get(
+            "raw_reference_conditional_clip_fraction_valid", True
+        )
+        conditional_value = record.get("raw_reference_conditional_clip_fraction")
+        if conditional_valid not in (True, False):
+            raise ArmArtifactError(
+                f"raw step {step}.conditional validity flag must be boolean"
+            )
+        expected_valid = remaining_value > 1e-12
+        if conditional_valid != expected_valid:
+            raise ArmArtifactError(
+                f"raw step {step}.conditional validity disagrees with remaining mass"
+            )
+        if conditional_valid and conditional_value is not None:
+            logged = _finite(
+                conditional_value,
+                f"raw step {step}.conditional_clip_fraction",
+            )
+            if realized_batch is None:
+                # Some early synthetic/unit fixtures did not retain realized
+                # batch size. Preserve their declared legacy coordinate, but
+                # label it so it cannot be confused with current calibration.
+                value = logged
+                conditional_normalizations.add(
+                    "legacy_logged_realized_batch_fraction"
+                )
+            else:
+                realized = _finite(
+                    realized_batch, f"raw step {step}.raw_realized_batch_size"
+                )
+                if realized <= 0:
+                    raise ArmArtifactError(
+                        f"raw step {step}.realized batch must be positive"
+                    )
+                expected_normalized_clip_mass = (
+                    clip_value * realized / expected_batch
+                )
+                value = expected_normalized_clip_mass / remaining_value
+                conditional_normalizations.add(
+                    "recomputed_expected_batch_size"
+                )
+                if int(record.get("telemetry_schema_version", 0)) >= 7:
+                    if record.get("raw_reference_conditional_normalization") != (
+                        "expected_batch_size"
+                    ):
+                        raise ArmArtifactError(
+                            f"raw step {step}.conditional normalization marker is invalid"
+                        )
+                    _require_number(
+                        record.get("raw_reference_expected_normalized_clip_mass"),
+                        expected_normalized_clip_mass,
+                        f"raw step {step}.expected-normalized clip mass",
+                    )
+                    _require_number(
+                        logged,
+                        value,
+                        f"raw step {step}.conditional clip mass",
+                    )
+            if value < 0.0:
+                raise ArmArtifactError(
+                    f"raw step {step}.conditional_clip_fraction is negative"
+                )
+            conditional.append(value)
+        elif conditional_valid:
+            raise ArmArtifactError(
+                f"raw step {step}.valid conditional proxy is missing"
+            )
         noise_std.append(multiplier * math.sqrt(slots) / expected_batch)
 
     clip_quantiles = {name: _quantile(clip, probability)
@@ -619,6 +673,9 @@ def _analyze_records(
         "remaining_proxy_median": _quantile(remaining, 0.5),
         "conditional_proxy_valid_records": len(conditional),
         "conditional_proxy_valid_fraction": conditional_valid_fraction,
+        "conditional_proxy_normalization": "+".join(
+            sorted(conditional_normalizations)
+        ),
         **{f"conditional_proxy_raw_{name}": value
            for name, value in conditional_quantiles.items()},
         **{f"projected_rho_{name}": value for name, value in projected.items()},

@@ -1470,15 +1470,35 @@ class PRISM(torch.optim.Optimizer):
                         math.isfinite(reference_remaining_proxy)
                         and reference_remaining_proxy > 1e-12
                     )
+                    # Full SlaClip's released indicator and z_t both use the
+                    # public expected batch size as their denominator.  Keep
+                    # the counterfactual clipped mass in that same coordinate
+                    # system.  ``clip_frac`` is realized-batch normalized and
+                    # therefore cannot be divided by (1-z_t) directly when
+                    # Poisson sampling changes the realized batch size.
+                    reference_expected_normalized_clip_mass = (
+                        float(self._dp_state.clipped_samples)
+                        / float(release_denom)
+                    )
                     reference_conditional = (
-                        float(clip_frac) / reference_remaining_proxy
+                        reference_expected_normalized_clip_mass
+                        / reference_remaining_proxy
                         if reference_valid
                         else None
                     )
                     raw.update({
                         'raw_reference_slaclip_num_slots': reference_slots,
+                        'raw_reference_conditional_normalization': (
+                            'expected_batch_size'
+                        ),
                         'raw_reference_expected_batch_size_normalization': (
                             float(release_denom)
+                        ),
+                        'raw_reference_realized_to_expected_batch_ratio': (
+                            float(total) / float(release_denom)
+                        ),
+                        'raw_reference_expected_normalized_clip_mass': (
+                            reference_expected_normalized_clip_mass
                         ),
                         'raw_reference_slack_indicator_last': (
                             reference_indicator_last

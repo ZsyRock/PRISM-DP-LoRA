@@ -9,9 +9,13 @@ trajectory exhibited non-saturated clipping and measurable slack.
 ``glue-high-c-refinement`` then performs a dynamically locked fixed-C boundary
 scan and conditional-target refinement.  ``glue-r8-slack-screen`` moves to the
 paper's rank-8 GLUE setting, locks two completed source campaigns, and uses a
-fresh-seed Stage-2 comparator after a dynamic fixed-C selection.  All arms run inside one immutable
-one- or two-lane Slurm allocation, and measured clipping strata are reported
-without pretending they are pre-established SlaClip failure thresholds.
+fresh-seed Stage-2 comparator after a dynamic fixed-C selection.
+``glue-target-baseline-screen`` completes coarse tuned-fixed calibration for
+the two remaining target-identifiable GLUE paper axes without running adaptive
+arms on the same data-dependent selection seed. All arms run inside one
+immutable one- or two-lane Slurm allocation, and measured clipping strata are
+reported without pretending they are pre-established SlaClip failure
+thresholds.
 """
 
 from __future__ import annotations
@@ -359,6 +363,26 @@ GLUE_R8_SLACK_RHO_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
 GLUE_R8_SLACK_RHO_BOUNDS = (0.05, 0.95)
 GLUE_R8_SLACK_PRIMARY_ETA = 0.02
 GLUE_R8_SLACK_FAST_ETA = 0.05
+# The complete paper-default landscape identifies all four GLUE settings as
+# target-identifiable, while every Math setting is saturated at fixed C=1.
+# Rank 8 and epsilon-6/rank-16 already have staged tuned-fixed screens whose
+# winners landed on the old C=15 search boundary.  This compact baseline-only
+# campaign therefore spends the next allocation on the two remaining paper
+# axes with the most incremental information: epsilon 3/rank 16 and epsilon
+# 6/rank 32.  It deliberately extends the fixed grid beyond 15 before any new
+# Full-SlaClip target is selected.
+GLUE_TARGET_BASELINE_SEED = 47
+GLUE_TARGET_BASELINE_STEPS = 200
+GLUE_TARGET_BASELINE_FIXED_GRID = (1.0, 5.0, 15.0, 30.0, 50.0)
+GLUE_TARGET_BASELINE_RHO_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
+GLUE_TARGET_BASELINE_RHO_BOUNDS = (0.05, 0.95)
+GLUE_TARGET_BASELINE_BURN_IN_STEPS = 50
+GLUE_TARGET_BASELINE_CLIP_MEDIAN_MAX = 0.90
+GLUE_TARGET_BASELINE_CLIP_VARIATION_MIN = 0.05
+GLUE_TARGET_BASELINE_SMALL_PROXY_NOISE_RATIO_MIN = 2.0
+GLUE_TARGET_BASELINE_CONDITIONAL_VALID_FRACTION_MIN = 0.99
+GLUE_TARGET_BASELINE_RHO_SPAN_MIN = 0.10
+GLUE_TARGET_BASELINE_RHO_ADJACENT_GAP_MIN = 0.02
 GLUE_SLACLIP_VALIDATION_SEED = 1729
 GLUE_SLACLIP_VALIDATION_ROWS = 800
 GLUE_SLACLIP_VALIDATION_INDICES_SHA256 = (
@@ -441,6 +465,32 @@ GLUE_R8_SLACK_FIXED_CANDIDATES = tuple(
         "lane": 0,
     }
     for value in GLUE_R8_SLACK_FIXED_GRID
+)
+
+GLUE_TARGET_BASELINE_SETTING_IDS = (
+    "glue8-4b-eps6-r32",
+    "glue8-4b-eps3-r16",
+)
+GLUE_TARGET_BASELINE_SETTINGS = tuple(
+    {**next(
+        setting
+        for setting in REGIME_SETTINGS
+        if setting["id"] == setting_id
+    ), "lane": 0}
+    for setting_id in GLUE_TARGET_BASELINE_SETTING_IDS
+)
+GLUE_TARGET_BASELINE_FIXED_CANDIDATES = tuple(
+    {
+        "id": f"fixed-c{_candidate_id_value(value)}",
+        "method": "baseline",
+        "initial_c": value,
+        "rho": None,
+        "eta": None,
+        "role": "target_calibration_fixed_candidate",
+        "stage": 1,
+        "lane": 0,
+    }
+    for value in GLUE_TARGET_BASELINE_FIXED_GRID
 )
 
 # Job 1413408 is the immutable negative decision source for leaving the
@@ -880,6 +930,12 @@ def build_manifest(
         screen_steps = GLUE_R8_SLACK_STEPS
         eval_limit = 0
         screen_seed = GLUE_R8_SLACK_STAGE1_SEED
+    elif profile == "glue-target-baseline-screen":
+        settings = GLUE_TARGET_BASELINE_SETTINGS
+        candidates = GLUE_TARGET_BASELINE_FIXED_CANDIDATES
+        screen_steps = GLUE_TARGET_BASELINE_STEPS
+        eval_limit = 0
+        screen_seed = GLUE_TARGET_BASELINE_SEED
     elif profile in {
         "baseline-reproduction",
         "baseline-reproduction-cached",
@@ -939,6 +995,8 @@ def build_manifest(
         "inference_class": (
             "two_seed_exploratory_screen_requires_multi_seed_full_length_confirmation"
             if profile == "glue-r8-slack-screen"
+            else "single_seed_fixed_baseline_calibration_requires_fresh_seed_adaptive_screen"
+            if profile == "glue-target-baseline-screen"
             else "single_seed_exploratory_breadth_screen_requires_fresh_seed_confirmation"
         ),
         "code_sha": code_sha,
@@ -947,7 +1005,11 @@ def build_manifest(
         "full_slaclip": {
             "K": 15,
             "C_min": 0.1,
-            "C_max": 15.0,
+            "C_max": (
+                max(GLUE_TARGET_BASELINE_FIXED_GRID)
+                if profile == "glue-target-baseline-screen"
+                else 15.0
+            ),
             "target_semantics": "p_star_t=rho*(1-z_t); rho is conditional on residual non-small mass",
         },
         "selection_warning": (
@@ -956,7 +1018,7 @@ def build_manifest(
             "at full length on fresh seeds with a locked tuned-fixed comparator."
             if profile in {
                 "glue-slaclip-screen", "glue-high-c-refinement",
-                "glue-r8-slack-screen",
+                "glue-r8-slack-screen", "glue-target-baseline-screen",
             }
             else "Task-test metrics are descriptive only. Any promising setting must be "
             "repeated on fresh seeds with a locked tuned-fixed comparator."
@@ -1006,7 +1068,7 @@ def build_manifest(
         "regime_map": {
             "exploratory": profile in {
                 "regime-map", "glue-slaclip-screen", "glue-high-c-refinement",
-                "glue-r8-slack-screen",
+                "glue-r8-slack-screen", "glue-target-baseline-screen",
             },
             "screen_steps": screen_steps,
             "per_task_eval_limit": eval_limit,
@@ -1017,6 +1079,8 @@ def build_manifest(
                 if profile == "glue-high-c-refinement"
                 else list(GLUE_R8_SLACK_FIXED_GRID)
                 if profile == "glue-r8-slack-screen"
+                else list(GLUE_TARGET_BASELINE_FIXED_GRID)
+                if profile == "glue-target-baseline-screen"
                 else [0.5, 1.0, 2.0, 3.0, 5.0]
                 if profile == "regime-map"
                 else [1.0]
@@ -1025,7 +1089,10 @@ def build_manifest(
                 list(GLUE_SLACLIP_RHO_GRID)
                 if profile == "glue-slaclip-screen"
                 else "derived_from_stage1_q10_q25_q50_q75_q90"
-                if profile in {"glue-high-c-refinement", "glue-r8-slack-screen"}
+                if profile in {
+                    "glue-high-c-refinement", "glue-r8-slack-screen",
+                    "glue-target-baseline-screen",
+                }
                 else [0.5, 0.7, 0.8, 0.9, 0.98]
                 if profile == "regime-map"
                 else [0.9, 0.98]
@@ -1045,6 +1112,12 @@ def build_manifest(
                     "eta": GLUE_R8_SLACK_PRIMARY_ETA,
                 }
                 if profile == "glue-r8-slack-screen"
+                else {
+                    "C_0": "selected_tuned_fixed_C",
+                    "rho": "selected_q10_q25_q50_q75_q90",
+                    "eta": "deferred_to_fresh_seed_adaptive_screen",
+                }
+                if profile == "glue-target-baseline-screen"
                 else {"C_0": 2.0, "rho": 0.9, "eta": 0.05}
                 if profile == "regime-map"
                 else None
@@ -1338,6 +1411,94 @@ def build_manifest(
                 if profile == "glue-r8-slack-screen" else None
             ),
         },
+        "glue_target_baseline_screen": {
+            "enabled": profile == "glue-target-baseline-screen",
+            "motivation": (
+                "The complete paper-default landscape leaves four identifiable "
+                "GLUE settings. Rank 8 and epsilon-6/rank-16 already have "
+                "negative staged screens whose fixed winners hit C=15, so this "
+                "baseline-only allocation covers the unscanned epsilon-3/rank-16 "
+                "and epsilon-6/rank-32 axes before another adaptive run."
+                if profile == "glue-target-baseline-screen" else None
+            ),
+            "settings": (
+                list(GLUE_TARGET_BASELINE_SETTING_IDS)
+                if profile == "glue-target-baseline-screen" else None
+            ),
+            "stage1": (
+                {
+                    "seed": GLUE_TARGET_BASELINE_SEED,
+                    "steps": GLUE_TARGET_BASELINE_STEPS,
+                    "fixed_C_grid": list(GLUE_TARGET_BASELINE_FIXED_GRID),
+                    "burn_in_rule": (
+                        "exclude steps 1 through 50; summarize steps 51 through 200"
+                    ),
+                    "winner_rule": (
+                        "ascending step-200 public-holdout response-only per-record "
+                        "loss, then ascending C, then candidate id"
+                    ),
+                    "boundary_rule": (
+                        "a boundary winner remains descriptive and blocks a "
+                        "journal confirmation until the fixed-C grid is expanded"
+                    ),
+                }
+                if profile == "glue-target-baseline-screen" else None
+            ),
+            "target_recipe": (
+                {
+                    "source": (
+                        "best interior fixed-C expected-batch-normalized exact "
+                        "conditional clip mass over steps 51 through 200"
+                    ),
+                    "quantiles": list(GLUE_TARGET_BASELINE_RHO_QUANTILES),
+                    "rho_bounds": list(GLUE_TARGET_BASELINE_RHO_BOUNDS),
+                    "hard_clip_outcomes_reported_separately": True,
+                    "target_semantics": "p_star_t=rho*(1-z_t)",
+                    "normalization": "expected_batch_size_for_both_clip_mass_and_z_t",
+                    "required_telemetry_schema_version": 7,
+                    "require_five_unique_projected_rhos": True,
+                    "minimum_projected_rho_span": (
+                        GLUE_TARGET_BASELINE_RHO_SPAN_MIN
+                    ),
+                    "minimum_projected_rho_adjacent_gap": (
+                        GLUE_TARGET_BASELINE_RHO_ADJACENT_GAP_MIN
+                    ),
+                    "adaptive_arms_in_this_campaign": 0,
+                }
+                if profile == "glue-target-baseline-screen" else None
+            ),
+            "selection": (
+                {
+                    "public_holdout_rows": GLUE_SLACLIP_VALIDATION_ROWS,
+                    "public_holdout_seed": GLUE_SLACLIP_VALIDATION_SEED,
+                    "public_holdout_indices_sha256": (
+                        GLUE_SLACLIP_VALIDATION_INDICES_SHA256
+                    ),
+                    "public_holdout_records_sha256": (
+                        GLUE_SLACLIP_VALIDATION_RECORDS_SHA256
+                    ),
+                    "validation_curve_steps": [0, 50, 100, 150, 200],
+                    "primary_metric": "step_200_response_only_mean_per_record_loss",
+                    "official_task_evaluation": False,
+                }
+                if profile == "glue-target-baseline-screen" else None
+            ),
+            "privacy_scope": (
+                {
+                    "target_selection": (
+                        "NON_PRIVATE hypothesis generation from exact baseline "
+                        "per-record gradient telemetry"
+                    ),
+                    "per_run_accounting": (
+                        "epsilon and delta apply to each fixed run conditional on "
+                        "its already-selected hyperparameters"
+                    ),
+                    "end_to_end_dp_claim": False,
+                    "next_stage_requires_fresh_seeds": True,
+                }
+                if profile == "glue-target-baseline-screen" else None
+            ),
+        },
         "arms": arms,
     }
 
@@ -1375,6 +1536,10 @@ def _plan_bytes(manifest: dict[str, Any], lane: int, include_all: bool = False) 
         if manifest.get("profile") not in {
             "baseline-gap-fill-all-cached",
             "baseline-gap-fill-math-only-cached",
+            # Rank 32 is intentionally first because its complete baseline has
+            # the strongest clipping variation and is the slowest of the two
+            # target-calibration settings. Preserve that failure-safe order.
+            "glue-target-baseline-screen",
         }:
             priority = {
                 setting: index
@@ -1605,6 +1770,11 @@ def _validate_arm_telemetry(
         # runs. It is identity metadata only; method=baseline never constructs
         # or applies the SlaClip controller.
         expected_config["slaclip_target_non_small_clip_fraction"] = 0.5
+    if arm.get("role") == "target_calibration_fixed_candidate":
+        expected_config.update({
+            "raw_hist_bins": 512,
+            "raw_hist_max": 200.0,
+        })
     for key, expected in expected_config.items():
         if config.get(key) != expected:
             raise CampaignError(
@@ -2821,6 +2991,365 @@ def _normalized_trapezoid_auc(
     return area / float(end - start)
 
 
+def _build_glue_target_baseline_selection(
+    manifest: dict[str, Any],
+    results: list[dict[str, Any]],
+    trajectory_rows: list[dict[str, Any]],
+    artifact_hashes: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    """Rank the coarse fixed grid and derive auditable later SlaClip targets.
+
+    This is deliberately a baseline-only, NON_PRIVATE hypothesis-generation
+    artifact. It keeps CDF identifiability, exploratory-screen readiness, and
+    journal-confirmation readiness as separate decisions. A coarse-grid or
+    boundary winner never satisfies the last one.
+    """
+
+    expected_settings = set(GLUE_TARGET_BASELINE_SETTING_IDS)
+    actual_settings = {row["setting_id"] for row in results}
+    if actual_settings != expected_settings or len(results) != 10:
+        raise CampaignError(
+            "target-baseline screen must contain ten fixed arms over exactly "
+            "the two predeclared GLUE settings"
+        )
+    if any(
+        row["method"] != "baseline"
+        or row["candidate_role"] != "target_calibration_fixed_candidate"
+        for row in results
+    ):
+        raise CampaignError("target-baseline screen unexpectedly contains adaptive arms")
+
+    quantile_names = ("q10", "q25", "q50", "q75", "q90")
+    per_setting = []
+    for setting_id in GLUE_TARGET_BASELINE_SETTING_IDS:
+        ranked = sorted(
+            (row for row in results if row["setting_id"] == setting_id),
+            key=lambda row: (
+                -row["selection_score"], row["initial_C"], row["candidate"]
+            ),
+        )
+        if (
+            len(ranked) != len(GLUE_TARGET_BASELINE_FIXED_GRID)
+            or {float(row["initial_C"]) for row in ranked}
+            != set(GLUE_TARGET_BASELINE_FIXED_GRID)
+        ):
+            raise CampaignError(
+                f"target-baseline fixed grid is incomplete for {setting_id}"
+            )
+        winner = ranked[0]
+        post = sorted(
+            (
+                row for row in trajectory_rows
+                if row["setting_id"] == setting_id
+                and row["candidate_id"] == winner["candidate"]
+                and int(row["step"]) > GLUE_TARGET_BASELINE_BURN_IN_STEPS
+            ),
+            key=lambda row: int(row["step"]),
+        )
+        expected_steps = list(
+            range(
+                GLUE_TARGET_BASELINE_BURN_IN_STEPS + 1,
+                GLUE_TARGET_BASELINE_STEPS + 1,
+            )
+        )
+        if [int(row["step"]) for row in post] != expected_steps:
+            raise CampaignError(
+                f"target-baseline post-burn-in telemetry is incomplete for {setting_id}"
+            )
+
+        clips = []
+        small = []
+        conditional = []
+        noise_std = []
+        for row in post:
+            step = int(row["step"])
+            if row.get("telemetry_schema_version") != 7:
+                raise CampaignError(
+                    f"target-baseline requires telemetry schema 7 at "
+                    f"{setting_id}:{step}"
+                )
+            clip = _finite(row.get("raw_clip_fraction"), f"{setting_id}:{step}:clip")
+            z_value = _finite(
+                row.get("raw_reference_small_gradient_proxy"),
+                f"{setting_id}:{step}:small-gradient proxy",
+            )
+            if not 0.0 <= clip <= 1.0 or z_value < 0.0:
+                raise CampaignError(
+                    f"target-baseline CDF telemetry is outside its domain at "
+                    f"{setting_id}:{step}"
+                )
+            clips.append(clip)
+            small.append(z_value)
+            multiplier = _finite(
+                row.get("dp_noise_multiplier"),
+                f"{setting_id}:{step}:noise multiplier",
+            )
+            normalization = _finite(
+                row.get("raw_reference_expected_batch_size_normalization"),
+                f"{setting_id}:{step}:expected-batch normalization",
+            )
+            slots_value = _finite(
+                row.get("raw_reference_slaclip_num_slots"),
+                f"{setting_id}:{step}:SlaClip K",
+            )
+            realized_batch = _finite(
+                row.get("raw_realized_batch_size"),
+                f"{setting_id}:{step}:realized batch",
+            )
+            remaining = _finite(
+                row.get("raw_reference_remaining_mass_proxy"),
+                f"{setting_id}:{step}:remaining-mass proxy",
+            )
+            if not math.isclose(
+                z_value + remaining, 1.0, rel_tol=0.0, abs_tol=1e-9
+            ):
+                raise CampaignError(
+                    f"small and remaining CDF masses disagree at {setting_id}:{step}"
+                )
+            valid = row.get("raw_reference_conditional_clip_fraction_valid")
+            if not isinstance(valid, bool) or valid != (remaining > 1e-12):
+                raise CampaignError(
+                    f"invalid conditional proxy validity flag at {setting_id}:{step}"
+                )
+            if row.get("raw_reference_conditional_normalization") != (
+                "expected_batch_size"
+            ):
+                raise CampaignError(
+                    f"conditional proxy is not expected-batch normalized at "
+                    f"{setting_id}:{step}"
+                )
+            expected_normalized_clip_mass = clip * realized_batch / normalization
+            logged_clip_mass = _finite(
+                row.get("raw_reference_expected_normalized_clip_mass"),
+                f"{setting_id}:{step}:expected-normalized clip mass",
+            )
+            if not math.isclose(
+                logged_clip_mass,
+                expected_normalized_clip_mass,
+                rel_tol=1e-9,
+                abs_tol=1e-8,
+            ):
+                raise CampaignError(
+                    f"expected-normalized clip mass mismatch at {setting_id}:{step}"
+                )
+            value = row.get("raw_reference_conditional_clip_fraction")
+            if valid:
+                conditional_value = _finite(
+                    value, f"{setting_id}:{step}:conditional clipping proxy"
+                )
+                recomputed_conditional = expected_normalized_clip_mass / remaining
+                if conditional_value < 0.0 or not math.isclose(
+                    conditional_value,
+                    recomputed_conditional,
+                    rel_tol=1e-9,
+                    abs_tol=1e-8,
+                ):
+                    raise CampaignError(
+                        f"conditional clipping proxy normalization mismatch at "
+                        f"{setting_id}:{step}"
+                    )
+                conditional.append(recomputed_conditional)
+            elif value is not None:
+                raise CampaignError(
+                    f"invalid conditional proxy must be null at {setting_id}:{step}"
+                )
+            slots = round(slots_value)
+            if (
+                multiplier <= 0.0
+                or normalization <= 0.0
+                or slots <= 0
+                or not math.isclose(
+                    slots_value, slots, rel_tol=0.0, abs_tol=1e-10
+                )
+            ):
+                raise CampaignError(
+                    f"invalid CDF noise calibration at {setting_id}:{step}"
+                )
+            noise_std.append(multiplier * math.sqrt(slots) / normalization)
+
+        conditional_valid_fraction = len(conditional) / len(post)
+        raw_rhos = (
+            [
+                _quantile(conditional, probability)
+                for probability in GLUE_TARGET_BASELINE_RHO_QUANTILES
+            ]
+            if conditional
+            else []
+        )
+        projected_rhos = [
+            min(
+                GLUE_TARGET_BASELINE_RHO_BOUNDS[1],
+                max(GLUE_TARGET_BASELINE_RHO_BOUNDS[0], value),
+            )
+            for value in raw_rhos
+        ]
+        unique_projected_rhos = len({round(value, 12) for value in projected_rhos})
+        projected_rho_span = (
+            projected_rhos[-1] - projected_rhos[0] if projected_rhos else 0.0
+        )
+        projected_rho_min_adjacent_gap = (
+            min(
+                right - left
+                for left, right in zip(
+                    projected_rhos, projected_rhos[1:], strict=False
+                )
+            )
+            if len(projected_rhos) >= 2
+            else 0.0
+        )
+        z_median = _quantile(small, 0.50)
+        targets = (
+            {
+                name: {
+                    "source_quantile": probability,
+                    "raw_conditional_rho": raw_rho,
+                    "projected_conditional_rho": projected_rho,
+                "implied_expected_batch_normalized_clip_mass_at_median_z": (
+                    projected_rho * (1.0 - z_median)
+                ),
+                }
+                for name, probability, raw_rho, projected_rho in zip(
+                    quantile_names,
+                    GLUE_TARGET_BASELINE_RHO_QUANTILES,
+                    raw_rhos,
+                    projected_rhos,
+                    strict=True,
+                )
+            }
+            if raw_rhos
+            else {}
+        )
+        clip_q25 = _quantile(clips, 0.25)
+        clip_q75 = _quantile(clips, 0.75)
+        split = len(clips) // 2
+        first_half_mean = sum(clips[:split]) / split
+        last_half_mean = sum(clips[-split:]) / split
+        half_delta = last_half_mean - first_half_mean
+        noise_median = _quantile(noise_std, 0.50)
+        small_median = z_median
+        small_proxy_noise_ratio = small_median / noise_median
+        clip_median = _quantile(clips, 0.50)
+        clip_iqr = clip_q75 - clip_q25
+        identifiable_gates = {
+            "clip_median_below_0p90": (
+                clip_median < GLUE_TARGET_BASELINE_CLIP_MEDIAN_MAX
+            ),
+            "clip_IQR_or_half_delta_at_least_0p05": (
+                clip_iqr >= GLUE_TARGET_BASELINE_CLIP_VARIATION_MIN
+                or abs(half_delta) >= GLUE_TARGET_BASELINE_CLIP_VARIATION_MIN
+            ),
+            "small_proxy_to_noise_ratio_at_least_2": (
+                small_proxy_noise_ratio
+                >= GLUE_TARGET_BASELINE_SMALL_PROXY_NOISE_RATIO_MIN
+            ),
+            "conditional_proxy_valid_fraction_at_least_0p99": (
+                conditional_valid_fraction
+                >= GLUE_TARGET_BASELINE_CONDITIONAL_VALID_FRACTION_MIN
+            ),
+            "five_unique_projected_conditional_rhos": (
+                len(projected_rhos) == 5 and unique_projected_rhos == 5
+            ),
+            "projected_rho_span_at_least_0p10": (
+                projected_rho_span >= GLUE_TARGET_BASELINE_RHO_SPAN_MIN
+            ),
+            "projected_rho_min_adjacent_gap_at_least_0p02": (
+                projected_rho_min_adjacent_gap
+                >= GLUE_TARGET_BASELINE_RHO_ADJACENT_GAP_MIN
+            ),
+        }
+        target_grid_identifiable = all(identifiable_gates.values())
+        winner_at_min = math.isclose(
+            float(winner["initial_C"]),
+            min(GLUE_TARGET_BASELINE_FIXED_GRID),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        winner_at_max = math.isclose(
+            float(winner["initial_C"]),
+            max(GLUE_TARGET_BASELINE_FIXED_GRID),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        winner_at_boundary = winner_at_min or winner_at_max
+        block_reasons = [
+            name for name, passed in identifiable_gates.items() if not passed
+        ]
+        if winner_at_boundary:
+            block_reasons.append("best_fixed_C_is_at_coarse_grid_boundary")
+        per_setting.append({
+            "setting_id": setting_id,
+            "seed": GLUE_TARGET_BASELINE_SEED,
+            "fixed_ranking": ranked,
+            "best_fixed": winner,
+            "best_fixed_at_grid_min": winner_at_min,
+            "best_fixed_at_grid_max": winner_at_max,
+            "best_fixed_at_search_boundary": winner_at_boundary,
+            "post_burn_in_steps": len(post),
+            "hard_clip_fraction": {
+                "q10": _quantile(clips, 0.10),
+                "q25": clip_q25,
+                "q50": clip_median,
+                "q75": clip_q75,
+                "q90": _quantile(clips, 0.90),
+                "first_half_mean": first_half_mean,
+                "last_half_mean": last_half_mean,
+                "last_minus_first_half_delta": half_delta,
+                "IQR": clip_iqr,
+            },
+            "small_gradient_proxy_median_z": z_median,
+            "cdf_slack_noise_std_estimate_median": noise_median,
+            "small_proxy_to_noise_ratio": small_proxy_noise_ratio,
+            "conditional_proxy_valid_fraction": conditional_valid_fraction,
+            "projected_conditional_rho_unique_count": unique_projected_rhos,
+            "projected_conditional_rho_span": projected_rho_span,
+            "projected_conditional_rho_min_adjacent_gap": (
+                projected_rho_min_adjacent_gap
+            ),
+            "full_slaclip_target_candidates": targets,
+            "target_grid_identifiability_gates": identifiable_gates,
+            "target_grid_identifiable": target_grid_identifiable,
+            "adaptive_exploratory_screen_allowed": (
+                target_grid_identifiable and not winner_at_boundary
+            ),
+            "journal_confirmation_ready": False,
+            "block_reasons": block_reasons,
+            "next_action": (
+                "expand the fixed-C boundary and rerun baseline calibration"
+                if winner_at_boundary
+                else "locally refine around the coarse-grid fixed winner, then "
+                "lock these five targets for a fresh-seed Full-SlaClip screen"
+            ),
+        })
+
+    return {
+        "schema_version": 1,
+        "NON_PRIVATE_TELEMETRY": True,
+        "warning": (
+            "Contains exact per-record-gradient-derived research statistics; "
+            "not a differentially private release artifact."
+        ),
+        "profile": manifest["profile"],
+        "inference": (
+            "single_seed_200_step_coarse_fixed_baseline_calibration; target "
+            "hypothesis generation only"
+        ),
+        "selection_metric": "step_200_response_only_mean_per_record_loss",
+        "ranking_rule": (
+            "ascending endpoint loss, then ascending C, then candidate id"
+        ),
+        "fixed_C_grid": list(GLUE_TARGET_BASELINE_FIXED_GRID),
+        "burn_in_rule": "exclude steps 1 through 50",
+        "target_semantics": "p_star_t=rho*(1-z_t)",
+        "target_rho_bounds": list(GLUE_TARGET_BASELINE_RHO_BOUNDS),
+        "adaptive_arms_in_campaign": 0,
+        "fresh_seed_required_for_adaptive_screen": True,
+        "task_test_or_official_glue_evaluation_used": False,
+        "privacy_scope": manifest["glue_target_baseline_screen"]["privacy_scope"],
+        "arm_artifact_sha256": artifact_hashes,
+        "settings": per_setting,
+    }
+
+
 def analyze(root: Path) -> None:
     manifest_path = root / "plans" / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2882,6 +3411,7 @@ def analyze(root: Path) -> None:
             raise CampaignError("rank-8 slack screen must analyze 14 unique arms")
     results = []
     trajectory_rows = []
+    histogram_rows = []
     validation_curve_rows = []
     focused_artifact_hashes: dict[str, dict[str, str]] = {}
     for arm in analysis_arms:
@@ -2899,7 +3429,7 @@ def analyze(root: Path) -> None:
             raise CampaignError(f"arm is not completed at the locked SHA: {arm['arm_id']}")
         focused_screen = manifest.get("profile") in {
             "glue-slaclip-screen", "glue-high-c-refinement",
-            "glue-r8-slack-screen",
+            "glue-r8-slack-screen", "glue-target-baseline-screen",
         }
         raw_records = None
         if focused_screen:
@@ -3043,8 +3573,10 @@ def analyze(root: Path) -> None:
             ]
         clip_median = _quantile(clip_values, 0.5)
         scalar_fields = (
-            "step", "loss_mean", "eps_spent", "dp_clip_threshold",
+            "telemetry_schema_version", "step", "loss_mean", "eps_spent",
+            "dp_clip_threshold",
             "dp_next_clip_threshold", "dp_noise_multiplier",
+            "dp_expected_batch_size",
             "raw_realized_batch_size", "raw_clip_fraction",
             "raw_clip_coefficient_mean", "raw_clip_coefficient_min",
             "raw_global_norm_mean", "raw_global_norm_std",
@@ -3058,9 +3590,13 @@ def analyze(root: Path) -> None:
             "raw_reference_remaining_mass_proxy",
             "raw_reference_conditional_clip_fraction",
             "raw_reference_conditional_clip_fraction_valid",
+            "raw_reference_conditional_normalization",
             "raw_reference_expected_batch_size_normalization",
+            "raw_reference_realized_to_expected_batch_ratio",
+            "raw_reference_expected_normalized_clip_mass",
             "raw_reference_slack_indicator_last",
             "raw_reference_slaclip_num_slots",
+            "raw_global_norm_hist_overflow",
             "slack_unclipped_proxy", "slack_clipped_proxy",
             "slack_indicator_noise_std", "slaclip_gamma_t",
             "raw_slack_indicator_noise_residual_l2",
@@ -3124,6 +3660,88 @@ def analyze(root: Path) -> None:
                 threshold_delta = next_c_value - current_c_value
                 if current_c_value != 0.0:
                     threshold_ratio = next_c_value / current_c_value
+            histogram_overflow_rate = None
+            histogram_counts = raw_record.get("raw_global_norm_hist_counts")
+            histogram_edges = raw_record.get("raw_global_norm_hist_edges")
+            histogram_overflow = raw_record.get("raw_global_norm_hist_overflow")
+            if histogram_counts is not None or histogram_edges is not None:
+                if (
+                    not isinstance(histogram_counts, list)
+                    or not isinstance(histogram_edges, list)
+                    or len(histogram_counts) < 1
+                    or len(histogram_edges) != len(histogram_counts) + 1
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                        for value in histogram_counts
+                    )
+                ):
+                    raise CampaignError(
+                        f"invalid norm histogram geometry for {arm['arm_id']}"
+                    )
+                numeric_edges = [
+                    _finite(value, f"{arm['arm_id']}:histogram edge")
+                    for value in histogram_edges
+                ]
+                if any(
+                    right <= left
+                    for left, right in zip(
+                        numeric_edges, numeric_edges[1:], strict=False
+                    )
+                ):
+                    raise CampaignError(
+                        f"non-increasing norm histogram edges for {arm['arm_id']}"
+                    )
+                overflow = int(
+                    _finite(
+                        histogram_overflow,
+                        f"{arm['arm_id']}:histogram overflow",
+                    )
+                )
+                realized = int(
+                    _finite(
+                        raw_record.get("raw_realized_batch_size"),
+                        f"{arm['arm_id']}:realized batch",
+                    )
+                )
+                if (
+                    overflow < 0
+                    or realized <= 0
+                    or sum(histogram_counts) + overflow != realized
+                ):
+                    raise CampaignError(
+                        f"norm histogram mass mismatch for {arm['arm_id']}"
+                    )
+                if arm.get("role") == "target_calibration_fixed_candidate" and (
+                    len(histogram_counts) != 512
+                    or not math.isclose(
+                        numeric_edges[0], 0.0, rel_tol=0.0, abs_tol=1e-12
+                    )
+                    or not math.isclose(
+                        numeric_edges[-1], 200.0, rel_tol=0.0, abs_tol=1e-8
+                    )
+                ):
+                    raise CampaignError(
+                        f"target-baseline histogram lock mismatch for {arm['arm_id']}"
+                    )
+                histogram_overflow_rate = overflow / realized
+                histogram_rows.append({
+                    "NON_PRIVATE_TELEMETRY": True,
+                    "setting_id": arm["setting_id"],
+                    "candidate_id": arm["candidate_id"],
+                    "method": arm["method"],
+                    "seed": arm["seed"],
+                    "step": int(raw_record["step"]),
+                    "realized_batch_size": realized,
+                    "bin_count": len(histogram_counts),
+                    "histogram_min": numeric_edges[0],
+                    "histogram_max": numeric_edges[-1],
+                    "overflow_count": overflow,
+                    "overflow_fraction": histogram_overflow_rate,
+                    "counts": histogram_counts,
+                    "edges": numeric_edges,
+                })
             trajectory_rows.append({
                 "NON_PRIVATE_TELEMETRY": True,
                 "setting_id": arm["setting_id"],
@@ -3144,6 +3762,9 @@ def analyze(root: Path) -> None:
                 "clip_threshold_ratio": threshold_ratio,
                 "raw_signal_retention_ratio": signal_retention,
                 "raw_clipping_bias_ratio": clipping_bias_ratio,
+                "raw_global_norm_hist_overflow_fraction": (
+                    histogram_overflow_rate
+                ),
                 "raw_global_norm_q10": quantiles.get("0.1"),
                 "raw_global_norm_q25": quantiles.get("0.25"),
                 "raw_global_norm_q50": quantiles.get("0.5"),
@@ -3278,6 +3899,16 @@ def analyze(root: Path) -> None:
         _with_sha(
             out / "baseline_telemetry_steps.csv",
             ("\n".join(trajectory_buffer) + "\n").encode(),
+        )
+    if histogram_rows:
+        _with_sha(
+            out / "NON_PRIVATE_norm_histograms.jsonl",
+            (
+                "".join(
+                    json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                    for row in histogram_rows
+                )
+            ).encode(),
         )
     if validation_curve_rows:
         validation_fields = list(validation_curve_rows[0])
@@ -3637,6 +4268,22 @@ def analyze(root: Path) -> None:
             out / "glue_r8_slack_screen_ranking.json",
             _json_bytes(selection_payload),
         )
+    elif manifest.get("profile") == "glue-target-baseline-screen":
+        selection_payload = _build_glue_target_baseline_selection(
+            manifest, results, trajectory_rows, focused_artifact_hashes
+        )
+        histogram_path = out / "NON_PRIVATE_norm_histograms.jsonl"
+        selection_payload["norm_histogram_artifact"] = {
+            "path": histogram_path.name,
+            "sha256": _file_sha256(histogram_path),
+            "sha256_sidecar": histogram_path.with_suffix(
+                histogram_path.suffix + ".sha256"
+            ).name,
+        }
+        _with_sha(
+            out / "glue_target_baseline_selection.json",
+            _json_bytes(selection_payload),
+        )
     print(f"analyzed_arms={len(results)}")
 
 
@@ -3657,6 +4304,7 @@ def parser() -> argparse.ArgumentParser:
             "baseline-gap-fill-math-only-cached",
             "glue-slaclip-screen",
             "glue-high-c-refinement", "glue-r8-slack-screen",
+            "glue-target-baseline-screen",
         ),
         default="paper-breadth",
     )

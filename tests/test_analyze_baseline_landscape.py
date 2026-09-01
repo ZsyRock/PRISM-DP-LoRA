@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -67,6 +69,7 @@ def _write_completed(
     raw_run_id: str | None = None,
     omit_step: int | None = None,
     official_utility: float | None = None,
+    realized_batch_size: int | None = None,
 ) -> None:
     steps = arm["steps"]
     run_id = f"run-{arm['arm_id']}"
@@ -113,8 +116,7 @@ def _write_completed(
         step = index + 1
         if step == omit_step:
             continue
-        records.append(
-            {
+        record = {
                 "NON_PRIVATE_TELEMETRY": True,
                 "step": step,
                 "run_id": raw_run_id or run_id,
@@ -137,7 +139,18 @@ def _write_completed(
                 "raw_reference_expected_batch_size_normalization": 100.0,
                 "raw_reference_slaclip_num_slots": 4,
             }
-        )
+        if realized_batch_size is not None:
+            expected_clip_mass = clips[index] * realized_batch_size / 100.0
+            record.update({
+                "telemetry_schema_version": 7,
+                "raw_realized_batch_size": realized_batch_size,
+                "raw_reference_conditional_normalization": "expected_batch_size",
+                "raw_reference_realized_to_expected_batch_ratio": (
+                    realized_batch_size / 100.0
+                ),
+                "raw_reference_expected_normalized_clip_mass": expected_clip_mass,
+            })
+        records.append(record)
     raw = arm_root / "results" / "research_raw" / "NON_PRIVATE_train_log.jsonl"
     raw.parent.mkdir(parents=True, exist_ok=True)
     raw.write_text(
@@ -255,6 +268,36 @@ def test_conditional_proxy_above_one_is_preserved_then_projected(tmp_path: Path)
     assert "five_unique_projected_rhos_unavailable" in row["eligibility_reasons"]
     recommended = list(csv.DictReader((output / "recommended_settings.csv").open()))
     assert recommended == []
+
+
+def test_landscape_recomputes_conditional_rho_in_expected_batch_coordinates(
+    tmp_path: Path,
+) -> None:
+    campaign = tmp_path / "campaign"
+    arm = _arm("expected-batch-normalization")
+    _manifest(campaign, [arm])
+    clips = [0.20 + 0.02 * index for index in range(arm["steps"])]
+    conditionals = [clip * 50.0 / 100.0 / 0.80 for clip in clips]
+    _write_completed(
+        campaign,
+        arm,
+        clips=clips,
+        conditionals=conditionals,
+        realized_batch_size=50,
+    )
+
+    output = tmp_path / "out"
+    assert _main([campaign], output) == 0
+    row = json.loads((output / "baseline_landscape.json").read_text())[
+        "landscape"
+    ][0]
+    assert row["conditional_proxy_normalization"] == (
+        "recomputed_expected_batch_size"
+    )
+    post = conditionals[row["burn_in_steps"]:]
+    assert row["conditional_proxy_raw_median"] == pytest.approx(
+        landscape._quantile(post, 0.50)
+    )
 
 
 def test_incomplete_is_reported_and_allow_incomplete_changes_exit_only(

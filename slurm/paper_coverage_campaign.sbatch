@@ -77,7 +77,8 @@ if [[ "${ALLOCATION_LANES}" != 1 && "${ALLOCATION_LANES}" != 2 ]]; then
 fi
 if [[ ( "${COVERAGE_PROFILE}" == baseline-gap-fill-cached \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached \
-      || "${COVERAGE_PROFILE}" == baseline-gap-fill-math-only-cached ) \
+      || "${COVERAGE_PROFILE}" == baseline-gap-fill-math-only-cached \
+      || "${COVERAGE_PROFILE}" == glue-target-baseline-screen ) \
     && "${ALLOCATION_LANES}" != 1 ]]; then
   echo "error: ${COVERAGE_PROFILE} requires one sequential GPU lane" >&2
   exit 2
@@ -188,7 +189,8 @@ if [[ "${COVERAGE_PROFILE}" != baseline-gap-fill-math-only-cached ]]; then
 fi
 if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
-    && "${COVERAGE_PROFILE}" != glue-r8-slack-screen ]]; then
+    && "${COVERAGE_PROFILE}" != glue-r8-slack-screen \
+    && "${COVERAGE_PROFILE}" != glue-target-baseline-screen ]]; then
   run_math_preflight() {
     local model_id="${1:?missing Math preflight model}" \
       model_revision="${2:?missing Math preflight revision}" \

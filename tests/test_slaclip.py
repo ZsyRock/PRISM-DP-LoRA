@@ -598,6 +598,16 @@ def test_research_raw_mode_is_explicitly_marked() -> None:
         'raw_reference_expected_batch_size_normalization'
     ] == pytest.approx(4.0)
     assert opt.last_raw_log[
+        'raw_reference_conditional_normalization'
+    ] == 'expected_batch_size'
+    assert opt.last_raw_log[
+        'raw_reference_expected_normalized_clip_mass'
+    ] == pytest.approx(
+        opt.last_raw_log['raw_clip_fraction']
+        * opt.last_raw_log['raw_realized_batch_size']
+        / opt.last_raw_log['raw_reference_expected_batch_size_normalization']
+    )
+    assert opt.last_raw_log[
         'raw_reference_conditional_clip_fraction_valid'
     ] is True
     assert opt.last_raw_log[
@@ -633,12 +643,24 @@ def test_fixed_reference_proxy_uses_expected_not_realized_batch_size() -> None:
                 opt.last_raw_log[
                     'raw_reference_expected_batch_size_normalization'
                 ],
+                opt.last_raw_log[
+                    'raw_reference_expected_normalized_clip_mass'
+                ],
+                opt.last_raw_log[
+                    'raw_reference_conditional_clip_fraction'
+                ],
+                opt.last_raw_log['raw_reference_remaining_mass_proxy'],
             )
         )
 
     assert references[0][1] == pytest.approx(4.0)
     assert references[1][1] == pytest.approx(8.0)
     assert references[1][0] == pytest.approx(references[0][0] / 2.0)
+    assert references[1][2] == pytest.approx(references[0][2] / 2.0)
+    for _, _, expected_normalized_clip_mass, conditional, remaining in references:
+        assert conditional * remaining == pytest.approx(
+            expected_normalized_clip_mass
+        )
 
 
 def test_fixed_raw_reference_observer_does_not_change_mechanism_output() -> None:

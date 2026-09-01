@@ -98,6 +98,14 @@ PREFERRED_COLUMNS = (
     "batch_n",
     "raw_realized_batch_size",
     "dp_expected_batch_size",
+    "raw_reference_conditional_normalization",
+    "raw_reference_expected_batch_size_normalization",
+    "raw_reference_realized_to_expected_batch_ratio",
+    "raw_reference_expected_normalized_clip_mass",
+    "raw_reference_small_gradient_proxy",
+    "raw_reference_remaining_mass_proxy",
+    "raw_reference_conditional_clip_fraction",
+    "raw_reference_conditional_clip_fraction_valid",
     "dp_clip_threshold",
     "dp_next_clip_threshold",
     "clip_threshold_delta",
@@ -132,6 +140,7 @@ PREFERRED_COLUMNS = (
     "raw_global_norm_hist_counts_json",
     "raw_global_norm_hist_edges_json",
     "raw_global_norm_hist_overflow",
+    "raw_global_norm_hist_overflow_fraction",
     "raw_clip_fraction",
     "raw_clip_fraction_reference_target",
     "raw_clip_fraction_error_target_kind",
@@ -169,6 +178,7 @@ PREFERRED_COLUMNS = (
 BOOLEAN_METRIC_COLUMNS = (
     "slaclip_c_hit_min",
     "slaclip_c_hit_max",
+    "raw_reference_conditional_clip_fraction_valid",
 )
 
 AGGREGATE_EXCLUSIONS = {
@@ -366,6 +376,12 @@ def add_derived_fields(rows: Sequence[Dict[str, Any]]) -> None:
         if proxy is not None and target_proxy is not None:
             row["slaclip_controller_error"] = target_proxy - proxy
         raw_clip = _finite_number(row.get("raw_clip_fraction"))
+        overflow_fraction = _safe_ratio(
+            row.get("raw_global_norm_hist_overflow"),
+            row.get("raw_realized_batch_size"),
+        )
+        if overflow_fraction is not None:
+            row["raw_global_norm_hist_overflow_fraction"] = overflow_fraction
         controller = str(
             row.get("slaclip_controller") or row.get("method") or ""
         ).casefold()

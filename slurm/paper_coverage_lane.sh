@@ -28,14 +28,16 @@ CURRENT_ARM_STATUS=""
 is_focused_glue_profile() {
   [[ "${COVERAGE_PROFILE}" == glue-slaclip-screen \
       || "${COVERAGE_PROFILE}" == glue-high-c-refinement \
-      || "${COVERAGE_PROFILE}" == glue-r8-slack-screen ]]
+      || "${COVERAGE_PROFILE}" == glue-r8-slack-screen \
+      || "${COVERAGE_PROFILE}" == glue-target-baseline-screen ]]
 }
 
 is_baseline_only_profile() {
   [[ "${COVERAGE_PROFILE}" == baseline-reproduction* \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-cached \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached \
-      || "${COVERAGE_PROFILE}" == baseline-gap-fill-math-only-cached ]]
+      || "${COVERAGE_PROFILE}" == baseline-gap-fill-math-only-cached \
+      || "${COVERAGE_PROFILE}" == glue-target-baseline-screen ]]
 }
 
 write_lane_status() {
@@ -137,11 +139,22 @@ run_training() {
   local adapter_dir="${arm_root}/adapter" result_dir="${arm_root}/results"
   local status_file="${arm_root}/orchestration-status.txt"
   local protocol_stage=final validation_rows=0 validation_interval=0 run_eval=true
+  local raw_hist_bins=128 raw_hist_max=30.0
   if is_focused_glue_profile; then
     protocol_stage=selection
     validation_rows=800
     validation_interval=50
     run_eval=false
+  fi
+  if [[ "${COVERAGE_PROFILE}" == glue-target-baseline-screen ]]; then
+    raw_hist_bins=512
+    raw_hist_max=200.0
+  fi
+  local controller_target="inactive_for_fixed_baseline"
+  local controller_c_bounds="not_applicable_to_fixed_baseline"
+  if [[ "${method}" == slaclip ]]; then
+    controller_target="p_star_t=rho*(1-z_t)"
+    controller_c_bounds="0.1,15"
   fi
   mkdir -p "${adapter_dir}" "${result_dir}/research_raw" "${arm_root}/logs"
   CURRENT_ARM="${arm_id}"
@@ -154,13 +167,15 @@ run_training() {
     echo "paper_fixed_or_initial_C=${initial_c}"
     echo "full_slaclip_conditional_rho=${rho}"
     echo "full_slaclip_eta=${eta}"
-    echo "dynamic_global_target=p_star_t=rho*(1-z_t)"
+    echo "dynamic_global_target=${controller_target}"
     echo "K=15"
-    echo "C_bounds=0.1,15"
+    echo "C_bounds=${controller_c_bounds}"
     echo "seed=${seed}"
     echo "code_sha=${EXPECTED_REPO_SHA}"
     echo "model=${model_id}@${model_revision}"
     echo "raw_training_telemetry=NONPRIVATE"
+    echo "raw_hist_bins=${raw_hist_bins}"
+    echo "raw_hist_max=${raw_hist_max}"
   } >"${arm_root}/arm-manifest.txt"
 
   local -a args=(
@@ -187,8 +202,8 @@ run_training() {
     --slaclip_num_slots 15
     --telemetry_mode research_raw
     --allow_non_private_telemetry
-    --raw_hist_bins 128
-    --raw_hist_max 30.0
+    --raw_hist_bins "${raw_hist_bins}"
+    --raw_hist_max "${raw_hist_max}"
     --protocol_stage "${protocol_stage}"
     --val_set_size "${validation_rows}"
     --validation_seed 1729
@@ -258,12 +273,16 @@ run_training() {
       "${result_dir}/validation/split_manifest.json" \
       "${result_dir}/validation/validation_metrics.json" \
       "${result_dir}/validation/validation_curve.jsonl" \
-      "${arm_id}" "${steps}" <<'PY'
+      "${arm_id}" "${steps}" "${COVERAGE_PROFILE}" \
+      "${result_dir}/research_raw/NON_PRIVATE_train_log.jsonl" <<'PY'
 import json
 import math
 import sys
 
-status_path, split_path, metrics_path, curve_path, arm_id, planned_steps = sys.argv[1:]
+(
+    status_path, split_path, metrics_path, curve_path, arm_id, planned_steps,
+    coverage_profile, raw_path,
+) = sys.argv[1:]
 planned_steps = int(planned_steps)
 status = json.load(open(status_path, encoding="utf-8"))
 split = json.load(open(split_path, encoding="utf-8"))
@@ -306,6 +325,61 @@ if not math.isclose(
     abs_tol=1e-8,
 ):
     raise SystemExit(f"{arm_id}: validation endpoint mismatch")
+if coverage_profile == "glue-target-baseline-screen":
+    config = status.get("config", {})
+    if (
+        config.get("method") != "baseline"
+        or config.get("telemetry_mode") != "research_raw"
+        or config.get("raw_hist_bins") != 512
+        or not math.isclose(float(config.get("raw_hist_max", -1)), 200.0)
+    ):
+        raise SystemExit(f"{arm_id}: target-baseline config lock mismatch")
+    raw = [json.loads(line) for line in open(raw_path, encoding="utf-8") if line.strip()]
+    if len(raw) != planned_steps:
+        raise SystemExit(f"{arm_id}: target-baseline raw telemetry is incomplete")
+    for expected_step, row in enumerate(raw, start=1):
+        if (
+            row.get("step") != expected_step
+            or row.get("telemetry_schema_version") != 7
+            or row.get("raw_reference_conditional_normalization")
+            != "expected_batch_size"
+        ):
+            raise SystemExit(f"{arm_id}: target-baseline telemetry identity mismatch")
+        realized = int(row["raw_realized_batch_size"])
+        expected = float(row["raw_reference_expected_batch_size_normalization"])
+        clip = float(row["raw_clip_fraction"])
+        remaining = float(row["raw_reference_remaining_mass_proxy"])
+        normalized_clip = clip * realized / expected
+        if not math.isclose(
+            float(row["raw_reference_expected_normalized_clip_mass"]),
+            normalized_clip,
+            rel_tol=1e-9,
+            abs_tol=1e-8,
+        ):
+            raise SystemExit(f"{arm_id}: expected-batch clip mass mismatch")
+        valid = remaining > 1e-12
+        if row.get("raw_reference_conditional_clip_fraction_valid") is not valid:
+            raise SystemExit(f"{arm_id}: conditional validity mismatch")
+        conditional = row.get("raw_reference_conditional_clip_fraction")
+        if valid and not math.isclose(
+            float(conditional), normalized_clip / remaining,
+            rel_tol=1e-9, abs_tol=1e-8,
+        ):
+            raise SystemExit(f"{arm_id}: conditional rho normalization mismatch")
+        counts = row.get("raw_global_norm_hist_counts")
+        edges = row.get("raw_global_norm_hist_edges")
+        overflow = row.get("raw_global_norm_hist_overflow")
+        if (
+            not isinstance(counts, list)
+            or len(counts) != 512
+            or not isinstance(edges, list)
+            or len(edges) != 513
+            or not math.isclose(float(edges[0]), 0.0, abs_tol=1e-12)
+            or not math.isclose(float(edges[-1]), 200.0, abs_tol=1e-8)
+            or not isinstance(overflow, int)
+            or sum(counts) + overflow != realized
+        ):
+            raise SystemExit(f"{arm_id}: target-baseline histogram mismatch")
 PY
   fi
   "${PYTHON_BIN}" scripts/summarize_telemetry.py \
@@ -331,26 +405,36 @@ run_one_real_smoke() {
     local root="${CAMPAIGN_ROOT}/smoke/lane-${LANE}/${dataset}-${model_slug}-${method}"
     mkdir -p "${root}/adapter" "${root}/results"
     local smoke_stage=pilot smoke_validation_rows=0 smoke_validation_interval=0
+    local smoke_initial_c=1.0 smoke_telemetry_mode=dp_safe
     local -a smoke_public_args=()
+    local -a smoke_raw_args=()
     if is_focused_glue_profile; then
       smoke_stage=selection
       smoke_validation_rows=8
       smoke_validation_interval=1
       smoke_public_args+=(--validation_data_is_public)
     fi
+    if [[ "${COVERAGE_PROFILE}" == glue-target-baseline-screen ]]; then
+      smoke_initial_c=50.0
+      smoke_telemetry_mode=research_raw
+      smoke_raw_args+=(
+        --allow_non_private_telemetry --raw_hist_bins 512 --raw_hist_max 200.0
+      )
+    fi
     local -a args=(
       "${PYTHON_BIN}" -u train_eval.py --config "${config}"
       --dataset "${dataset}" --method "${method}" --privacy dp
       --base_model "${model_id}" --model_revision "${model_revision}"
       --seed 42 --steps 2 --batch_size 64 --micro_batch_size 4
-      --initial_clip_threshold 1.0 --slaclip_num_slots 15
-      --telemetry_mode dp_safe --protocol_stage "${smoke_stage}"
+      --initial_clip_threshold "${smoke_initial_c}" --slaclip_num_slots 15
+      --telemetry_mode "${smoke_telemetry_mode}" --protocol_stage "${smoke_stage}"
       --val_set_size "${smoke_validation_rows}" --validation_seed 1729
       --validation_eval_interval "${smoke_validation_interval}"
       --require_cuda --resume --checkpoint_every 1
       --run_train true --run_eval false
       --output_dir "${root}/adapter" --result_dir "${root}/results"
       "${smoke_public_args[@]}"
+      "${smoke_raw_args[@]}"
     )
     if [[ "${method}" == slaclip ]]; then
       args+=(--slaclip_target_non_small_clip_fraction 0.9 --slaclip_eta 0.05 --slaclip_c_min 0.1 --slaclip_c_max 15)
@@ -382,6 +466,48 @@ if (
     or [row.get("step") for row in curve] != [0, 1, 2]
 ):
     raise SystemExit("focused real-model smoke did not exercise the public validation path")
+PY
+    fi
+    if [[ "${COVERAGE_PROFILE}" == glue-target-baseline-screen ]]; then
+      "${PYTHON_BIN}" - "${root}/adapter/run_status.json" \
+        "${root}/results/research_raw/NON_PRIVATE_train_log.jsonl" <<'PY'
+import json
+import math
+import sys
+
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+config = status.get("config", {})
+rows = [json.loads(line) for line in open(sys.argv[2], encoding="utf-8") if line.strip()]
+if (
+    config.get("method") != "baseline"
+    or config.get("telemetry_mode") != "research_raw"
+    or config.get("dp_max_grad_norm") != 50.0
+    or config.get("raw_hist_bins") != 512
+    or config.get("raw_hist_max") != 200.0
+    or len(rows) != 2
+):
+    raise SystemExit("target-baseline real smoke did not lock high-C research telemetry")
+for row in rows:
+    realized = int(row["raw_realized_batch_size"])
+    expected = float(row["raw_reference_expected_batch_size_normalization"])
+    clip_mass = float(row["raw_clip_fraction"]) * realized / expected
+    remaining = float(row["raw_reference_remaining_mass_proxy"])
+    if (
+        row.get("telemetry_schema_version") != 7
+        or row.get("raw_reference_conditional_normalization")
+        != "expected_batch_size"
+        or not math.isclose(
+            float(row["raw_reference_expected_normalized_clip_mass"]),
+            clip_mass, rel_tol=1e-9, abs_tol=1e-8,
+        )
+        or not math.isclose(
+            float(row["raw_reference_conditional_clip_fraction"]),
+            clip_mass / remaining, rel_tol=1e-9, abs_tol=1e-8,
+        )
+        or len(row.get("raw_global_norm_hist_counts", [])) != 512
+        or len(row.get("raw_global_norm_hist_edges", [])) != 513
+    ):
+        raise SystemExit("target-baseline real smoke telemetry semantics mismatch")
 PY
     fi
   done

@@ -24,7 +24,7 @@ from .slaclip import resolve_full_slaclip_target
 
 
 CHECKPOINT_SCHEMA_VERSION = 4
-TELEMETRY_SCHEMA_VERSION = 6
+TELEMETRY_SCHEMA_VERSION = 7
 LOSS_DEFINITION = 'per_record_mean_of_nonignored_next_token_losses'
 VALIDATION_SPLIT_SCHEMA_VERSION = 2
 PROMPT_GROUP_NORMALIZATION_ID = (

@@ -44,6 +44,10 @@ def test_summarizer_flattens_metrics_merges_safe_log_and_handles_missing_fields(
                 "slaclip_c_hit_min": False,
                 "slaclip_c_hit_max": False,
                 "raw_global_norm_quantiles": {"0.1": 0.2, "0.5": 0.8, "0.99": 3.0},
+                "raw_realized_batch_size": 10,
+                "raw_global_norm_hist_counts": [3, 5],
+                "raw_global_norm_hist_edges": [0.0, 1.0, 2.0],
+                "raw_global_norm_hist_overflow": 2,
                 "raw_clip_fraction": 0.4,
                 "raw_clip_coefficient_mean": 0.8,
                 "raw_clip_coefficient_min": 0.2,
@@ -164,6 +168,7 @@ def test_summarizer_flattens_metrics_merges_safe_log_and_handles_missing_fields(
     assert [row["step"] for row in rows] == ["1", "2", "4"]
     assert rows[1]["loss_mean"] == "1.7"
     assert rows[0]["raw_global_norm_q10"] == "0.2"
+    assert float(rows[0]["raw_global_norm_hist_overflow_fraction"]) == 0.2
     assert rows[1]["raw_global_norm_q10"] == ""
     assert rows[1]["raw_global_norm_q50"] == "0.7"
     assert rows[1]["dp_noise_multiplier"] == "0.9"
