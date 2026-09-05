@@ -78,7 +78,8 @@ fi
 if [[ ( "${COVERAGE_PROFILE}" == baseline-gap-fill-cached \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-math-only-cached \
-      || "${COVERAGE_PROFILE}" == glue-target-baseline-screen ) \
+      || "${COVERAGE_PROFILE}" == glue-target-baseline-screen \
+      || "${COVERAGE_PROFILE}" == glue-weighted-target-screen ) \
     && "${ALLOCATION_LANES}" != 1 ]]; then
   echo "error: ${COVERAGE_PROFILE} requires one sequential GPU lane" >&2
   exit 2
@@ -93,6 +94,7 @@ for required in \
   configs/glue8_paper.json \
   configs/math10k_paper.json \
   scripts/build_paper_coverage_campaign.py \
+  scripts/weighted_target_screen.py \
   scripts/prepare_glue_eval_assets.py \
   scripts/preflight_hpc.py \
   scripts/smoke_dp_path.py \
@@ -190,7 +192,8 @@ fi
 if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
     && "${COVERAGE_PROFILE}" != glue-r8-slack-screen \
-    && "${COVERAGE_PROFILE}" != glue-target-baseline-screen ]]; then
+    && "${COVERAGE_PROFILE}" != glue-target-baseline-screen \
+    && "${COVERAGE_PROFILE}" != glue-weighted-target-screen ]]; then
   run_math_preflight() {
     local model_id="${1:?missing Math preflight model}" \
       model_revision="${2:?missing Math preflight revision}" \
@@ -242,16 +245,23 @@ CURRENT_PHASE=parallel-paper-coverage
 write_status running 0
 LANE_SCRIPT="${REPO_ROOT}/slurm/paper_coverage_lane.sh"
 if [[ "${COVERAGE_PROFILE}" == glue-high-c-refinement \
-    || "${COVERAGE_PROFILE}" == glue-r8-slack-screen ]]; then
+    || "${COVERAGE_PROFILE}" == glue-r8-slack-screen \
+    || "${COVERAGE_PROFILE}" == glue-weighted-target-screen ]]; then
   if [[ "${ALLOCATION_LANES}" != 1 ]]; then
     echo "error: ${COVERAGE_PROFILE} requires one sequential GPU lane" >&2
     exit 2
   fi
   lock_command=lock-high-c-refinement
   stage1_phase=stage1-high-c-fixed-screen
+  stage2_plan=stage2-slaclip.tsv
   if [[ "${COVERAGE_PROFILE}" == glue-r8-slack-screen ]]; then
     lock_command=lock-r8-slack-screen
     stage1_phase=stage1-r8-fixed-screen
+  fi
+  if [[ "${COVERAGE_PROFILE}" == glue-weighted-target-screen ]]; then
+    lock_command=lock-weighted-target-screen
+    stage1_phase=stage1-weighted-fixed-boundary-screen
+    stage2_plan=stage2-weighted.tsv
   fi
   CURRENT_PHASE="${stage1_phase}"
   write_status running 0
@@ -273,11 +283,11 @@ if [[ "${COVERAGE_PROFILE}" == glue-high-c-refinement \
 
   CURRENT_PHASE=stage2-derived-full-slaclip-screen
   write_status running 0
-  verify_plan_sidecar "${CAMPAIGN_ROOT}/plans/stage2-slaclip.tsv"
+  verify_plan_sidecar "${CAMPAIGN_ROOT}/plans/${stage2_plan}"
   srun --export=ALL --exclusive --exact --kill-on-bad-exit=1 \
     --nodes=1 --ntasks=1 --cpus-per-task="${EXPECTED_CPUS_PER_TASK}" \
     --mem="${STEP_MEMORY}" --gres="${STEP_GRES}" \
-    "${LANE_SCRIPT}" 0 "${CAMPAIGN_ROOT}/plans/stage2-slaclip.tsv" "${REPO_ROOT}" \
+    "${LANE_SCRIPT}" 0 "${CAMPAIGN_ROOT}/plans/${stage2_plan}" "${REPO_ROOT}" \
     "${ENV_PREFIX}" "${CAMPAIGN_ROOT}" "${EXPECTED_REPO_SHA}" "${JOB_TMP}" \
     "${GLUE_EVAL_ROOT}" "${COVERAGE_PROFILE}" "${MODEL_12B_REVISION}" \
     "${EXPECTED_CPUS_PER_TASK}" false

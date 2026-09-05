@@ -322,6 +322,27 @@ def test_full_slaclip_target_legacy_alias_is_compatible_and_conflict_safe() -> N
             resolve_full_slaclip_target(invalid)
 
 
+def test_full_slaclip_79_percent_target_applies_to_remaining_mass() -> None:
+    # User's trajectory-derived rho = 30% * early(100%) + 70% * late(70%).
+    # It is used directly as conditional rho, not divided by (1-z) again.
+    rho = 0.3 * 1.0 + 0.7 * 0.7
+    update = full_slaclip_threshold_update(
+        2.0,
+        torch.tensor([0.20, 0.40]),
+        eta=0.05,
+        c_min=0.1,
+        c_max=100.0,
+        target_non_small_clip_fraction=rho,
+    )
+    assert rho == pytest.approx(0.79)
+    assert update.small_gradient_proxy_noisy == pytest.approx(0.20, abs=1e-6)
+    assert 1.0 - update.target_unclipped_proxy == pytest.approx(0.632, abs=1e-6)
+    assert update.target_unclipped_proxy == pytest.approx(0.368, abs=1e-6)
+    assert update.observed_unclipped_proxy == pytest.approx(0.20)
+    assert update.next_clip == pytest.approx(2.0 * math.exp(0.05 * 0.168), rel=1e-6)
+    assert update.next_clip > 2.0
+
+
 @pytest.mark.parametrize(
     ('unclipped_proxy', 'direction'),
     [(0.0, 1), (0.01, 0), (0.20, -1)],

@@ -116,6 +116,52 @@ the dynamic global target; report other values as a target-conditioned
 full-SlaClip extension. Do not describe `rho` as the exact or fixed global
 clipping fraction. The legacy `slaclip_beta` spelling has the same semantics.
 
+### Direct weighted conditional-target screen (September 2026)
+
+The `glue-weighted-target-screen` profile implements the user-specified recipe:
+
+```text
+rho = 0.3 * mean(first 25 fixed-run clipping fractions)
+    + 0.7 * mean(last 25 fixed-run clipping fractions)
+u_t = normalized_noisy_slack_indicator[0]
+z_t = normalized_noisy_slack_indicator[-1] / (C_t + 1e-6)
+gamma_t = clip(1 - rho * (1 - z_t), 0, 1)
+C_next = clip(C_t * exp(eta * (gamma_t - u_t)), C_min, C_max)
+```
+
+The weighted number is used directly as conditional rho: **no second division
+by `(1-z)`**. For an early rate 100% and late rate 70%, rho is 0.79.
+If the later small-gradient proxy is 0.20, the global clipped target proxy is
+0.632 and the unclipped target proxy is 0.368. The first indicator coordinate
+is already normalized and is not divided by C again. Both coordinates are
+noisy proxies, and use the public expected Poisson batch size; neither is an
+exact promise about a realized batch's hard clipping rate.
+
+The four complete, full-length GLUE C=1 baselines provide one target each.
+A second target per setting uses the same weighted recipe on a selected
+fixed-C trajectory. All source identities and hashes are locked before
+adaptive training. This differs intentionally from the earlier inverse-map
+conditional-quantile recipe, which remains available for historical replay.
+
+The single-A100, 80G host RAM, 24-hour job first expands the old C=15-limited
+fixed scans: rank 8 at C={15,40,80}, epsilon-6/rank-16 at C={15,30,60}, seed47,
+200 steps. The already-completed epsilon-6/rank-32 and epsilon-3/rank-16 scans
+select C=15 and C=30, respectively. Selection uses public validation loss only.
+Then all four settings run seed48, 150 steps each, with a selected-fixed
+control and two Full-SlaClip target recipes (12 arms). Stage2 shares the same
+800-record public holdout and the same per-setting noise multiplier, seed,
+budget and initial C. It fixes eta=0.05, K=15, C_min=0.1, C_max=100; the wider
+bound prevents the old C_max=15 from blocking adaptation around larger fixed C.
+
+Only compare a 150-step adaptive arm against its 150-step fresh-seed fixed
+control, never against the 200-step calibration arms. A C selected at 200 steps
+is not guaranteed optimal at 150 steps. Boundary winners are flagged and
+remain exploratory. These are candidate screens, not full-length paper
+reproductions, task-accuracy results, or multi-seed confirmation. Positive
+signals need a subsequent full-500-step, multi-seed GLUE evaluation with a
+matched tuned-fixed comparator. The raw calibration and search are NON_PRIVATE;
+the per-run accountant does not certify the complete data-dependent search.
+
 ### Fixed 99%-clipped SlaClip-Q ablation
 
 The first Slack Indicator coordinate is a noisy, bin-averaged surrogate for the
@@ -169,9 +215,12 @@ p*_t = rho * (1 - z_t),     z_t = s_hat_K / C_t
 ```
 
 before projection. Here `p*_t` is the dynamic global clipped proxy, whereas
-`rho` is conditional on the residual/non-small proxy mass. Therefore the exact
-fixed-run `raw_clip_fraction` cannot be copied directly into `rho`; doing so
-would ignore `z_t`. A saturated 100% fixed-run clipping median is also censored
+`rho` is conditional on the residual/non-small proxy mass. When the requested
+number is a desired **global** clipping fraction, the exact fixed-run
+`raw_clip_fraction` cannot be copied directly into `rho` while preserving that
+global target; doing so would ignore `z_t`. The separate direct-weighted recipe
+below deliberately defines the weighted number as **conditional rho**, so it
+does not apply this inverse conversion. A saturated 100% fixed-run clipping median is also censored
 and does not reveal how far the norms lie beyond `C`.
 
 The exploratory campaign locks the following sequence before task-test

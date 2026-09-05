@@ -29,7 +29,8 @@ is_focused_glue_profile() {
   [[ "${COVERAGE_PROFILE}" == glue-slaclip-screen \
       || "${COVERAGE_PROFILE}" == glue-high-c-refinement \
       || "${COVERAGE_PROFILE}" == glue-r8-slack-screen \
-      || "${COVERAGE_PROFILE}" == glue-target-baseline-screen ]]
+      || "${COVERAGE_PROFILE}" == glue-target-baseline-screen \
+      || "${COVERAGE_PROFILE}" == glue-weighted-target-screen ]]
 }
 
 is_baseline_only_profile() {
@@ -146,15 +147,20 @@ run_training() {
     validation_interval=50
     run_eval=false
   fi
-  if [[ "${COVERAGE_PROFILE}" == glue-target-baseline-screen ]]; then
+  if [[ "${COVERAGE_PROFILE}" == glue-target-baseline-screen \
+      || "${COVERAGE_PROFILE}" == glue-weighted-target-screen ]]; then
     raw_hist_bins=512
     raw_hist_max=200.0
   fi
   local controller_target="inactive_for_fixed_baseline"
   local controller_c_bounds="not_applicable_to_fixed_baseline"
+  local controller_c_max=15.0
+  if [[ "${COVERAGE_PROFILE}" == glue-weighted-target-screen ]]; then
+    controller_c_max=100.0
+  fi
   if [[ "${method}" == slaclip ]]; then
     controller_target="p_star_t=rho*(1-z_t)"
-    controller_c_bounds="0.1,15"
+    controller_c_bounds="0.1,${controller_c_max}"
   fi
   mkdir -p "${adapter_dir}" "${result_dir}/research_raw" "${arm_root}/logs"
   CURRENT_ARM="${arm_id}"
@@ -225,7 +231,7 @@ run_training() {
       --slaclip_target_non_small_clip_fraction "${rho}"
       --slaclip_eta "${eta}"
       --slaclip_c_min 0.1
-      --slaclip_c_max 15.0
+      --slaclip_c_max "${controller_c_max}"
     )
   elif [[ "${rho}" != NA || "${eta}" != NA ]]; then
     echo "error: fixed arm unexpectedly includes SlaClip parameters" >&2
@@ -421,6 +427,11 @@ run_one_real_smoke() {
         --allow_non_private_telemetry --raw_hist_bins 512 --raw_hist_max 200.0
       )
     fi
+    if [[ "${COVERAGE_PROFILE}" == glue-weighted-target-screen ]]; then
+      smoke_initial_c=80.0
+      smoke_telemetry_mode=research_raw
+      smoke_raw_args+=(--allow_non_private_telemetry --raw_hist_bins 512 --raw_hist_max 200.0)
+    fi
     local -a args=(
       "${PYTHON_BIN}" -u train_eval.py --config "${config}"
       --dataset "${dataset}" --method "${method}" --privacy dp
@@ -437,7 +448,12 @@ run_one_real_smoke() {
       "${smoke_raw_args[@]}"
     )
     if [[ "${method}" == slaclip ]]; then
-      args+=(--slaclip_target_non_small_clip_fraction 0.9 --slaclip_eta 0.05 --slaclip_c_min 0.1 --slaclip_c_max 15)
+      local smoke_c_max=15.0 smoke_rho=0.9
+      if [[ "${COVERAGE_PROFILE}" == glue-weighted-target-screen ]]; then
+        smoke_c_max=100.0
+        smoke_rho=0.79
+      fi
+      args+=(--slaclip_target_non_small_clip_fraction "${smoke_rho}" --slaclip_eta 0.05 --slaclip_c_min 0.1 --slaclip_c_max "${smoke_c_max}")
     fi
     if [[ "${dataset}" == glue8 ]] && ! is_focused_glue_profile; then
       args+=(

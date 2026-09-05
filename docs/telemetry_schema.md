@@ -125,9 +125,15 @@ Every raw record is marked `NON_PRIVATE_TELEMETRY: true` and adds:
 | `raw_reference_slaclip_num_slots` | telemetry-only `K` used to evaluate the full-SlaClip small-gradient proxy from exact norms; present when a positive reference `K` is configured, including fixed arms in the exploratory scan |
 | `raw_reference_expected_batch_size_normalization` | fixed expected-batch denominator used by the corresponding SlaClip DP release (not the randomly realized Poisson batch size) |
 | `raw_reference_slack_indicator_last` | exact unnoised final coordinate of the telemetry-only reference Slack Indicator |
+| `raw_reference_slack_indicator` | optional full unnoised K-coordinate reference vector, normalized by `lambda * expected_batch_size`; available for future fixed runs as well as adaptive runs with raw observation |
+| `raw_reference_slack_indicator_first` | first coordinate of that reference vector: a bin-averaged unclipped CDF proxy, not an exact hard-clipping fraction |
+| `raw_reference_expected_normalized_unclipped_mass` | `(realized_batch_size - clipped_count) / expected_batch_size`, using the same denominator as the CDF proxy |
+| `raw_reference_unclipped_cdf_bias` | first reference CDF coordinate minus expected-batch-normalized hard-unclipped mass; quantifies boundary-bin smoothing without mixing Poisson denominators |
+| `raw_reference_slack_indicator_noise_std` | counterfactual indicator-coordinate Gaussian s.d. `sigma*sqrt(K)/expected_batch_size`; computed without drawing or releasing noise |
+| `raw_reference_small_gradient_proxy_noise_std` | corresponding z-coordinate s.d. `sigma*sqrt(K)/(expected_batch_size*(C_t+1e-6))`; use this denominator when computing `z/sigma_z` |
 | `raw_reference_small_gradient_proxy` | exact reference `z_t=raw_reference_slack_indicator_last/(C_t+1e-6)` matching the implemented full-SlaClip normalization |
 | `raw_reference_remaining_mass_proxy` | exact reference residual proxy `1-z_t` |
-| `raw_reference_conditional_clip_fraction` | telemetry-only ratio `raw_clip_fraction/(1-z_t)` when the residual proxy is finite and positive; not itself a controller target and not clipped to `[0,1]` |
+| `raw_reference_conditional_clip_fraction` | telemetry-only ratio `(clipped_count/expected_batch_size)/(1-z_t)` in schema 7, when the residual proxy is finite and positive; not itself a controller target and not clipped to `[0,1]` |
 | `raw_reference_conditional_clip_fraction_valid` | whether that conditional ratio has a finite, strictly positive denominator |
 
 By default the histogram upper edge is `4 * C_0`, fixed for the run, and `raw_hist_bins` defaults to 32. A fixed edge makes distributions comparable across adaptive steps. `raw_hist_max` can set another predeclared fixed edge. Histogram resolution is independent of SlaClip's `K`.
@@ -136,9 +142,20 @@ The `raw_reference_*` fields are observer-only counterfactuals. On a fixed arm
 they are computed from exact norms after the mechanism's clipping decision;
 they do not append Slack coordinates to the DP query, affect the clipped
 gradient or Gaussian noise, update `C`, or change accounting. They support the
-exploratory mapping from a global target `p` to full SlaClip's conditional
-target: since `p*_t=rho*(1-z_t)`, a fixed arm's `raw_clip_fraction` cannot be
-used directly as `rho`.
+exploratory choice of full SlaClip's conditional target. Since
+`p*_t=rho*(1-z_t)`, a raw clipping fraction and `rho` describe different
+quantities. A design may explicitly set `rho` to a weighted raw trajectory
+statistic (for example 0.79); its dynamic whole-batch target is then
+`0.79*(1-z_t)`, not 0.79. If instead the goal is to match a particular global
+target `p` at a reference z, the distinct conversion is `rho=p/(1-z)`.
+
+The full reference vector and first-coordinate diagnostics are optional
+additions to schema 7; old logs may omit them. The summarizer retains missing
+fields as absent and serializes the vector into
+`raw_reference_slack_indicator_json` for CSV plots. Indicator noise and
+z-coordinate noise are reported separately, so SNR calculations do not mix
+their units. No additional Gaussian draw or optimizer operation is performed
+to produce these reference diagnostics.
 
 `replay` loads exactly one positive finite threshold per update from
 `--clip_schedule_path`. The file-byte SHA256 and provenance metadata are stored

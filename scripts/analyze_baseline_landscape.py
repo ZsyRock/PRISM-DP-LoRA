@@ -88,7 +88,9 @@ LANDSCAPE_FIELDS = (
     "projected_rho_q90",
     "projected_rho_unique_count",
     "cdf_slack_noise_std_estimate_median",
+    "small_gradient_proxy_noise_std_estimate_median",
     "small_proxy_to_noise_ratio",
+    "small_proxy_noise_ratio_normalization",
     "slack_score",
     "variation_score",
     "eligible_clip_below_threshold",
@@ -484,6 +486,7 @@ def _analyze_records(
     remaining: list[float] = []
     conditional: list[float] = []
     noise_std: list[float] = []
+    small_proxy_noise_std: list[float] = []
     conditional_normalizations: set[str] = set()
     post_steps: list[int] = []
     for record in post:
@@ -589,7 +592,11 @@ def _analyze_records(
             raise ArmArtifactError(
                 f"raw step {step}.valid conditional proxy is missing"
             )
-        noise_std.append(multiplier * math.sqrt(slots) / expected_batch)
+        indicator_noise = multiplier * math.sqrt(slots) / expected_batch
+        noise_std.append(indicator_noise)
+        # The controller uses z=s_hat[K]/(C+1e-6), so signal and noise
+        # must both be expressed in z units when estimating its SNR.
+        small_proxy_noise_std.append(indicator_noise / (identity["C"] + 1e-6))
 
     clip_quantiles = {name: _quantile(clip, probability)
                       for name, probability in QUANTILES}
@@ -616,8 +623,9 @@ def _analyze_records(
     clip_iqr = clip_quantiles["q75"] - clip_quantiles["q25"]
     clip_range = max(clip) - min(clip)
     noise_median = _quantile(noise_std, 0.5)
+    small_proxy_noise_median = _quantile(small_proxy_noise_std, 0.5)
     small_median = _quantile(small, 0.5)
-    ratio = small_median / noise_median
+    ratio = small_median / small_proxy_noise_median
     rolling_window = min(25, len(clip))
     rolling_means = [
         statistics.fmean(clip[start:start + rolling_window])
@@ -681,7 +689,9 @@ def _analyze_records(
         **{f"projected_rho_{name}": value for name, value in projected.items()},
         "projected_rho_unique_count": unique_count,
         "cdf_slack_noise_std_estimate_median": noise_median,
+        "small_gradient_proxy_noise_std_estimate_median": small_proxy_noise_median,
         "small_proxy_to_noise_ratio": ratio,
+        "small_proxy_noise_ratio_normalization": "z_over_sigma_z",
         "slack_score": 1.0 - clip_quantiles["median"],
         "variation_score": max(clip_iqr, abs(delta), rolling_range),
         "eligible_clip_below_threshold": eligible_clip,
@@ -980,6 +990,10 @@ def analyze_campaigns(
             "required_unique_projected_rhos": 5,
             "cdf_slack_noise_std_formula":
                 "dp_noise_multiplier * sqrt(K) / dp_expected_batch_size",
+            "small_gradient_proxy_noise_std_formula":
+                "dp_noise_multiplier * sqrt(K) / (dp_expected_batch_size * (C + 1e-6))",
+            "small_proxy_noise_ratio_formula":
+                "median(z) / median(sigma_z)",
         },
         "counts": {
             "registered_baseline_arms": len(coverage),

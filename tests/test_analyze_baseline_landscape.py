@@ -238,7 +238,7 @@ def test_strict_landscape_statistics_and_manifest_only_discovery(tmp_path: Path)
     assert row["summary_sha256"]
     assert row["clip_median"] < 0.90
     assert row["clip_IQR"] >= 0.05
-    assert row["small_proxy_to_noise_ratio"] == 100.0
+    assert row["small_proxy_to_noise_ratio"] == pytest.approx(100.0001)
     assert row["projected_rho_unique_count"] == 5
     assert row["screen_eligible"] is True
     assert row["conditional_proxy_valid_fraction"] == 1.0

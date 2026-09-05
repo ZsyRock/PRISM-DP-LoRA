@@ -1462,6 +1462,19 @@ class PRISM(torch.optim.Optimizer):
                             )
                         ).item()
                     )
+                    reference_indicator = reference_slack.sum(dim=0) / (
+                        float(reference_lambda) * float(release_denom)
+                    )
+                    reference_indicator_first = float(reference_indicator[0].item())
+                    reference_unclipped_mass = (
+                        float(total - self._dp_state.clipped_samples)
+                        / float(release_denom)
+                    )
+                    # Public counterfactual noise scale only: the observer
+                    # never samples noise or changes the release RNG stream.
+                    reference_indicator_noise = slack_indicator_noise_std(
+                        sigma, reference_slots, release_denom
+                    )
                     reference_small_proxy = reference_indicator_last / (
                         float(C) + 1e-6
                     )
@@ -1502,6 +1515,20 @@ class PRISM(torch.optim.Optimizer):
                         ),
                         'raw_reference_slack_indicator_last': (
                             reference_indicator_last
+                        ),
+                        'raw_reference_slack_indicator': (
+                            [float(value) for value in reference_indicator.tolist()]
+                        ),
+                        'raw_reference_slack_indicator_first': reference_indicator_first,
+                        'raw_reference_expected_normalized_unclipped_mass': (
+                            reference_unclipped_mass
+                        ),
+                        'raw_reference_unclipped_cdf_bias': (
+                            reference_indicator_first - reference_unclipped_mass
+                        ),
+                        'raw_reference_slack_indicator_noise_std': reference_indicator_noise,
+                        'raw_reference_small_gradient_proxy_noise_std': (
+                            reference_indicator_noise / (float(C) + 1e-6)
                         ),
                         'raw_reference_small_gradient_proxy': (
                             reference_small_proxy

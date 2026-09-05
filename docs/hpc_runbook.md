@@ -15,6 +15,21 @@ not use them as defaults for a newly designed campaign.  The canonical wrapper
 also requires `PRISM_COVERAGE_PROFILE` explicitly so a bare command cannot
 silently submit a historical 99-arm profile.
 
+The September 2026 next-stage profile is `glue-weighted-target-screen`:
+
+```bash
+PRISM_COVERAGE_PROFILE=glue-weighted-target-screen bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=glue-weighted-target-screen bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+It runs six fixed-C calibration arms and then twelve matched target-screen
+arms inside one allocation. The plan and input hashes are verified before
+queueing; synthetic and real fixed/adaptive GPU smokes run at the front of the
+same job. Source evidence is resolved relative to the campaigns directory, not
+to a hard-coded HPC username. Copy the required source campaign artifacts when
+migrating this continuation to another account, or build a new calibration
+campaign there. See `docs/assessment_2026-09-05.md` for the exact scientific scope.
+
 ## 1. Clone an immutable code revision
 
 Clone the repository on persistent project storage and record the exact commit:

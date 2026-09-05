@@ -23,12 +23,14 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import tempfile
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 
 SCHEMA_VERSION = 2
@@ -37,6 +39,21 @@ MODEL_4B = "google/gemma-3-4b-pt"
 MODEL_9B = "google/gemma-2-9b"
 MODEL_12B = "google/gemma-3-12b-pt"
 FULL_SHA_LENGTH = 40
+
+
+def _weighted_target_module():
+    """Load the optional staged profile in CLI and importlib-based tests alike."""
+    spec = importlib.util.spec_from_file_location(
+        "weighted_target_screen", Path(__file__).with_name("weighted_target_screen.py")
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _builder_api():
+    return SimpleNamespace(**globals())
 
 BREADTH_SETTINGS = (
     {
@@ -893,6 +910,11 @@ def build_manifest(
     profile: str = "paper-breadth",
     model_12b_revision: str | None = None,
 ) -> dict[str, Any]:
+    if profile == "glue-weighted-target-screen":
+        return _weighted_target_module().build_manifest(
+            _builder_api(), code_sha, model_4b_revision, model_9b_revision,
+            model_12b_revision,
+        )
     for label, value in (
         ("code_sha", code_sha),
         ("model_4b_revision", model_4b_revision),
@@ -1540,6 +1562,7 @@ def _plan_bytes(manifest: dict[str, Any], lane: int, include_all: bool = False) 
             # the strongest clipping variation and is the slowest of the two
             # target-calibration settings. Preserve that failure-safe order.
             "glue-target-baseline-screen",
+            "glue-weighted-target-screen",
         }:
             priority = {
                 setting: index
@@ -1587,7 +1610,9 @@ def _plan_bytes(manifest: dict[str, Any], lane: int, include_all: bool = False) 
 
 
 def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision: str, profile: str, model_12b_revision: str | None = None) -> None:
-    if profile == "glue-slaclip-screen":
+    if profile == "glue-weighted-target-screen":
+        _weighted_target_module().verify_sources(_builder_api(), root)
+    elif profile == "glue-slaclip-screen":
         _verify_glue_slaclip_source(root)
     elif profile == "glue-high-c-refinement":
         _verify_high_c_preceding_primary_source(root)
@@ -1604,7 +1629,7 @@ def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision
     _with_sha(root / "plans" / "lane-0.tsv", _plan_bytes(manifest, 0))
     _with_sha(root / "plans" / "lane-1.tsv", _plan_bytes(manifest, 1))
     _with_sha(root / "plans" / "sequential.tsv", _plan_bytes(manifest, 0, include_all=True))
-    if profile in {"glue-high-c-refinement", "glue-r8-slack-screen"}:
+    if profile in {"glue-high-c-refinement", "glue-r8-slack-screen", "glue-weighted-target-screen"}:
         _with_sha(
             root / "plans" / "stage1-fixed.tsv",
             _plan_bytes(manifest, 0, include_all=True),
@@ -1763,14 +1788,14 @@ def _validate_arm_telemetry(
             "slaclip_target_non_small_clip_fraction": arm["rho"],
             "slaclip_eta": arm["eta"],
             "slaclip_c_min": 0.1,
-            "slaclip_c_max": 15.0,
+            "slaclip_c_max": arm.get("c_max", 15.0),
         })
     else:
         # The paper config retains its inactive rho=0.5 default for fixed-C
         # runs. It is identity metadata only; method=baseline never constructs
         # or applies the SlaClip controller.
         expected_config["slaclip_target_non_small_clip_fraction"] = 0.5
-    if arm.get("role") == "target_calibration_fixed_candidate":
+    if arm.get("role") == "target_calibration_fixed_candidate" or arm.get("raw_hist_bins") == 512:
         expected_config.update({
             "raw_hist_bins": 512,
             "raw_hist_max": 200.0,
@@ -3061,6 +3086,7 @@ def _build_glue_target_baseline_selection(
         small = []
         conditional = []
         noise_std = []
+        small_proxy_noise_std = []
         for row in post:
             step = int(row["step"])
             if row.get("telemetry_schema_version") != 7:
@@ -3165,7 +3191,13 @@ def _build_glue_target_baseline_selection(
                 raise CampaignError(
                     f"invalid CDF noise calibration at {setting_id}:{step}"
                 )
-            noise_std.append(multiplier * math.sqrt(slots) / normalization)
+            indicator_noise = multiplier * math.sqrt(slots) / normalization
+            noise_std.append(indicator_noise)
+            # z=s_hat[K]/(C+1e-6); its noise must have the same scaling.
+            # Comparing z with indicator-space noise understates SNR by C.
+            small_proxy_noise_std.append(
+                indicator_noise / (float(winner["initial_C"]) + 1e-6)
+            )
 
         conditional_valid_fraction = len(conditional) / len(post)
         raw_rhos = (
@@ -3226,8 +3258,9 @@ def _build_glue_target_baseline_selection(
         last_half_mean = sum(clips[-split:]) / split
         half_delta = last_half_mean - first_half_mean
         noise_median = _quantile(noise_std, 0.50)
+        small_proxy_noise_median = _quantile(small_proxy_noise_std, 0.50)
         small_median = z_median
-        small_proxy_noise_ratio = small_median / noise_median
+        small_proxy_noise_ratio = small_median / small_proxy_noise_median
         clip_median = _quantile(clips, 0.50)
         clip_iqr = clip_q75 - clip_q25
         identifiable_gates = {
@@ -3298,7 +3331,9 @@ def _build_glue_target_baseline_selection(
             },
             "small_gradient_proxy_median_z": z_median,
             "cdf_slack_noise_std_estimate_median": noise_median,
+            "small_gradient_proxy_noise_std_estimate_median": small_proxy_noise_median,
             "small_proxy_to_noise_ratio": small_proxy_noise_ratio,
+            "small_proxy_noise_ratio_normalization": "z_over_sigma_z",
             "conditional_proxy_valid_fraction": conditional_valid_fraction,
             "projected_conditional_rho_unique_count": unique_projected_rhos,
             "projected_conditional_rho_span": projected_rho_span,
@@ -3340,6 +3375,10 @@ def _build_glue_target_baseline_selection(
         "fixed_C_grid": list(GLUE_TARGET_BASELINE_FIXED_GRID),
         "burn_in_rule": "exclude steps 1 through 50",
         "target_semantics": "p_star_t=rho*(1-z_t)",
+        "cdf_slack_noise_std_formula": "sigma*sqrt(K)/expected_batch_size",
+        "small_gradient_proxy_noise_std_formula":
+            "sigma*sqrt(K)/(expected_batch_size*(C+1e-6))",
+        "small_proxy_noise_ratio_formula": "median(z)/median(sigma_z)",
         "target_rho_bounds": list(GLUE_TARGET_BASELINE_RHO_BOUNDS),
         "adaptive_arms_in_campaign": 0,
         "fresh_seed_required_for_adaptive_screen": True,
@@ -3356,7 +3395,21 @@ def analyze(root: Path) -> None:
     analysis_arms = list(manifest.get("arms", []))
     high_c_lock = None
     r8_slack_lock = None
-    if manifest.get("profile") == "glue-high-c-refinement":
+    weighted_lock = None
+    if manifest.get("profile") == "glue-weighted-target-screen":
+        weighted_lock = _weighted_target_module().lock(_builder_api(), root)
+        stage2 = weighted_lock.get("stage2_arms", [])
+        if (
+            len(stage2) != 12
+            or weighted_lock.get("code_sha") != manifest["code_sha"]
+            or weighted_lock.get("stage2_plan_sha256")
+            != _file_sha256(root / "plans" / "stage2-weighted.tsv")
+        ):
+            raise CampaignError("weighted-target screen has an invalid Stage-2 lock")
+        analysis_arms.extend(stage2)
+        if len(analysis_arms) != 18 or len({a["arm_id"] for a in analysis_arms}) != 18:
+            raise CampaignError("weighted-target screen requires 18 unique arms")
+    elif manifest.get("profile") == "glue-high-c-refinement":
         # Recompute the dynamic provenance gate at analysis time.  The
         # immutable writer accepts byte-identical replay but refuses any change
         # to the Stage-1-derived lock, its sidecar, or the Stage-2 plan.  (The
@@ -3430,6 +3483,7 @@ def analyze(root: Path) -> None:
         focused_screen = manifest.get("profile") in {
             "glue-slaclip-screen", "glue-high-c-refinement",
             "glue-r8-slack-screen", "glue-target-baseline-screen",
+            "glue-weighted-target-screen",
         }
         raw_records = None
         if focused_screen:
@@ -3925,7 +3979,7 @@ def analyze(root: Path) -> None:
     best_fixed = {}
     for row in results:
         paired_rank8_fixed = (
-            manifest.get("profile") != "glue-r8-slack-screen"
+            manifest.get("profile") not in {"glue-r8-slack-screen", "glue-weighted-target-screen"}
             or row["candidate_role"] == "fresh_fixed_comparator"
         )
         if row["method"] == "baseline" and paired_rank8_fixed:
@@ -3984,7 +4038,47 @@ def analyze(root: Path) -> None:
         ),
         "rows": regime_rows,
     }))
-    if manifest.get("profile") == "glue-slaclip-screen":
+    if weighted_lock is not None:
+        comparisons = []
+        for fixed in results:
+            if fixed["candidate_role"] != "fresh_fixed_comparator":
+                continue
+            for adaptive in results:
+                if adaptive["setting_id"] != fixed["setting_id"] or adaptive["method"] != "slaclip":
+                    continue
+                if adaptive["seed"] != fixed["seed"] or adaptive["initial_C"] != fixed["initial_C"]:
+                    raise CampaignError("weighted comparison must match seed and initial C")
+                comparisons.append({
+                    "setting_id": fixed["setting_id"],
+                    "seed": fixed["seed"],
+                    "steps": 150,
+                    "candidate": adaptive["candidate"],
+                    "target_recipe": adaptive["candidate_role"],
+                    "rho": adaptive["rho"],
+                    "C0_and_fixed_C": fixed["initial_C"],
+                    "fixed_validation_loss": fixed["public_validation_loss"],
+                    "slaclip_validation_loss": adaptive["public_validation_loss"],
+                    "loss_improvement": fixed["public_validation_loss"] - adaptive["public_validation_loss"],
+                    "endpoint_win": adaptive["public_validation_loss"] < fixed["public_validation_loss"],
+                    "full_auc_not_worse": adaptive["full_normalized_validation_loss_auc"] <= fixed["full_normalized_validation_loss_auc"],
+                    "late_auc_not_worse": adaptive["late_window_normalized_validation_loss_auc"] <= fixed["late_window_normalized_validation_loss_auc"],
+                    "C_hit_min_steps": adaptive["C_hit_min_steps"],
+                    "C_hit_max_steps": adaptive["C_hit_max_steps"],
+                })
+        if len(comparisons) != 8:
+            raise CampaignError("weighted screen needs eight matched comparisons")
+        _with_sha(out / "weighted_target_comparison.json", _json_bytes({
+            "schema_version": 1,
+            "NON_PRIVATE_TELEMETRY": True,
+            "inference": "single_fresh_seed_150_step_exploratory_screen",
+            "journal_confirmation_ready": False,
+            "accuracy_evaluated": False,
+            "comparison_rule": "150-step seed48 SlaClip vs same-seed same-budget fixed comparator only",
+            "settings": weighted_lock.get("settings", []),
+            "comparisons": comparisons,
+            "next_step": "confirm promising targets with full-length multi-seed utility evaluation; refine boundary fixed winners",
+        }))
+    elif manifest.get("profile") == "glue-slaclip-screen":
         eligible = [
             row for row in results
             if row["candidate_role"] in {
@@ -4305,6 +4399,7 @@ def parser() -> argparse.ArgumentParser:
             "glue-slaclip-screen",
             "glue-high-c-refinement", "glue-r8-slack-screen",
             "glue-target-baseline-screen",
+            "glue-weighted-target-screen",
         ),
         default="paper-breadth",
     )
@@ -4313,6 +4408,8 @@ def parser() -> argparse.ArgumentParser:
     lock.add_argument("--campaign-root", required=True, type=Path)
     lock_r8 = sub.add_parser("lock-r8-slack-screen")
     lock_r8.add_argument("--campaign-root", required=True, type=Path)
+    lock_weighted = sub.add_parser("lock-weighted-target-screen")
+    lock_weighted.add_argument("--campaign-root", required=True, type=Path)
     report = sub.add_parser("analyze")
     report.add_argument("--campaign-root", required=True, type=Path)
     return value
@@ -4333,6 +4430,8 @@ def main() -> None:
         lock_high_c_refinement(args.campaign_root)
     elif args.command == "lock-r8-slack-screen":
         lock_glue_r8_slack_screen(args.campaign_root)
+    elif args.command == "lock-weighted-target-screen":
+        _weighted_target_module().lock(_builder_api(), args.campaign_root)
     else:
         analyze(args.campaign_root)
 
