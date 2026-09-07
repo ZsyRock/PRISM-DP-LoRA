@@ -79,7 +79,8 @@ if [[ ( "${COVERAGE_PROFILE}" == baseline-gap-fill-cached \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-math-only-cached \
       || "${COVERAGE_PROFILE}" == glue-target-baseline-screen \
-      || "${COVERAGE_PROFILE}" == glue-weighted-target-screen ) \
+      || "${COVERAGE_PROFILE}" == glue-weighted-target-screen \
+      || "${COVERAGE_PROFILE}" == glue-quantile-target-screen ) \
     && "${ALLOCATION_LANES}" != 1 ]]; then
   echo "error: ${COVERAGE_PROFILE} requires one sequential GPU lane" >&2
   exit 2
@@ -95,6 +96,7 @@ for required in \
   configs/math10k_paper.json \
   scripts/build_paper_coverage_campaign.py \
   scripts/weighted_target_screen.py \
+  scripts/quantile_target_screen.py \
   scripts/prepare_glue_eval_assets.py \
   scripts/preflight_hpc.py \
   scripts/smoke_dp_path.py \
@@ -193,7 +195,8 @@ if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-high-c-refinement \
     && "${COVERAGE_PROFILE}" != glue-r8-slack-screen \
     && "${COVERAGE_PROFILE}" != glue-target-baseline-screen \
-    && "${COVERAGE_PROFILE}" != glue-weighted-target-screen ]]; then
+    && "${COVERAGE_PROFILE}" != glue-weighted-target-screen \
+    && "${COVERAGE_PROFILE}" != glue-quantile-target-screen ]]; then
   run_math_preflight() {
     local model_id="${1:?missing Math preflight model}" \
       model_revision="${2:?missing Math preflight revision}" \

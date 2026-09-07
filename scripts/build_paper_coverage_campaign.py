@@ -55,6 +55,17 @@ def _weighted_target_module():
 def _builder_api():
     return SimpleNamespace(**globals())
 
+
+def _quantile_target_module():
+    """Load the empirical-default-quantile screen without circular imports."""
+    spec = importlib.util.spec_from_file_location(
+        "quantile_target_screen", Path(__file__).with_name("quantile_target_screen.py")
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 BREADTH_SETTINGS = (
     {
         "id": "glue8-4b-eps6-r16",
@@ -910,6 +921,11 @@ def build_manifest(
     profile: str = "paper-breadth",
     model_12b_revision: str | None = None,
 ) -> dict[str, Any]:
+    if profile == "glue-quantile-target-screen":
+        return _quantile_target_module().build_manifest(
+            _builder_api(), code_sha, model_4b_revision, model_9b_revision,
+            model_12b_revision,
+        )
     if profile == "glue-weighted-target-screen":
         return _weighted_target_module().build_manifest(
             _builder_api(), code_sha, model_4b_revision, model_9b_revision,
@@ -1563,6 +1579,7 @@ def _plan_bytes(manifest: dict[str, Any], lane: int, include_all: bool = False) 
             # target-calibration settings. Preserve that failure-safe order.
             "glue-target-baseline-screen",
             "glue-weighted-target-screen",
+            "glue-quantile-target-screen",
         }:
             priority = {
                 setting: index
@@ -1610,7 +1627,10 @@ def _plan_bytes(manifest: dict[str, Any], lane: int, include_all: bool = False) 
 
 
 def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision: str, profile: str, model_12b_revision: str | None = None) -> None:
-    if profile == "glue-weighted-target-screen":
+    quantile_sources = None
+    if profile == "glue-quantile-target-screen":
+        quantile_sources = _quantile_target_module().verify_sources(_builder_api(), root)
+    elif profile == "glue-weighted-target-screen":
         _weighted_target_module().verify_sources(_builder_api(), root)
     elif profile == "glue-slaclip-screen":
         _verify_glue_slaclip_source(root)
@@ -1626,6 +1646,8 @@ def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision
         model_12b_revision=model_12b_revision,
     )
     _with_sha(root / "plans" / "manifest.json", _json_bytes(manifest))
+    if quantile_sources is not None:
+        _with_sha(root / "selection" / "quantile-sources.lock.json", _json_bytes(quantile_sources))
     _with_sha(root / "plans" / "lane-0.tsv", _plan_bytes(manifest, 0))
     _with_sha(root / "plans" / "lane-1.tsv", _plan_bytes(manifest, 1))
     _with_sha(root / "plans" / "sequential.tsv", _plan_bytes(manifest, 0, include_all=True))
@@ -3396,6 +3418,18 @@ def analyze(root: Path) -> None:
     high_c_lock = None
     r8_slack_lock = None
     weighted_lock = None
+    if manifest.get("profile") == "glue-quantile-target-screen":
+        quantile_sources = _quantile_target_module().verify_sources(_builder_api(), root)
+        _with_sha(root / "selection" / "quantile-sources.lock.json", _json_bytes(quantile_sources))
+        expected = build_manifest(
+            manifest["code_sha"], _weighted_target_module().MODEL_REVISION,
+            "0" * 40, profile="glue-quantile-target-screen",
+        )
+        if (manifest.get("arms") != expected["arms"]
+                or manifest.get("quantile_target_screen") != expected["quantile_target_screen"]):
+            raise CampaignError("quantile plan or target recipe differs from the immutable profile")
+        if len(analysis_arms) != 20 or len({a["arm_id"] for a in analysis_arms}) != 20:
+            raise CampaignError("quantile screen requires 20 unique arms")
     if manifest.get("profile") == "glue-weighted-target-screen":
         weighted_lock = _weighted_target_module().lock(_builder_api(), root)
         stage2 = weighted_lock.get("stage2_arms", [])
@@ -3484,6 +3518,7 @@ def analyze(root: Path) -> None:
             "glue-slaclip-screen", "glue-high-c-refinement",
             "glue-r8-slack-screen", "glue-target-baseline-screen",
             "glue-weighted-target-screen",
+            "glue-quantile-target-screen",
         }
         raw_records = None
         if focused_screen:
@@ -3979,7 +4014,7 @@ def analyze(root: Path) -> None:
     best_fixed = {}
     for row in results:
         paired_rank8_fixed = (
-            manifest.get("profile") not in {"glue-r8-slack-screen", "glue-weighted-target-screen"}
+            manifest.get("profile") not in {"glue-r8-slack-screen", "glue-weighted-target-screen", "glue-quantile-target-screen"}
             or row["candidate_role"] == "fresh_fixed_comparator"
         )
         if row["method"] == "baseline" and paired_rank8_fixed:
@@ -4038,7 +4073,54 @@ def analyze(root: Path) -> None:
         ),
         "rows": regime_rows,
     }))
-    if weighted_lock is not None:
+    if manifest.get("profile") == "glue-quantile-target-screen":
+        comparisons = []
+        arm_by_id = {(a["setting_id"], a["candidate_id"]): a for a in analysis_arms}
+        for sid in dict.fromkeys(a["setting_id"] for a in analysis_arms):
+            group = [r for r in results if r["setting_id"] == sid]
+            default_rows = [r for r in group if r["candidate_role"] == "quantile_default_fixed"]
+            tuned_rows = [r for r in group if r["candidate_role"] == "fresh_fixed_comparator"]
+            adaptive_rows = [r for r in group if r["method"] == "slaclip"]
+            if len(default_rows) != 1 or len(tuned_rows) != 1 or len(adaptive_rows) != 3:
+                raise CampaignError("each quantile setting needs two fixed controls and three SlaClip arms")
+            default, tuned = default_rows[0], tuned_rows[0]
+            if default["initial_C"] != 1.0:
+                raise CampaignError("default quantile control must use C=1")
+            for adaptive in adaptive_rows:
+                arm = arm_by_id[(sid, adaptive["candidate"])]
+                if (adaptive["seed"] != tuned["seed"] or adaptive["seed"] != default["seed"]
+                        or adaptive["initial_C"] != tuned["initial_C"]):
+                    raise CampaignError("quantile controls must match seed and tuned initial C")
+                comparisons.append({
+                    "setting_id": sid, "candidate": adaptive["candidate"],
+                    "seed": arm["seed"], "steps": arm["steps"],
+                    "rho": adaptive["rho"], "quantile": arm["quantile"],
+                    "C0_and_tuned_fixed_C": tuned["initial_C"],
+                    "tuned_fixed_validation_loss": tuned["public_validation_loss"],
+                    "default_fixed_validation_loss": default["public_validation_loss"],
+                    "slaclip_validation_loss": adaptive["public_validation_loss"],
+                    "loss_improvement_vs_tuned": tuned["public_validation_loss"] - adaptive["public_validation_loss"],
+                    "loss_improvement_vs_default": default["public_validation_loss"] - adaptive["public_validation_loss"],
+                    "endpoint_win_vs_tuned": adaptive["public_validation_loss"] < tuned["public_validation_loss"],
+                    "endpoint_win_vs_default": adaptive["public_validation_loss"] < default["public_validation_loss"],
+                    "full_auc_not_worse_vs_tuned": adaptive["full_normalized_validation_loss_auc"] <= tuned["full_normalized_validation_loss_auc"],
+                    "late_auc_not_worse_vs_tuned": adaptive["late_window_normalized_validation_loss_auc"] <= tuned["late_window_normalized_validation_loss_auc"],
+                    "C_hit_min_steps": adaptive["C_hit_min_steps"],
+                    "C_hit_max_steps": adaptive["C_hit_max_steps"],
+                })
+        if len(comparisons) != 12:
+            raise CampaignError("quantile screen requires twelve adaptive comparisons")
+        _with_sha(out / "quantile_target_comparison.json", _json_bytes({
+            "schema_version": 1, "NON_PRIVATE_TELEMETRY": True,
+            "accuracy_evaluated": False, "journal_confirmation_ready": False,
+            "inference": "single_fresh_seed_150_step_exploratory_screen",
+            "comparison_rule": "same-seed same-budget adaptive vs tuned fixed (primary) and C1 fixed (secondary)",
+            "target_source": "paper_default_C1_all_500_steps_empirical_quantiles",
+            "inverse_small_mass_adjustment": False,
+            "comparisons": comparisons,
+            "next_step": "lock candidates before full-length fresh-seed official-utility confirmation; beating C1 alone does not establish a tuned-fixed improvement",
+        }))
+    elif weighted_lock is not None:
         comparisons = []
         for fixed in results:
             if fixed["candidate_role"] != "fresh_fixed_comparator":
@@ -4400,6 +4482,7 @@ def parser() -> argparse.ArgumentParser:
             "glue-high-c-refinement", "glue-r8-slack-screen",
             "glue-target-baseline-screen",
             "glue-weighted-target-screen",
+            "glue-quantile-target-screen",
         ),
         default="paper-breadth",
     )

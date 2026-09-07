@@ -30,7 +30,8 @@ is_focused_glue_profile() {
       || "${COVERAGE_PROFILE}" == glue-high-c-refinement \
       || "${COVERAGE_PROFILE}" == glue-r8-slack-screen \
       || "${COVERAGE_PROFILE}" == glue-target-baseline-screen \
-      || "${COVERAGE_PROFILE}" == glue-weighted-target-screen ]]
+      || "${COVERAGE_PROFILE}" == glue-weighted-target-screen \
+      || "${COVERAGE_PROFILE}" == glue-quantile-target-screen ]]
 }
 
 is_baseline_only_profile() {
@@ -148,14 +149,16 @@ run_training() {
     run_eval=false
   fi
   if [[ "${COVERAGE_PROFILE}" == glue-target-baseline-screen \
-      || "${COVERAGE_PROFILE}" == glue-weighted-target-screen ]]; then
+      || "${COVERAGE_PROFILE}" == glue-weighted-target-screen \
+      || "${COVERAGE_PROFILE}" == glue-quantile-target-screen ]]; then
     raw_hist_bins=512
     raw_hist_max=200.0
   fi
   local controller_target="inactive_for_fixed_baseline"
   local controller_c_bounds="not_applicable_to_fixed_baseline"
   local controller_c_max=15.0
-  if [[ "${COVERAGE_PROFILE}" == glue-weighted-target-screen ]]; then
+  if [[ "${COVERAGE_PROFILE}" == glue-weighted-target-screen \
+      || "${COVERAGE_PROFILE}" == glue-quantile-target-screen ]]; then
     controller_c_max=100.0
   fi
   if [[ "${method}" == slaclip ]]; then
@@ -427,7 +430,8 @@ run_one_real_smoke() {
         --allow_non_private_telemetry --raw_hist_bins 512 --raw_hist_max 200.0
       )
     fi
-    if [[ "${COVERAGE_PROFILE}" == glue-weighted-target-screen ]]; then
+    if [[ "${COVERAGE_PROFILE}" == glue-weighted-target-screen \
+        || "${COVERAGE_PROFILE}" == glue-quantile-target-screen ]]; then
       smoke_initial_c=80.0
       smoke_telemetry_mode=research_raw
       smoke_raw_args+=(--allow_non_private_telemetry --raw_hist_bins 512 --raw_hist_max 200.0)
@@ -449,7 +453,8 @@ run_one_real_smoke() {
     )
     if [[ "${method}" == slaclip ]]; then
       local smoke_c_max=15.0 smoke_rho=0.9
-      if [[ "${COVERAGE_PROFILE}" == glue-weighted-target-screen ]]; then
+      if [[ "${COVERAGE_PROFILE}" == glue-weighted-target-screen \
+          || "${COVERAGE_PROFILE}" == glue-quantile-target-screen ]]; then
         smoke_c_max=100.0
         smoke_rho=0.79
       fi
