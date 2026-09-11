@@ -1,0 +1,16 @@
+# Model, data, evaluation, and serialization stack.
+# PyTorch and Opacus are kept in requirements.txt because their installation
+# must be considered together with the target HPC CUDA driver.
+transformers>=4.50,<5.2
+peft>=0.14,<0.19
+datasets>=3.2,<4.6
+evaluate>=0.4.3,<0.5
+accelerate>=1.2,<2
+huggingface-hub>=0.28,<2
+pandas>=2.2,<3
+tqdm>=4.66,<5
+scikit-learn>=1.5,<2
+scipy>=1.13,<2
+sentencepiece>=0.2,<0.3
+safetensors>=0.4.5,<0.8
+fire>=0.7,<0.8

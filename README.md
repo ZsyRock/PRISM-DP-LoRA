@@ -1,88 +1,567 @@
-# PRISM-DP-LoRA
+# PRISM-DP-LoRA with SlaClip controllers
 
-Code for **PRISM: Gauge-Invariant Tangent-Space Differentially Private LoRA**.
+This repository provides reproducible, separately labelled comparisons among:
 
-This repository provides training and evaluation scripts for PRISM and baseline LoRA fine-tuning on GLUE8 and Math-10K.
+- `baseline`: PRISM with a fixed clipping threshold `C`;
+- `slaclip`: the camera-ready full SlaClip controller, whose global target is dynamically constructed from the jointly noised Slack Indicator and a predeclared conditional target fraction;
+- `slaclip_q`: the paper's fixed-target SlaClip-Q ablation applied to PRISM.
 
-## Setup
+For full SlaClip, let `rho=slaclip_target_non_small_clip_fraction`, let
+`s_hat_1` denote the noisy near-threshold *unclipped* CDF proxy, and let
+`z_t=s_hat_K/C_t` denote the paper's noisy, threshold-adjusted small-gradient
+proxy. The controller uses
+`gamma_t=Proj_[0,1](1-rho*(1-z_t))` and
+`C_(t+1)=C_t*exp(eta*(gamma_t-s_hat_1))`, followed by the declared threshold
+bounds. Thus `rho` is the target clipped fraction of the residual/non-small
+mass after accounting for `z_t`; it is not a fixed global clipping rate and is
+not guaranteed to equal the exact realized clipping fraction. `rho=0.5`
+reproduces the paper's literal `1/2`, while `eta` is the threshold-update gain.
+When `gamma_t-s_hat_1` is positive the controller increases `C_t`, tending to
+reduce clipping; when it is negative the controller decreases `C_t`, tending
+to increase clipping. The legacy name `slaclip_beta` refers to the same `rho`.
+
+SlaClip-Q is different: it omits `s_hat_K` and tracks a fixed global
+unclipped-CDF target. A requested SlaClip-Q global clipped fraction of `0.99`
+therefore maps to the fixed target `gamma=0.01`. A full-SlaClip run with
+`rho=0.99` remains full SlaClip because its global target still changes with
+`z_t`; it must not be labelled SlaClip-Q-99. Neither controller's noisy proxy
+target guarantees an exact achieved clipping fraction.
+
+Every paired launcher keeps the model, data order, Poisson sampling, optimizer, privacy target, accountant, noise multiplier, update count, LoRA setup, and evaluation settings identical. Only the declared clipping controller differs.
+
+## What is ready, and what still needs HPC validation
+
+The repository-level unit suite and the synthetic Opacus/PRISM DP smoke path have been exercised on Ubuntu/CPU. They cover the fixed and adaptive threshold paths, per-sample gradients, DP noise and accounting, privacy-separated telemetry, stable experiment identities, atomic checkpoints, and checkpoint/resume equivalence.
+
+That does **not** prove that the full gated `google/gemma-3-4b-pt` checkpoint fits a particular GPU, that the cluster's CUDA/PyTorch binaries are compatible, or that every Gemma 3 module works in that environment. Before a formal run, the HPC still needs:
+
+1. the environment/data preflight;
+2. the synthetic CUDA smoke test;
+3. a two-step, one-GPU Gemma smoke run for both methods.
+
+These are hardware and environment validation steps, not unfinished experiment interfaces. If they expose a cluster-specific incompatibility, the code can still be revised after migration; HPC is not an artificial boundary on future changes. See [the HPC runbook](docs/hpc_runbook.md) for the exact sequence.
+
+## Environment
+
+Python 3.11 is recommended. For a local installation:
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-The project follows the `LLM-Adapters` directory layout:
+Development checks additionally require:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+python scripts/smoke_dp_path.py --device cpu --steps 2
+```
+
+The dependency files are layered as follows:
+
+- `requirements-core.txt`: Transformers, PEFT, datasets, evaluation, and I/O;
+- `requirements.txt`: runtime stack including bounded PyTorch and Opacus families;
+- `requirements-dev.txt`: runtime stack plus test dependencies;
+- `environment.yml`: reference Python 3.11 Conda environment.
+
+Gemma 3 4B is a gated, multimodal checkpoint even when this project fine-tunes it on text. Accept the model terms, authenticate with Hugging Face, and pin a reviewed model commit for formal experiments. The loader selects a compatible multimodal/conditional-generation class and freezes the vision tower during text-only LoRA training. Transformers 4.50 or later is required for this architecture.
+
+## Paper/default configurations
+
+The tracked JSON configurations make the reproduction defaults explicit:
+
+| Setting | Math-10K | GLUE8 |
+|---|---:|---:|
+| Config | `configs/math10k_paper.json` | `configs/glue8_paper.json` |
+| Updates | 300 | 500 |
+| Learning rate | `3e-4` | `2e-4` |
+| Cutoff length | 256 | 384 |
+| Train on inputs | yes | no |
+| Expected batch / physical microbatch | 64 / 4 | 64 / 4 |
+| LoRA rank / alpha / dropout | 16 / 16 / 0.05 | 16 / 16 / 0.05 |
+| Initial or fixed threshold | 1.0 | 1.0 |
+
+Both configs use `google/gemma-3-4b-pt`, target `q_proj,k_proj,v_proj,up_proj,down_proj`, request `epsilon=6` and `delta=1e-5`, and use the PRV accountant. `prv` is also the CLI default.
+
+The default optimizer protocol is deliberately labelled the **PRISM public-code variant**: scalar second-moment floor `0.5` and no noise-moment debias, matching the authors' released training defaults. The paper text also describes a geometry-dependent additive floor/debias variant; that is a distinct optimizer ablation and must not be silently mixed into a clipping-controller comparison. This repository additionally uses a record-normalized, microbatch-invariant causal-LM loss. It matches the paper's per-record DP formulation but differs from the released code's batch-token reduction, so clipping trajectories from this hardened protocol should not be described as bitwise upstream-code reproduction.
+
+The journal ablation configs `configs/math10k_slaclip_q99.json` and `configs/glue8_slaclip_q99.json` retain those task/model settings and predeclare `target_clip_fraction=0.99`, `C_min=0.1`, `C_max=15`, and the official SlaClip CLI gain `eta=0.2`. They also make the PRISM public-code optimizer variant explicit (`scalar` floor with factor `0.5`, no second-moment debias). Their research histogram range is fixed at 30 with 128 bins so an adaptive threshold above the original `4*C_0` range does not silently collapse into overflow.
+
+For a formal run, override the moving `main` model revision with an immutable Hugging Face commit or a pinned local snapshot:
+
+```bash
+MODEL_REVISION="REPLACE_WITH_REVIEWED_HF_COMMIT_SHA"
+
+bash scripts/run_math10k_pair.sh \
+  --model_revision "$MODEL_REVISION" \
+  --run_eval false
+```
+
+The pair script launches `baseline` and then `slaclip` from one shared argument list. The GLUE equivalent is `scripts/run_glue8_pair.sh`. Training-only jobs should use `--run_eval false` and perform generation/classification evaluation in a separate job.
+
+For the fixed-target 99%-clipped ablation, use one paired process:
+
+```bash
+export PRISM_PAIR_RUN_ROOT="${SCRATCH:-/scratch/$USER}/runs/prism-dp-lora/pairs"
+export PRISM_PAIR_RUN_ID="math10k-q99-seed42"
+bash scripts/run_math10k_q99_pair.sh \
+  --model_revision "$MODEL_REVISION" \
+  --run_eval true
+```
+
+The GLUE equivalent is `scripts/run_glue8_q99_pair.sh`. Supplying both pair environment variables routes each arm's adapter, logs, telemetry, and results to separate directories below the declared absolute root; this is the portable scratch path. On Slurm, use the cluster wrapper generated by the HPC skill so both arms execute sequentially inside one allocation.
+
+To run either method directly:
+
+```bash
+python train_eval.py \
+  --config configs/math10k_paper.json \
+  --method baseline \
+  --model_revision "$MODEL_REVISION" \
+  --initial_clip_threshold 1.0
+
+python train_eval.py \
+  --config configs/math10k_slaclip_q99.json \
+  --method slaclip_q \
+  --model_revision "$MODEL_REVISION" \
+  --initial_clip_threshold 1.0
+
+python train_eval.py \
+  --config configs/math10k_paper.json \
+  --method slaclip \
+  --model_revision "$MODEL_REVISION" \
+  --initial_clip_threshold 1.0 \
+  --slaclip_target_non_small_clip_fraction 0.5
+```
+
+`--initial_clip_threshold` means fixed `C` for `baseline` and initial `C_0` for either adaptive controller. `--dp_max_grad_norm` remains only as a legacy alias. A custom initial-threshold experiment can therefore use, for example:
+
+```bash
+bash scripts/run_math10k_pair.sh \
+  --model_revision "$MODEL_REVISION" \
+  --initial_clip_threshold 2.0 \
+  --run_eval false
+```
+
+For full SlaClip, `--slaclip_target_non_small_clip_fraction`,
+`--slaclip_eta`, `--slaclip_c_min`, and `--slaclip_c_max` configure the
+controller. The first option is `rho`, the target clipped fraction within the
+noisy residual/non-small mass; `--slaclip_beta` is its legacy alias. It is not
+a fixed global or exact achieved clipping rate. `eta`, not `rho`, is the
+feedback/update gain. For SlaClip-Q, `--slaclip_target_clip_fraction 0.99` is
+converted to the complementary fixed target-unclipped proxy `0.01`.
+`--slaclip_num_slots 0` follows the journal-extension policy: expected batches
+below 128 use `K=15`, while batches of 128 or more use the paper-bound formula
+based on expected batch size and noise multiplier. Small-batch `K=15` remains
+DP-valid but can exceed the paper's high-probability CDF-monotonicity bound, so
+experiments must label it as the journal policy rather than a paper-bound
+choice.
+
+The exploratory Math-10K 4B dynamics campaign first scans fixed PRISM at
+`C in {0.1, 0.5, 1, 1.5, 2, 3, 5, 15}` with seed 42. It uses exact,
+access-controlled `NON_PRIVATE` telemetry to lock a validation-best `C_best`, a
+clipping-transition `C_transition`, and a five-point global-target interval.
+Because full SlaClip targets `p*_t=rho*(1-z_t)`, fixed-run clipping fractions
+are not copied directly into `rho`: the locked mapping adjusts each target by a
+reference `z_t`. The resulting screen crosses two `C_0` values with five `rho`
+values while fixing `eta=0.15`, `K=15`, `c_min=0.1`, and `c_max=15`.
+
+Public-holdout numeric exact accuracy, with response-only loss as the
+deterministic tie-break, ranks the screen and stage-2 confirmation arms; task
+test sets do not participate in selection. After the selection record is
+locked, final arms use fresh independent seeds, `--protocol_stage final`, and
+`--val_set_size 0`. The literal paper-default controller
+`C_0=1, rho=0.5, eta=0.2, K=15` remains a separately labelled final control.
+The raw-statistic-dependent calibration is exploratory and is not end-to-end
+DP; a formal privacy claim needs an independently predeclared/confirmed grid or
+privacy composition covering the selection. See
+[the experiment protocol](docs/experiment_protocol.md) for the exact mapping,
+leakage guards, and public-data privacy boundary.
+
+On Slurm, every new paper-coverage submission uses one queued allocation rather
+than an array.  The current canonical default is one A100, one sequential GPU
+lane, eight CPUs, 80G host memory, and 24 hours; the single-GPU training step
+uses 76G of that parent allocation.  Historical multi-H200 shapes can still be
+requested through explicit `PRISM_*` overrides, but they are not the default
+for new experiments.
+
+The paper-coverage launcher has several profiles. `paper-breadth` retains the
+15-arm historical screen. The historical `regime-map` profile crosses nine
+paper-supported settings: GLUE8 and Math-10K, `epsilon in {3,6}`, LoRA
+`rank in {8,16,32}` where reported, and the paper's Gemma-2-9B Math row. It
+scans fixed `C in {0.5,1,2,3,5}` and Full SlaClip conditional
+`rho in {0.5,0.7,0.8,0.9,0.98}` at `C_0=1`, `eta=0.05`, `K=15`, and bounds
+`[0.1,15]`; a `C_0=2, rho=0.9` control tests initial-threshold sensitivity.
+These 99 arms use 150 updates and a locked random 512-example subset per task
+to map clipping regimes economically. The Gemma-3-12B Math
+row is deliberately not enabled until its separately pinned gated checkpoint
+is staged and smoke-tested.
+
+The analyzer reports the achieved clipping median and 10th/90th percentiles,
+the exact research-only small-gradient proxy, and descriptive Full-SlaClip
+deltas versus the best fixed arm within each setting. It groups measured
+clipping into `<70%`, `70–<90%`, `90–<98%`, and `>=98%` bins. These bins are
+reporting strata, not assumed failure thresholds. The entire regime map is a
+seed-42 exploratory screen; any boundary or positive utility result requires a
+locked full-length, fresh-seed confirmation. This historical 99-arm profile is
+not expected to finish on one A100 within the current 24-hour queue policy. It
+can be materialized for scheduler inspection only with an explicit profile,
+but it must be redesigned into a smaller preregistered campaign before a new
+formal submission:
+
+```bash
+PRISM_COVERAGE_PROFILE=regime-map \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+```
+
+Every launcher invocation requires an explicit `PRISM_COVERAGE_PROFILE`; this
+prevents an accidental bare submission of a large historical plan. Set it to
+`paper-breadth` only to materialize the smaller historical profile.
+
+After a full-length fixed-`C=1` baseline has established a non-saturated
+clipping trajectory, `glue-slaclip-screen` performs the next exploratory
+selection stage. The current preregistered instance focuses on
+GLUE8/Gemma-3-4B/epsilon 6/rank 16. It compares five equally budgeted fixed
+thresholds `C in {0.5,1,2,3,5}` with five Full SlaClip conditional targets
+`rho in {0.55,0.60,0.65,0.70,0.75}` at `C_0=1`, plus two `rho=0.65`
+initial-threshold controls at `C_0 in {0.5,2}`. All 12 arms run for 150 updates
+with seed 43 and are ranked only by response-only loss on the same deterministic
+800-row public training holdout. Official GLUE validation is not run or used
+for screening. The exact source-telemetry hash, burn-in rule, target mapping,
+candidate roles, and confirmation requirement are locked in the manifest.
+The seed-42 calibration run trained on the complete 10,000-row file, including
+the rows later assigned to this public holdout. Consequently this screen is
+useful for target discovery but is not an untouched-holdout or confirmatory
+estimate; the later fresh-seed, locked-candidate stage supplies that evidence.
+
+Submit all candidates sequentially inside one allocation with, for example:
+
+```bash
+PRISM_COVERAGE_PROFILE=glue-slaclip-screen \
+PRISM_SLURM_PARTITION=a100 PRISM_GPU_TYPE=a100 PRISM_GPU_LANES=1 \
+PRISM_CPUS_PER_TASK=8 PRISM_SLURM_MEMORY=80G PRISM_STEP_MEMORY=76G \
+PRISM_SLURM_WALLTIME=1-00:00:00 \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+```
+
+This screen is single-seed exploratory evidence, not the journal result. Its
+selected Full SlaClip and tuned-fixed candidates must next be locked and rerun
+for the full 500 updates on fresh paired seeds before official evaluation.
+
+The follow-up `glue-high-c-refinement` profile is a fail-closed two-stage
+boundary refinement for the same GLUE8/Gemma-3-4B/epsilon-6/rank-16 setting.
+It first runs fixed `C in {3,5,7.5,10,15}` for 200 updates with seed 44.  Only
+after all five fixed arms and their `0/50/100/150/200` holdout curves validate
+does the campaign atomically lock the step-200 winner.  The lock derives five
+conditional SlaClip targets from that winner's step-51--200 reference-clipping
+`q10/q25/q50/q75/q90`, clamps them to `[0.20,0.90]`, and rejects the campaign
+unless the resulting values are unique.  Stage 2 then runs five primary Full
+SlaClip arms at the winning `C_0` and `eta=0.02`, plus a central-target
+`eta=0.05` controller-speed control and a central-target half-`C_0` control.
+Both stages use the same deterministic 800-row holdout and run serially inside
+one A100 allocation.  The endpoint loss is primary; normalized full-curve and
+step-100--200 AUCs plus complete clipping/CDF/bias--noise/controller telemetry
+are secondary.  The manifest also pins and revalidates the immutable ten
+primary arms from the preceding screen; its two initial-`C` controls do not
+participate in the refinement decision.
+
+The Stage-2 targets are selected from exact `research_raw` Stage-1 gradient
+statistics on the same training split.  This is explicitly NON-PRIVATE,
+data-dependent calibration: epsilon 6/delta `1e-5` describes each training run
+conditional on its chosen hyperparameters, not an end-to-end privacy guarantee
+for the search procedure.  The target lock and combined telemetry artifacts
+carry the corresponding NON_PRIVATE warning and must not be released as DP
+outputs.
+
+```bash
+PRISM_COVERAGE_PROFILE=glue-high-c-refinement \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+```
+
+This refinement remains a single-seed, short-run selection experiment.  Its
+winner must still be paired against the tuned fixed comparator for 500 updates
+on fresh seeds before a confirmatory or journal-level claim.
+
+Job 1413408 completed this rank-16 refinement, but it did not pass that gate.
+The best Full SlaClip arm improved the normalized early/full loss AUC slightly,
+while its step-200 loss was 2.87% worse than fixed `C=15`; it also spent most of
+the run at the `C=15` upper bound.  The preregistered next branch is therefore
+`glue-r8-slack-screen`, not another rank-16 target sweep.  It is motivated by
+the independently completed paper-default GLUE8/Gemma-3-4B/epsilon-6/rank-8
+arm, whose post-burn-in clipping rate is about 49% and whose small-gradient mass
+is about 21%, leaving substantially more usable slack than the rank-16/high-C
+setting.
+
+The rank-8 screen uses one allocation and two sequential stages. Stage 1 runs
+six 200-update fixed candidates `C in {0.5,1,2,5,10,15}` with seed 45. After
+all artifacts validate, it locks the endpoint-loss winner and derives five
+conditional targets from that arm's step-51--200 clipping
+`q10/q25/q50/q75/q90`. Stage 2 uses fresh seed 46 and reruns the selected fixed
+comparator alongside five primary Full SlaClip arms at `eta=0.02`, one central
+target `eta=0.05` controller-speed control, and one half-`C_0` sensitivity
+control. Thus all 14 arms remain serial inside one queued A100 job. The screen
+advances only if a primary Full SlaClip arm has lower endpoint loss and no worse
+full or late loss AUC than the fresh-seed fixed comparator, and the Stage-1
+fixed winner is not either search-grid boundary. Only then should a separate
+500-update, multi-seed official-GLUE confirmation be submitted.
+
+```bash
+PRISM_COVERAGE_PROFILE=glue-r8-slack-screen \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=glue-r8-slack-screen \
+  bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+Like the earlier screens, target derivation and public-holdout selection use
+exact NON_PRIVATE research telemetry. Per-run epsilon accounting remains valid
+conditional on the chosen hyperparameters, but the adaptive search is not an
+end-to-end differentially private release or confirmatory journal evidence.
+
+The compact `glue-target-baseline-screen` profile fills the two remaining
+target-calibration gaps after all ten paper-default baselines have completed.
+The default landscape identifies all four GLUE8/Gemma-3-4B settings as
+non-saturated and target-identifiable, whereas all six Math settings have a
+fixed-`C=1` clipping median of 100% and no useful conditional-target spread.
+Rank 8 and epsilon-6/rank-16 already have fixed/adaptive screens whose fixed
+winners reached the old `C=15` boundary. This profile therefore runs only the
+unscanned epsilon-6/rank-32 and epsilon-3/rank-16 settings, in that failure-safe
+order, using seed 47 and five 200-update fixed candidates
+`C in {1,5,15,30,50}`. It has exactly ten baseline arms, no adaptive arms, and
+runs them sequentially in one queued allocation.
+
+Each arm records the same public 800-row response-only validation curve and
+exact NON_PRIVATE clipping/CDF/bias--noise telemetry. For thresholds as high as
+50, the research histogram is widened to `[0,200]` with 512 bins. Norms may
+still exceed 200, so every step retains its exact overflow count and fraction;
+the analyzer emits a separately hashed `NON_PRIVATE_norm_histograms.jsonl`
+instead of silently dropping that mass. After excluding steps 1--50, the
+analyzer ranks fixed candidates by step-200 holdout loss and emits
+`glue_target_baseline_selection.json`. It separately reports hard clipping and
+derives five Full SlaClip conditional targets from the winning fixed arm's
+`q10/q25/q50/q75/q90`, with `p*_t = rho * (1-z_t)`. Both the clipped-mass
+numerator and `z_t` use the controller's public expected-batch normalization;
+the realized-batch clipping fraction is reported separately and is never used
+directly as `rho`. Telemetry schema 7 records and validates that distinction.
+The target grid must also span at least 0.10 with adjacent targets at least
+0.02 apart. A boundary winner blocks the adaptive stage and requires an
+expanded fixed grid; an interior winner still requires local fixed-C
+refinement before a journal confirmation. Any later Full SlaClip screen must
+use a fresh seed.
+
+```bash
+PRISM_COVERAGE_PROFILE=glue-target-baseline-screen \
+PRISM_SLURM_PARTITION=a100 PRISM_GPU_TYPE=a100 PRISM_GPU_LANES=1 \
+PRISM_CPUS_PER_TASK=8 PRISM_SLURM_MEMORY=80G PRISM_STEP_MEMORY=76G \
+PRISM_SLURM_WALLTIME=1-00:00:00 \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=glue-target-baseline-screen \
+  bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+For fixed-C baseline reproduction and target-rate calibration, use
+`baseline-reproduction`. It runs the ten distinct DP-PRISM settings obtained
+by deduplicating Tables 2--4: four GLUE8 settings and six Math-10K settings,
+covering Gemma-3-4B-pt, Gemma-2-9B, Gemma-3-12B-pt, `epsilon in {3,6}`, and
+`rank in {8,16,32}` where the paper reports them. Every arm uses the paper
+default fixed `C=1`, seed 42, full update count, full official evaluation, and
+otherwise the exact task defaults in Table 7. No SlaClip controller or slack
+coordinate is added to the DP query. The access-controlled research log does
+compute an exact telemetry-only `K=15` reference CDF from already available
+per-record norms; it cannot alter clipping, noise, or optimization.
+
+```bash
+PRISM_COVERAGE_PROFILE=baseline-reproduction \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=baseline-reproduction \
+  bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+The full profile fails closed unless the pinned manual-gated 12B checkpoint is
+already staged. `baseline-reproduction-cached` is an explicitly incomplete
+nine-setting profile for accounts that currently have only the pinned 4B and
+9B checkpoints; its manifest records the missing 12B row and must not be
+reported as complete paper model coverage. The analyzer writes a combined
+`baseline_telemetry_steps.csv` containing loss, `C_t`, next `C`, clipping rate
+and coefficients, norm summaries, clipped/unclipped signal, clipping bias,
+realized noise, SNR, bias/noise diagnostics, reference small-gradient mass,
+and privacy accounting for plotting and later target-rate preregistration.
+
+If a 24-hour cached-model run has already completed the first seven settings,
+use `baseline-gap-fill-cached` instead of rerunning them. It contains exactly
+the missing full-length paper-default `C=1`, seed-42 GLUE8/4B/rank-32 and
+Math-10K/4B/rank-32 arms, serially in one allocation. The unavailable 12B row
+remains explicitly excluded.
+
+```bash
+PRISM_COVERAGE_PROFILE=baseline-gap-fill-cached \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=baseline-gap-fill-cached \
+  bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+When the pinned Gemma-3-12B-pt snapshot is also staged, use the separate
+`baseline-gap-fill-all-cached` profile to close all remaining gaps in one
+queue item. It preserves the two-arm profile above unchanged and contains
+exactly three paper-default arms, in this fail-safe order: GLUE8/4B/rank-32
+for 500 updates, Math-10K/4B/rank-32 for 300 updates, and
+Math-10K/12B/rank-16 for 300 updates. Every arm uses seed 42, fixed `C=1`,
+the paper task defaults, exact research telemetry, and full official
+evaluation. The launcher requires one sequential GPU lane and fails real
+submission unless the exact pinned 12B revision has a completed staging
+marker; it never substitutes a 4B or 9B checkpoint.
+
+```bash
+PRISM_COVERAGE_PROFILE=baseline-gap-fill-all-cached \
+  bash scripts/submit_paper_coverage_campaign.sh --test-only
+PRISM_COVERAGE_PROFILE=baseline-gap-fill-all-cached \
+  bash scripts/submit_paper_coverage_campaign.sh --submit
+```
+
+Merge either the original seven-arm campaign plus this three-arm campaign, or
+the original campaign plus the historical two-arm gap fill and a separately
+registered 12B run. Do not count duplicate rank-32 arms twice.
+
+`scripts/analyze_baseline_landscape.py` combines one or more registered
+campaign manifests into an English CSV/JSON discovery table. It reports every
+registered arm, including incomplete/excluded rows, and recommends a setting
+only when clipping is unsaturated, the trajectory changes materially, the
+small-gradient proxy is distinguishable from expected Slack-release noise,
+and five conditional-rho quantiles remain unique after projection. This step
+consumes exact `NON_PRIVATE` telemetry and is hypothesis generation, not an
+end-to-end DP release or confirmatory result. For legacy schema-6 runs it
+recomputes conditional rho as
+`raw_clip_fraction * realized_batch / expected_batch / (1-z_t)` whenever the
+realized batch was recorded; schema-7 runs additionally fail closed unless the
+logged expected-batch-normalized mass and conditional value agree with that
+identity.
+
+```bash
+python scripts/analyze_baseline_landscape.py \
+  --campaign-root "$PRISM_RUN_ROOT/campaigns/<original-baseline-campaign>" \
+  --campaign-root "$PRISM_RUN_ROOT/campaigns/<gap-fill-campaign>" \
+  --output-dir "$PRISM_RUN_ROOT/analysis/<landscape-id>"
+```
+
+The wrapper resolves the account-specific home/scratch paths, pins both model
+revisions and the Git SHA, materializes a content-hashed official GLUE
+validation snapshot before submission, stages immutable source, and runs the
+compute allocation fully offline. It writes the receipt, Slurm logs, adapters,
+evaluation summaries, step telemetry, and aggregate CSV/JSON below one
+SHA-qualified scratch campaign directory. A two-step real-model smoke now
+includes offline GLUE inference, so training success alone cannot mask a broken
+evaluation path.
+
+The noise multiplier is calibrated for the requested update count. Each Poisson batch is normalized by Opacus's fixed expected batch size, not by the randomly realized batch size. Dynamic clipping changes the absolute noise scale with `C_t`, while the matched noise multiplier and accountant determine the same privacy schedule. The sensitivity statement uses Poisson subsampling and add/remove record adjacency; replace-one adjacency must not be substituted without changing the analysis.
+
+For `method=replay`, the reported per-run accountant is conditional on the
+locked clipping schedule. If that schedule was derived from earlier
+private-data-dependent trajectories, compose their privacy costs with the replay
+run before making any end-to-end claim. Replay is used here as a mechanistic
+control; it is not a way to reset the privacy budget.
+
+## Training loss and microbatch invariance
+
+Training uses one causal-LM loss per record:
+
+1. shift logits and labels by one token;
+2. average cross-entropy over the non-ignored target tokens **within each record**;
+3. average those per-record values across the physical batch.
+
+In short: token mean within a record, then record mean across the batch. This matches Opacus's record-level `loss_reduction='mean'` contract, so per-record gradients and clipping decisions do not change merely because a logical batch is split into different physical microbatches. The definition is recorded in logs, statuses, and checkpoints and is checked on resume.
+
+## DP-safe telemetry and research “god view”
+
+`--telemetry_mode dp_safe` is the default. Its main log contains run identity, privacy accounting, clipping thresholds, values obtained by post-processing the DP release/model update, and—for either SlaClip arm only—the jointly noised Slack Indicator and controller updates. The baseline arm does not compute or release SlaClip slack coordinates. The log deliberately excludes exact DP-training loss, exact clipping fractions, raw norm distributions, the realized noise norm, and other decompositions that would reveal non-released training behavior.
+
+For access-controlled training-dynamics research, the requested exact observer is enabled only with both flags:
+
+```bash
+bash scripts/run_math10k_analysis_pair.sh \
+  --model_revision "$MODEL_REVISION" \
+  --initial_clip_threshold 1.0 \
+  --run_eval false
+```
+
+The analysis scripts are equivalent to passing:
+
+```text
+--telemetry_mode research_raw --allow_non_private_telemetry
+```
+
+The GLUE equivalent is `scripts/run_glue8_analysis_pair.sh`. Raw records are written to:
+
+```text
+<result_dir>/research_raw/NON_PRIVATE_train_log.jsonl
+```
+
+They include exact record-mean training loss and supervised-token count,
+per-record tangent-gradient norm summaries/histograms, clipping fraction and
+coefficients, clipped and unclipped signal norms, clipping-bias norm, realized
+noise norm, signal-to-noise ratio, exact-vs-noisy Slack/CDF residuals, signal
+cosines, bias/noise ratio, and a bias-squared-plus-noise-squared proxy. The
+DP-safe controller record separately exposes the requested conditional `rho`,
+the noisy pre-projection small-gradient and remaining-mass proxies, the dynamic
+target before and after projection, the observed `s_hat_1` proxy, and the
+controller error. These proxy fields are post-processing of the jointly noised
+DP-safe Slack Indicator release; they are not `research_raw` measurements.
+The raw file is self-contained and marked `NON_PRIVATE_TELEMETRY`.
+
+When a fixed arm is configured with reference `K=15`, its raw observer also
+records a counterfactual final Slack coordinate, exact `z_t`, residual mass, and
+conditional clipping ratio. These fields exist only to calibrate the
+exploratory target grid: they do not add Slack coordinates to the baseline DP
+query, alter gradient clipping or Gaussian noise, or drive a baseline optimizer
+update.
+
+For SlaClip-Q-99 dynamics, use `scripts/run_math10k_q99_analysis_pair.sh` (or
+the GLUE counterpart). Its summary separates the requested global clipped-rate
+label, noisy CDF proxy, fixed proxy target, controller error,
+unbounded/bounded next threshold, and bound-hit flags. The label is a requested
+proxy target, not a claim that the exact achieved rate is 99%.
+
+To turn one raw trajectory into a step-wise CSV plus a compact JSON summary:
+
+```bash
+python scripts/summarize_telemetry.py \
+  <result_dir>/research_raw/NON_PRIVATE_train_log.jsonl \
+  --safe-log <output_dir>/train_log.jsonl
+```
+
+The generated files remain explicitly marked non-private and belong under the same access controls as the source log.
+
+The optimizer and released adapter still follow the configured DP training mechanism while this observer is active. The observer file itself, however, is a direct function of private examples and is **not a DP release**. Keep it access-controlled, do not publish it, and do not claim that the model-plus-raw-log bundle is DP. If raw telemetry is used to choose a checkpoint, hyperparameter, seed, or model for release, that selection also needs a privacy analysis; “internal only” does not make data-dependent selection free.
+
+See [the telemetry schema](docs/telemetry_schema.md) for field-level meanings and [the experiment protocol](docs/experiment_protocol.md) for the release boundary.
+
+## Run identity, outputs, and exact resume
+
+Every experiment receives a content-derived configuration fingerprint and a readable run ID containing the clipping threshold plus a short hash. The fingerprint covers the Git implementation commit plus a content hash when the worktree is dirty, dataset content hash, requested model revision, method, privacy parameters, optimizer/LoRA configuration, training schedule, and telemetry mode. Existing output directories with a different or unverifiable fingerprint are rejected instead of silently mixed. Formal runs should still start from a clean commit so another machine can reproduce the implementation directly.
+
+The automatic dataset hash is safe to expose here only because the tracked benchmark data and their hashes are public auxiliary information. For a genuinely private dataset, do not publish the hash, fingerprint/run ID derived from it, or status/config snapshot without a separate release design. Interrupted resume checkpoints also contain sampler and RNG state and are controlled training state, not DP outputs; a completed run deletes its resume checkpoint.
+
+Default artifacts are placed under:
 
 ```text
 LLM-Adapters/
-  ft-training_set/
-  dataset/
-  trained_models/
-  experiment/
+  ft-training_set/       # tracked training assets
+  trained_models/<run>/  # adapter, DP-safe JSONL, status/config snapshot
+  experiment/<run>/      # evaluation output and optional research_raw directory
 ```
 
-## Usage
+Checkpoints are written atomically at step zero and after completed logical steps. A valid resume restores and validates trainable weights, PRISM optimizer and SlaClip state, current `C_t`, Poisson sampler state, data-loader generator, serializable DP-noise generator state, privacy accountant, global Python/NumPy/PyTorch RNG state, completed update count, loss definition, model revision, and configuration fingerprint. Logs are truncated back to the checkpoint step before appending, preventing duplicate future records. Bitwise resume equivalence is covered by a synthetic Opacus/PRISM test in the default reproducible research mode (`dp_secure_mode=false`). A secure CSPRNG may intentionally resume from fresh entropy when its generator is not serializable; the mechanism remains valid but the continuation is not expected to match an uninterrupted run bit for bit.
 
-### PRISM on Math-10K
+Use the same run identity and unchanged configuration to resume. `--force_train` intentionally restarts the exact configuration and clears both that run's model and result directories so stale evaluation or telemetry cannot survive; it should not be used to overwrite an unrelated run directory.
 
-```bash
-python train_eval.py \
-  --dataset math10k \
-  --method prism \
-  --privacy dp \
-  --epsilon 6
-```
+The saved adapter rank can be twice the training rank because spectral residual rebasing restores the original base model while preserving the learned low-rank update. `run_status.json` records `training_lora_r`, `saved_adapter_r`, the resolved model revision, privacy accounting, runtime metadata, and completion state. Evaluation accepts only a completed adapter whose fingerprint matches the requested experiment.
 
-### PRISM on GLUE8
+## Evaluation and reporting
 
-```bash
-python train_eval.py \
-  --dataset glue8 \
-  --method prism \
-  --privacy dp \
-  --epsilon 6
-```
+Math evaluation reports exact-answer accuracy. GLUE evaluation retains the standard task metrics: Matthews correlation for CoLA; accuracy for SST-2, QNLI, and RTE; accuracy/F1 for MRPC and QQP; Pearson/Spearman for STS-B; and matched/mismatched accuracy for MNLI.
 
-### AdamW baseline
+Evaluation reloads the resolved base-model revision recorded by training, even if the original request used a moving label such as `main`. Cached predictions are bound to an `evaluation_config.json` containing that resolved revision, the adapter fingerprint, task list, decoding parameters, and (for GLUE) `fast_dev_run`. Math predictions are written directly to each run's result directory, so concurrent baseline/SlaClip evaluations cannot collide. A mismatched or legacy cache is rejected; use `--force_eval` to rebuild it explicitly.
 
-```bash
-python train_eval.py \
-  --dataset math10k \
-  --method adam \
-  --privacy dp \
-  --epsilon 6
-```
-
-
-
-## Common options
-
-```text
---dataset {math10k,glue8}
---method {prism,adam}
---privacy {dp,nondp}
---epsilon 6
---lora_r 16
---base_model google/gemma-3-4b-pt
---seed 42
-```
-
-## Outputs
-
-Trained adapters are saved to:
-
-```text
-LLM-Adapters/trained_models/
-```
-
-Evaluation results are saved to:
-
-```text
-LLM-Adapters/experiment/
-```
+For claims about adaptive clipping, use at least three predeclared seeds and report mean and standard deviation. Keep all paired fields matched, use the same `C` as baseline's fixed threshold and SlaClip's `C_0`, and do not select settings from the test set. The detailed comparison and artifact checklist is in [docs/experiment_protocol.md](docs/experiment_protocol.md).
 
 ## Acknowledgements
 
-This repository builds on the directory structure and parts of the training/evaluation pipeline from [LLM-Adapters](https://github.com/AGI-Edgerunners/LLM-Adapters). We thank the LLM-Adapters authors for releasing their code and datasets.
-
-Portions adapted from LLM-Adapters are distributed under the Apache-2.0 license; see `licenses/Apache-2.0.txt`.
-
+This repository builds on the [PRISM paper](https://arxiv.org/abs/2606.00944), the full [SlaClip implementation](https://github.com/ZsyRock/SlaClip), and the [LLM-Adapters](https://github.com/AGI-Edgerunners/LLM-Adapters) pipeline. Portions adapted from LLM-Adapters are distributed under the Apache-2.0 license; see `licenses/Apache-2.0.txt`.

@@ -2,9 +2,18 @@ from __future__ import annotations
 import math
 import types
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import Tensor
+
+from ..slaclip import (
+    automatic_num_slots,
+    build_slack_vectors,
+    full_slaclip_threshold_update,
+    resolve_full_slaclip_target,
+    slaclip_q_threshold_update,
+    slack_indicator_noise_std,
+)
 
 class _LoraShapeHelper:
 
@@ -99,12 +108,160 @@ def _psd_pinv(M: Tensor, rcond: float=1e-06) -> Tensor:
     out = v * inv.unsqueeze(0) @ v.T
     return _sym(out)
 
-def _psd_invsqrt_damped(M: Tensor, eps: float=1e-08) -> Tensor:
-    w, v = _psd_eigh(M)
-    w = w + float(eps)
-    invsqrt = 1.0 / torch.sqrt(w)
-    out = v * invsqrt.unsqueeze(0) @ v.T
-    return _sym(out)
+def _full_column_rank_qr(
+    X: Tensor,
+    *,
+    gram_rcond: float,
+    factor_name: str,
+) -> Tuple[Tensor, Tensor, Dict[str, float]]:
+    """Return a thin QR factorization after a fail-closed rank check.
+
+    PRISM's rank-``r`` tangent mechanism assumes that both LoRA factors have
+    full column rank.  Silently damping or truncating a singular Gram matrix
+    changes the covariance of the Gaussian mechanism while leaving the
+    accountant unchanged.  We instead check the same *relative Gram
+    eigenvalue* criterion historically controlled by ``rcond`` and refuse to
+    make a release outside the paper's smooth rank-``r`` manifold.
+    """
+
+    if X.ndim != 2:
+        raise RuntimeError(f'{factor_name} must be a matrix, got {X.ndim}D')
+    rows, rank = X.shape
+    if rows < rank:
+        raise RuntimeError(
+            f'{factor_name} cannot have full column rank: shape={tuple(X.shape)}'
+        )
+    Xf = X.float()
+    if not bool(torch.isfinite(Xf).all().item()):
+        raise RuntimeError(f'{factor_name} contains non-finite values')
+    Q, R = torch.linalg.qr(Xf, mode='reduced')
+    # R has the same singular values as X, while its r-by-r SVD is far
+    # cheaper than a second decomposition of a tall LoRA factor each step.
+    try:
+        singular_values = torch.linalg.svdvals(R)
+    except Exception:
+        singular_values = torch.linalg.svdvals(R.double().cpu()).to(
+            device=Xf.device,
+            dtype=Xf.dtype,
+        )
+    s_max = float(torch.max(singular_values).item()) if rank else 0.0
+    s_min = float(torch.min(singular_values).item()) if rank else 0.0
+    relative_gram_eigenvalue = 0.0 if s_max <= 0.0 else (s_min / s_max) ** 2
+    if s_max <= 0.0 or relative_gram_eigenvalue <= float(gram_rcond):
+        raise RuntimeError(
+            'PRISM DP tangent release requires numerically full-column-rank '
+            f'LoRA factors; {factor_name} has shape={tuple(X.shape)}, '
+            f's_min={s_min:.6g}, s_max={s_max:.6g}, '
+            f'(s_min/s_max)^2={relative_gram_eigenvalue:.6g} <= '
+            f'rcond={float(gram_rcond):.6g}. The rank-r manifold and its '
+            'isotropic tangent Gaussian are undefined at a rank-deficient '
+            'factor, so the release is aborted before privacy accounting.'
+        )
+    return (
+        Q,
+        R,
+        {
+            's_min': s_min,
+            's_max': s_max,
+            'relative_gram_eigenvalue': relative_gram_eigenvalue,
+        },
+    )
+
+
+def _gram_inverse_from_qr(R: Tensor) -> Tensor:
+    """Compute ``(X.T @ X)^-1`` from ``X = Q @ R`` without a Gram EVD."""
+
+    if R.ndim != 2 or R.shape[0] != R.shape[1]:
+        raise ValueError(f'R must be square, got shape={tuple(R.shape)}')
+    eye = torch.eye(R.shape[0], device=R.device, dtype=R.dtype)
+    R_inv = torch.linalg.solve_triangular(R, eye, upper=True)
+    gram_inv = _sym(R_inv @ R_inv.T)
+    if not bool(torch.isfinite(gram_inv).all().item()):
+        raise RuntimeError(
+            'PRISM full-rank Gram inverse is non-finite; aborting before '
+            'per-record gradient accumulation and privacy accounting'
+        )
+    return gram_inv
+
+
+def _right_solve_transpose(X: Tensor, R: Tensor) -> Tensor:
+    """Return ``X @ R^-T`` using a triangular solve."""
+
+    Xt = X.transpose(-2, -1)
+    return torch.linalg.solve_triangular(R, Xt, upper=True).transpose(-2, -1)
+
+
+def _right_solve_gram(X: Tensor, R: Tensor) -> Tensor:
+    """Return ``X @ (R.T @ R)^-1`` for a 2D or batched 3D ``X``.
+
+    Keeping both solves triangular avoids explicitly multiplying a possibly
+    ill-conditioned Gram inverse into the private per-record query.
+    """
+
+    if X.ndim not in {2, 3}:
+        raise ValueError(f'X must be 2D or 3D, got {X.ndim}D')
+    Xt = X.transpose(-2, -1)
+    # first = X @ R^-1, obtained from R.T @ first.T = X.T
+    first = torch.linalg.solve_triangular(
+        R.T,
+        Xt,
+        upper=False,
+    ).transpose(-2, -1)
+    # result = first @ R^-T, obtained from R @ result.T = first.T
+    return _right_solve_transpose(first, R)
+
+
+def _dp_isometric_chart_lift(
+    gA: Tensor,
+    gB: Tensor,
+    QA: Tensor,
+    RA: Tensor,
+    RB: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """Lift a factor-gradient query into the same chart as PRISM noise.
+
+    The paper's intrinsic tangent projection has many equivalent factor
+    lifts.  For a rigorous factor-wise implementation of the Gaussian release
+    and its adaptive post-processing, the private query and Eq. (19) noise must
+    inhabit the same linear chart.  We use the unique representative satisfying
+    ``QA.T @ dA = 0``:
+
+    ``dA = (I-QA QA.T) gA (B.T B)^-1`` and
+    ``dB = gB (A.T A)^-1``.
+
+    Its induced matrix is the same intrinsic projected tangent as the
+    symmetric half lift when the factor gradients obey the LoRA chain rule.
+    """
+
+    YA = _right_solve_gram(gA, RB)
+    dA = YA - _apply_projector_Q(QA, YA)
+    dB = _right_solve_gram(gB, RA)
+    return dA, dB
+
+
+def _factorized_isotropic_tangent_noise(
+    U: Tensor,
+    V: Tensor,
+    QA: Tensor,
+    RA: Tensor,
+    RB: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """Sample-factor map whose induced tangent noise is exactly isotropic.
+
+    With ``A = QA @ RA`` and ``B = QB @ RB``, these lifts induce
+
+    ``(I-QA QA.T) U QB.T + QA V.T``.
+
+    Thus i.i.d. standard-normal ``U,V`` yield the orthogonal projection of a
+    dense standard Gaussian onto the rank-``r`` tangent space.  In particular,
+    no ``eps`` damping is permitted here: it would reduce covariance in some
+    intrinsic directions below the scale assumed by the Gaussian accountant.
+    """
+
+    U_perp = U - _apply_projector_Q(QA, U)
+    noise_A = _right_solve_transpose(U_perp, RB)
+    noise_B = _right_solve_transpose(V, RA)
+    return noise_A, noise_B
 
 def _psd_invsqrt_clamped(M: Tensor, eps: float, floor: float, cond_max: Optional[float]=None, cond_strategy: str='raise_small') -> Tuple[Tensor, Dict[str, float]]:
     w, v = _psd_eigh(M)
@@ -208,13 +365,59 @@ def _tangent_fro_norm_sq(dA: Tensor, dB: Tensor, A: Tensor, B: Tensor) -> Tensor
         return term1 + term2 + 2.0 * term3
     raise ValueError(f'dA must be 2D or 3D, got {dA.ndim}D')
 
+
+def _tangent_fro_inner_product(
+    dA: Tensor,
+    dB: Tensor,
+    eA: Tensor,
+    eB: Tensor,
+    A: Tensor,
+    B: Tensor,
+) -> Tensor:
+    """Inner product of two induced tangent matrices without densifying them."""
+
+    if any(value.ndim != 2 for value in (dA, dB, eA, eB)):
+        raise ValueError('_tangent_fro_inner_product expects four 2D lifts')
+    M = A.T @ A
+    N = B.T @ B
+    term_aa = torch.sum((dA.T @ eA) * N)
+    term_bb = torch.sum((dB.T @ eB) * M)
+    term_ab = torch.sum((A.T @ dA) * (B.T @ eB).T)
+    term_ba = torch.sum((A.T @ eA) * (B.T @ dB).T)
+    return term_aa + term_bb + term_ab + term_ba
+
+
+def _cosine_from_inner(inner: float, first_norm_sq: float, second_norm_sq: float) -> float:
+    denominator = math.sqrt(max(first_norm_sq, 0.0) * max(second_norm_sq, 0.0))
+    if denominator <= 1e-30:
+        return 0.0
+    # Roundoff in low-rank Gram products can put a mathematically valid
+    # cosine a few ulps outside [-1, 1].
+    return max(-1.0, min(1.0, float(inner) / denominator))
+
+
 def _z_fro_norm_sq(A: Tensor, B: Tensor) -> Tensor:
     M = A.T @ A
     N = B.T @ B
     return torch.sum(M * N)
 
-def _psd_inv_from_invsqrt(M_invsqrt: Tensor) -> Tensor:
-    return _sym(M_invsqrt @ M_invsqrt)
+
+def _factorized_delta_fro_norm_sq(
+    A_new: Tensor,
+    B_new: Tensor,
+    A_old: Tensor,
+    B_old: Tensor,
+) -> Tensor:
+    """Return ``||A_new B_new^T - A_old B_old^T||_F^2`` without densifying.
+
+    LoRA matrices can be very wide, so materializing the full weight update just
+    for telemetry would be prohibitively expensive.  Writing the difference as
+    ``U V^T`` with at most ``2r`` columns keeps this calculation rank-sized.
+    """
+
+    U = torch.cat((A_new.float(), A_old.float()), dim=1)
+    V = torch.cat((B_new.float(), -B_old.float()), dim=1)
+    return torch.sum((U.T @ U) * (V.T @ V))
 
 def _sylvester_symmetric_solve(M: Tensor, N: Tensor, C: Tensor, eps: float=1e-12) -> Tensor:
     Mf = _sym(M.float())
@@ -241,16 +444,21 @@ def _horizontalize_lift(dA: Tensor, dB: Tensor, A: Tensor, B: Tensor, eps: float
 @dataclass
 class _DPAccumState:
     max_grad_norm: float
+    expected_batch_size: float
+    noise_multiplier: float
     total_samples: int = 0
     microbatches: int = 0
-    clipped_frac_sum: float = 0.0
-    coef_mean_sum: float = 0.0
-    coef_min_sum: float = 0.0
+    clipped_samples: int = 0
+    coef_sum: float = 0.0
+    coef_min: float = 1.0
+    slack_sum: Optional[Tensor] = None
+    slack_lambda: float = 0.0
+    raw_norms: List[Tensor] = field(default_factory=list)
     last_micro_stats: Dict[str, float] = field(default_factory=dict)
 
 class PRISM(torch.optim.Optimizer):
 
-    def __init__(self, params: Iterable[torch.nn.Parameter], lr: float=0.0003, betas: Tuple[float, float]=(0.9, 0.999), eps: float=1e-08, weight_decay: float=0.0, rcond: float=1e-06, lora_l_dim: int=0, lora_r_dim: int=-1, use_adaptive: bool=True, dp_precond_floor_factor: float=1.0, dp_floor_mode: str='geometry', precond_cond_max: Optional[float]=10000.0, precond_cond_strategy: str='raise_small', precond_update_mode: str='current', lift_gauge_fix: str='none', gauge_fix_eps: float=1e-12, max_update_norm: float=0.0, use_trust_ratio: bool=False, trust_clip: Tuple[float, float]=(0.0, 10.0), trust_eps: float=1e-12, dp_debias_second_moment: bool=True, log_every: int=1):
+    def __init__(self, params: Iterable[torch.nn.Parameter], lr: float=0.0003, betas: Tuple[float, float]=(0.9, 0.999), eps: float=1e-08, weight_decay: float=0.0, rcond: float=1e-06, lora_l_dim: int=0, lora_r_dim: int=-1, use_adaptive: bool=True, dp_precond_floor_factor: float=1.0, dp_floor_mode: str='geometry', precond_cond_max: Optional[float]=10000.0, precond_cond_strategy: str='raise_small', precond_update_mode: str='current', lift_gauge_fix: str='none', gauge_fix_eps: float=1e-12, max_update_norm: float=0.0, use_trust_ratio: bool=False, trust_clip: Tuple[float, float]=(0.0, 10.0), trust_eps: float=1e-12, dp_debias_second_moment: bool=True, log_every: int=1, clipping_method: str='baseline', slaclip_num_slots: int=0, slaclip_eta: float=0.5, slaclip_beta: Optional[float]=None, slaclip_target_non_small_clip_fraction: Optional[float]=None, slaclip_target_clip_fraction: Optional[float]=None, slaclip_c_min: float=0.1, slaclip_c_max: float=50.0, telemetry_mode: str='dp_safe', raw_hist_bins: int=32, raw_hist_max: float=0.0):
         if lr <= 0:
             raise ValueError('lr must be positive')
         beta1, beta2 = betas
@@ -258,6 +466,8 @@ class PRISM(torch.optim.Optimizer):
             raise ValueError('betas must be in [0,1)')
         if eps <= 0:
             raise ValueError('eps must be positive')
+        if not 0.0 <= float(rcond) < 1.0:
+            raise ValueError('rcond must be in [0, 1)')
         if weight_decay < 0:
             raise ValueError('weight_decay must be >= 0')
         if trust_eps <= 0:
@@ -277,6 +487,28 @@ class PRISM(torch.optim.Optimizer):
             raise ValueError(f'lift_gauge_fix must be one of {sorted(valid_gauge_fix_modes)}, got {lift_gauge_fix!r}')
         if gauge_fix_eps <= 0:
             raise ValueError('gauge_fix_eps must be positive')
+        clipping_method = str(clipping_method).lower()
+        if clipping_method not in {'baseline', 'slaclip', 'slaclip_q'}:
+            raise ValueError("clipping_method must be 'baseline', 'slaclip', or 'slaclip_q'")
+        telemetry_mode = str(telemetry_mode).lower()
+        if telemetry_mode not in {'dp_safe', 'research_raw'}:
+            raise ValueError("telemetry_mode must be 'dp_safe' or 'research_raw'")
+        if int(slaclip_num_slots) < 0:
+            raise ValueError('slaclip_num_slots must be >= 0 (0 selects it automatically)')
+        if float(slaclip_eta) < 0:
+            raise ValueError('slaclip_eta must be non-negative')
+        target_non_small_clip_fraction = resolve_full_slaclip_target(
+            slaclip_target_non_small_clip_fraction,
+            beta=slaclip_beta,
+        )
+        if slaclip_target_clip_fraction is None:
+            slaclip_target_clip_fraction = 0.99
+        if not 0.0 <= float(slaclip_target_clip_fraction) <= 1.0:
+            raise ValueError('slaclip_target_clip_fraction must be in [0, 1]')
+        if float(slaclip_c_min) <= 0 or float(slaclip_c_max) < float(slaclip_c_min):
+            raise ValueError('require 0 < slaclip_c_min <= slaclip_c_max')
+        if int(raw_hist_bins) <= 0:
+            raise ValueError('raw_hist_bins must be positive')
         defaults = dict(lr=lr)
         super().__init__(params, defaults)
         self.beta1 = float(beta1)
@@ -300,16 +532,197 @@ class PRISM(torch.optim.Optimizer):
         self.trust_clip = (float(trust_clip[0]), float(trust_clip[1]))
         self.trust_eps = float(trust_eps)
         self.dp_debias_second_moment = bool(dp_debias_second_moment)
+        self.clipping_method = clipping_method
+        self.slaclip_num_slots = int(slaclip_num_slots)
+        self.slaclip_eta = float(slaclip_eta)
+        self.slaclip_target_non_small_clip_fraction = float(
+            target_non_small_clip_fraction
+        )
+        # Keep the historical attribute/checkpoint key readable by existing
+        # analysis code. It is an alias for rho, not a feedback gain.
+        self.slaclip_beta = self.slaclip_target_non_small_clip_fraction
+        self.slaclip_target_clip_fraction = float(slaclip_target_clip_fraction)
+        self.slaclip_c_min = float(slaclip_c_min)
+        self.slaclip_c_max = float(slaclip_c_max)
+        self.telemetry_mode = telemetry_mode
+        self.raw_hist_bins = int(raw_hist_bins)
+        self.raw_hist_max = float(raw_hist_max)
+        self.current_clip: Optional[float] = None
         self._helper = _LoraShapeHelper()
         self._dp_state: Optional[_DPAccumState] = None
         self._state_initialized = False
-        self.last_log: Dict[str, float] = {}
+        self._dp_noise_generator: Optional[torch.Generator] = None
+        self._dp_secure_mode = False
+        self.last_log: Dict[str, Any] = {}
+        self.last_raw_log: Dict[str, Any] = {}
 
     def _pair_iter(self):
         for group in self.param_groups:
             params = group['params']
             for p1, p2 in list(zip(params, params[1:]))[::2]:
                 yield (group, p1, p2)
+
+    def state_dict(self):
+        state = super().state_dict()
+        state['_prism_runtime'] = {
+            'clipping_method': self.clipping_method,
+            'current_clip': self.current_clip,
+            'slaclip_num_slots': self.slaclip_num_slots,
+            'slaclip_eta': self.slaclip_eta,
+            'slaclip_target_non_small_clip_fraction': (
+                self.slaclip_target_non_small_clip_fraction
+            ),
+            'slaclip_beta': self.slaclip_beta,
+            'slaclip_target_clip_fraction': self.slaclip_target_clip_fraction,
+            'slaclip_c_min': self.slaclip_c_min,
+            'slaclip_c_max': self.slaclip_c_max,
+            'telemetry_mode': self.telemetry_mode,
+            'raw_hist_max': self.raw_hist_max,
+        }
+        return state
+
+    def load_state_dict(self, state_dict):
+        state_copy = dict(state_dict)
+        runtime = state_copy.pop('_prism_runtime', None)
+        result = super().load_state_dict(state_copy)
+        # A valid step-zero checkpoint can precede the first dp_begin(), in
+        # which case torch's optimizer state is empty. Recreate only missing
+        # PRISM slots after loading while preserving any restored moments.
+        self._state_initialized = False
+        self._ensure_state()
+        if isinstance(runtime, dict):
+            saved_method = runtime.get('clipping_method')
+            if saved_method is not None and saved_method != self.clipping_method:
+                raise ValueError(
+                    f"checkpoint clipping_method={saved_method!r} does not match current method={self.clipping_method!r}"
+                )
+            saved_non_small_target = runtime.get(
+                'slaclip_target_non_small_clip_fraction',
+                runtime.get('slaclip_beta'),
+            )
+            if saved_non_small_target is not None and not math.isclose(
+                float(saved_non_small_target),
+                self.slaclip_target_non_small_clip_fraction,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    'checkpoint slaclip_target_non_small_clip_fraction='
+                    f'{saved_non_small_target!r} does not match current value='
+                    f'{self.slaclip_target_non_small_clip_fraction!r}'
+                )
+            saved_legacy_target = runtime.get('slaclip_beta')
+            saved_canonical_target = runtime.get(
+                'slaclip_target_non_small_clip_fraction'
+            )
+            if (
+                saved_legacy_target is not None
+                and saved_canonical_target is not None
+                and not math.isclose(
+                    float(saved_legacy_target),
+                    float(saved_canonical_target),
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError(
+                    'checkpoint has conflicting full-SlaClip target aliases'
+                )
+            for key, current in (
+                ('slaclip_eta', self.slaclip_eta),
+                ('slaclip_target_clip_fraction', self.slaclip_target_clip_fraction),
+                ('slaclip_c_min', self.slaclip_c_min),
+                ('slaclip_c_max', self.slaclip_c_max),
+            ):
+                saved = runtime.get(key)
+                if saved is not None and not math.isclose(
+                    float(saved), float(current), rel_tol=1e-12, abs_tol=1e-12
+                ):
+                    raise ValueError(
+                        f'checkpoint {key}={saved!r} does not match current value={current!r}'
+                    )
+            saved_telemetry = runtime.get('telemetry_mode')
+            if saved_telemetry is not None and saved_telemetry != self.telemetry_mode:
+                raise ValueError(
+                    f'checkpoint telemetry_mode={saved_telemetry!r} does not match '
+                    f'current mode={self.telemetry_mode!r}'
+                )
+            saved_clip = runtime.get('current_clip')
+            self.current_clip = None if saved_clip is None else float(saved_clip)
+            saved_slots = int(runtime.get('slaclip_num_slots', self.slaclip_num_slots))
+            if self.slaclip_num_slots not in {0, saved_slots}:
+                raise ValueError(
+                    f'checkpoint slaclip_num_slots={saved_slots} does not match '
+                    f'current value={self.slaclip_num_slots}'
+                )
+            self.slaclip_num_slots = saved_slots
+            self.raw_hist_max = float(runtime.get('raw_hist_max', self.raw_hist_max))
+        # torch.optim recursively moves tensors in dictionaries/lists, but not
+        # tensors stored in SimpleNamespace.  Checkpoints are taken between
+        # logical steps, so only persistent moments should be populated here.
+        for _, pA, _ in self._pair_iter():
+            st = self.state.get(pA, {}).get('prism')
+            if st is None:
+                continue
+            for name in ('mA', 'mB', 'vA', 'vB'):
+                value = getattr(st, name, None)
+                if isinstance(value, Tensor):
+                    setattr(st, name, value.to(device=pA.device))
+            for transient in ('dp_accum_A', 'dp_accum_B', 'dp_raw_accum_A', 'dp_raw_accum_B'):
+                value = getattr(st, transient, None)
+                if value is not None:
+                    raise ValueError(
+                        f'checkpoint unexpectedly contains in-progress state {transient}; '
+                        'only logical-step checkpoints are supported'
+                    )
+        return result
+
+    def configure_dp_noise(self, *, generator=None, secure_mode: bool = False) -> None:
+        """Use the same noise source configured by Opacus's PrivacyEngine."""
+
+        self._dp_noise_generator = generator
+        self._dp_secure_mode = bool(secure_mode)
+
+    def get_dp_noise_generator_state(self) -> Optional[Tensor]:
+        generator = self._dp_noise_generator
+        if generator is None or not hasattr(generator, 'get_state'):
+            return None
+        return generator.get_state().detach().cpu()
+
+    def set_dp_noise_generator_state(self, state: Optional[Tensor]) -> None:
+        if state is None:
+            return
+        generator = self._dp_noise_generator
+        if generator is None or not hasattr(generator, 'set_state'):
+            raise RuntimeError('checkpoint contains a DP noise RNG state, but no compatible generator is configured')
+        generator.set_state(state)
+
+    def _generate_dp_noise(self, reference: Tensor, std: float) -> Tensor:
+        if float(std) == 0.0:
+            return torch.zeros_like(reference)
+        try:
+            # Reuse Opacus's hardened four-sample construction when secure mode
+            # is enabled; in ordinary research mode this also preserves the
+            # PrivacyEngine generator semantics.
+            from opacus.optimizers.optimizer import _generate_noise
+
+            return _generate_noise(
+                std=float(std),
+                reference=reference,
+                generator=self._dp_noise_generator,
+                secure_mode=self._dp_secure_mode,
+            )
+        except ImportError:
+            if self._dp_secure_mode:
+                raise RuntimeError('secure DP noise requires an Opacus version exposing _generate_noise')
+            return torch.normal(
+                mean=0.0,
+                std=float(std),
+                size=tuple(reference.shape),
+                generator=self._dp_noise_generator,
+                device=reference.device,
+                dtype=reference.dtype,
+            )
 
     def _get_factors(self, pA: torch.nn.Parameter, pB: torch.nn.Parameter) -> Tuple[Tensor, Tensor]:
         B, _ = self._helper.move_lora_dim_to_last(pA.data, self.lora_l_dim)
@@ -324,9 +737,11 @@ class PRISM(torch.optim.Optimizer):
         if self._state_initialized:
             return
         for _, pA, pB in self._pair_iter():
+            if self.state[pA].get('prism') is not None:
+                continue
             A, B = self._get_factors(pA, pB)
             r = A.shape[1]
-            self.state[pA]['prism'] = types.SimpleNamespace(step=0, mA=torch.zeros_like(A, dtype=torch.float32), mB=torch.zeros_like(B, dtype=torch.float32), vA=torch.zeros((r, r), device=A.device, dtype=torch.float32), vB=torch.zeros((r, r), device=B.device, dtype=torch.float32), dp_accum_A=None, dp_accum_B=None, dp_cache=None, last_spec_A={}, last_spec_B={})
+            self.state[pA]['prism'] = types.SimpleNamespace(step=0, mA=torch.zeros_like(A, dtype=torch.float32), mB=torch.zeros_like(B, dtype=torch.float32), vA=torch.zeros((r, r), device=A.device, dtype=torch.float32), vB=torch.zeros((r, r), device=B.device, dtype=torch.float32), dp_accum_A=None, dp_accum_B=None, dp_raw_accum_A=None, dp_raw_accum_B=None, dp_cache=None, last_spec_A={}, last_spec_B={})
         self._state_initialized = True
 
     def _compute_tangent_grad(self, A: Tensor, B: Tensor, gA: Tensor, gB: Tensor, M_pinv: Optional[Tensor]=None, N_pinv: Optional[Tensor]=None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -452,27 +867,87 @@ class PRISM(torch.optim.Optimizer):
         return loss
 
     @torch.no_grad()
-    def dp_begin(self, max_grad_norm: float) -> None:
+    def dp_begin(self, max_grad_norm: float, *, expected_batch_size: float, noise_multiplier: float) -> None:
         if max_grad_norm <= 0:
             raise ValueError('max_grad_norm must be positive')
+        if expected_batch_size <= 0:
+            raise ValueError('expected_batch_size must be positive')
+        if noise_multiplier <= 0:
+            raise ValueError('noise_multiplier must be positive')
         self._ensure_state()
-        self._dp_state = _DPAccumState(max_grad_norm=float(max_grad_norm), total_samples=0)
+        if self.current_clip is None:
+            self.current_clip = float(max_grad_norm)
+        if self.raw_hist_max <= 0:
+            # Freeze one absolute range for the whole run so histograms remain comparable.
+            self.raw_hist_max = 4.0 * float(max_grad_norm)
+        uses_slack = self.clipping_method in {'slaclip', 'slaclip_q'}
+        clip_threshold = float(self.current_clip if uses_slack else max_grad_norm)
+        if uses_slack and self.slaclip_num_slots == 0:
+            self.slaclip_num_slots = automatic_num_slots(expected_batch_size, noise_multiplier)
+        self._dp_state = _DPAccumState(
+            max_grad_norm=clip_threshold,
+            expected_batch_size=float(expected_batch_size),
+            noise_multiplier=float(noise_multiplier),
+        )
+        if uses_slack:
+            # Lambda is defined by C and K, not by the realized batch.  Set it
+            # before accumulation so an empty Poisson batch still performs the
+            # noisy Slack-Indicator release and controller update.
+            self._dp_state.slack_lambda = clip_threshold / math.sqrt(
+                int(self.slaclip_num_slots)
+            )
+        self.last_log = {}
+        self.last_raw_log = {}
         for _, pA, pB in self._pair_iter():
             st = self.state[pA]['prism']
             A, B = self._get_factors(pA, pB)
             A32 = A.float()
             B32 = B.float()
-            QA, _ = torch.linalg.qr(A32, mode='reduced')
-            QB, _ = torch.linalg.qr(B32, mode='reduced')
+            # The exact rank-r mechanism lives on the smooth fixed-rank
+            # manifold.  Check this before accumulating any per-record
+            # gradient or making/accounting a release, and cache a stable QR
+            # chart used by both the query and the Gaussian sampler.
+            QA, RA, rank_stats_A = _full_column_rank_qr(
+                A32,
+                gram_rcond=self.rcond,
+                factor_name='LoRA factor A',
+            )
+            _QB, RB, rank_stats_B = _full_column_rank_qr(
+                B32,
+                gram_rcond=self.rcond,
+                factor_name='LoRA factor B',
+            )
             M = A32.T @ A32
             N = B32.T @ B32
-            M_pinv = _psd_pinv(M, rcond=self.rcond)
-            N_pinv = _psd_pinv(N, rcond=self.rcond)
-            M_invsqrt = _psd_invsqrt_damped(M, eps=self.eps)
-            N_invsqrt = _psd_invsqrt_damped(N, eps=self.eps)
-            st.dp_cache = {'A': A32, 'B': B32, 'QA': QA, 'QB': QB, 'M': M, 'N': N, 'M_pinv': M_pinv, 'N_pinv': N_pinv, 'M_invsqrt': M_invsqrt, 'N_invsqrt': N_invsqrt}
+            M_inv = _gram_inverse_from_qr(RA)
+            N_inv = _gram_inverse_from_qr(RB)
+            st.dp_cache = {
+                'A': A32,
+                'B': B32,
+                'QA': QA,
+                'RA': RA,
+                'RB': RB,
+                'M': M,
+                'N': N,
+                'M_inv': M_inv,
+                'N_inv': N_inv,
+                'rank_stats_A': rank_stats_A,
+                'rank_stats_B': rank_stats_B,
+            }
             st.dp_accum_A = torch.zeros_like(A32)
             st.dp_accum_B = torch.zeros_like(B32)
+            if uses_slack and self._dp_state.slack_sum is None:
+                self._dp_state.slack_sum = torch.zeros(
+                    int(self.slaclip_num_slots),
+                    device=A32.device,
+                    dtype=torch.float32,
+                )
+            if self.telemetry_mode == 'research_raw':
+                st.dp_raw_accum_A = torch.zeros_like(A32)
+                st.dp_raw_accum_B = torch.zeros_like(B32)
+            else:
+                st.dp_raw_accum_A = None
+                st.dp_raw_accum_B = None
 
     @torch.no_grad()
     def dp_accumulate(self) -> int:
@@ -488,43 +963,68 @@ class PRISM(torch.optim.Optimizer):
                 raise RuntimeError('dp_cache missing; did you call dp_begin()?')
             gsA_raw = self._helper.get_grad_sample_tensor(pB)
             gsB_raw = self._helper.get_grad_sample_tensor(pA)
-            if gsA_raw is None or gsB_raw is None:
+            if (gsA_raw is None) != (gsB_raw is None):
+                raise RuntimeError('paired LoRA factors must either both have grad_sample or both be unused')
+            if gsA_raw is None:
                 continue
             gA = self._helper.move_lora_dim_to_last_grad_sample(gsA_raw, self.lora_r_dim).float()
             gB = self._helper.move_lora_dim_to_last_grad_sample(gsB_raw, self.lora_l_dim).float()
             bs = int(gA.shape[0])
-            total_in_micro = bs if total_in_micro is None else min(total_in_micro, bs)
+            if int(gB.shape[0]) != bs:
+                raise RuntimeError(
+                    f'paired LoRA grad_sample batch mismatch: A={bs}, B={int(gB.shape[0])}'
+                )
+            if total_in_micro is None:
+                total_in_micro = bs
+            elif total_in_micro != bs:
+                raise RuntimeError(
+                    f'inconsistent grad_sample batch dimension across LoRA modules: '
+                    f'expected {total_in_micro}, got {bs}'
+                )
             A = cache['A']
             B = cache['B']
-            M_pinv = cache['M_pinv']
-            N_pinv = cache['N_pinv']
+            RA = cache['RA']
+            RB = cache['RB']
             QA = cache['QA']
-            QB = cache['QB']
-            YA = torch.matmul(gA, N_pinv)
-            projYA = _apply_projector_Q(QA, YA)
-            dA = YA - 0.5 * projYA
-            YB = torch.matmul(gB, M_pinv)
-            projYB = _apply_projector_Q(QB, YB)
-            dB = YB - 0.5 * projYB
+            dA, dB = _dp_isometric_chart_lift(gA, gB, QA, RA, RB)
             n2 = _tangent_fro_norm_sq(dA, dB, A, B)
             if global_norm_sq is None:
                 global_norm_sq = n2
             else:
-                assert total_in_micro is not None
-                global_norm_sq = global_norm_sq[:total_in_micro] + n2[:total_in_micro]
+                global_norm_sq = global_norm_sq + n2
         if total_in_micro is None or global_norm_sq is None:
             return 0
-        global_norm_sq = global_norm_sq[:total_in_micro]
         global_norm = torch.sqrt(torch.clamp(global_norm_sq, min=0.0) + 1e-12)
         coef = (max_norm / global_norm).clamp(max=1.0)
         clipped_frac = float((coef < 1.0).float().mean().item())
         coef_mean = float(coef.mean().item())
         coef_min = float(coef.min().item())
         self._dp_state.microbatches += 1
-        self._dp_state.clipped_frac_sum += clipped_frac
-        self._dp_state.coef_mean_sum += coef_mean
-        self._dp_state.coef_min_sum += coef_min
+        self._dp_state.clipped_samples += int((coef < 1.0).sum().item())
+        self._dp_state.coef_sum += float(coef.sum().item())
+        self._dp_state.coef_min = min(self._dp_state.coef_min, coef_min)
         self._dp_state.last_micro_stats = {'micro_clipped_frac': clipped_frac, 'micro_coef_mean': coef_mean, 'micro_coef_min': coef_min, 'micro_global_norm_mean': float(global_norm.mean().item()), 'micro_global_norm_p95': float(torch.quantile(global_norm, 0.95).item())}
+        if self.clipping_method in {'slaclip', 'slaclip_q'}:
+            slack_vectors, lambda_t = build_slack_vectors(
+                global_norm,
+                max_norm,
+                self.slaclip_num_slots,
+            )
+            if not math.isclose(
+                self._dp_state.slack_lambda,
+                lambda_t,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise RuntimeError('SlaClip threshold changed inside one logical batch')
+            slack_sum = slack_vectors.sum(dim=0)
+            if self._dp_state.slack_sum is None:
+                raise RuntimeError('SlaClip slack accumulator is missing')
+            self._dp_state.slack_sum.add_(
+                slack_sum.to(self._dp_state.slack_sum.device)
+            )
+        if self.telemetry_mode == 'research_raw':
+            self._dp_state.raw_norms.append(global_norm.detach().to('cpu', dtype=torch.float32))
         coef_view = coef.view(-1, 1, 1)
         for _, pA, pB in self._pair_iter():
             st = self.state[pA]['prism']
@@ -533,26 +1033,25 @@ class PRISM(torch.optim.Optimizer):
                 raise RuntimeError('dp_cache missing; did you call dp_begin()?')
             gsA_raw = self._helper.get_grad_sample_tensor(pB)
             gsB_raw = self._helper.get_grad_sample_tensor(pA)
-            if gsA_raw is None or gsB_raw is None:
+            if (gsA_raw is None) != (gsB_raw is None):
+                raise RuntimeError('paired LoRA factors must either both have grad_sample or both be unused')
+            if gsA_raw is None:
                 continue
             gA = self._helper.move_lora_dim_to_last_grad_sample(gsA_raw, self.lora_r_dim).float()
             gB = self._helper.move_lora_dim_to_last_grad_sample(gsB_raw, self.lora_l_dim).float()
-            if int(gA.shape[0]) != total_in_micro:
-                gA = gA[:total_in_micro]
-            if int(gB.shape[0]) != total_in_micro:
-                gB = gB[:total_in_micro]
+            if int(gA.shape[0]) != total_in_micro or int(gB.shape[0]) != total_in_micro:
+                raise RuntimeError(
+                    'grad_sample batch dimension changed between norm computation and accumulation'
+                )
             A = cache['A']
             B = cache['B']
-            M_pinv = cache['M_pinv']
-            N_pinv = cache['N_pinv']
+            RA = cache['RA']
+            RB = cache['RB']
             QA = cache['QA']
-            QB = cache['QB']
-            YA = torch.matmul(gA, N_pinv)
-            projYA = _apply_projector_Q(QA, YA)
-            dA = YA - 0.5 * projYA
-            YB = torch.matmul(gB, M_pinv)
-            projYB = _apply_projector_Q(QB, YB)
-            dB = YB - 0.5 * projYB
+            dA, dB = _dp_isometric_chart_lift(gA, gB, QA, RA, RB)
+            if self.telemetry_mode == 'research_raw':
+                st.dp_raw_accum_A.add_(dA.sum(dim=0))
+                st.dp_raw_accum_B.add_(dB.sum(dim=0))
             st.dp_accum_A.add_((dA * coef_view).sum(dim=0))
             st.dp_accum_B.add_((dB * coef_view).sum(dim=0))
             self._helper.clear_grad_sample(pA)
@@ -565,14 +1064,33 @@ class PRISM(torch.optim.Optimizer):
         if self._dp_state is None:
             raise RuntimeError('dp_begin() must be called before dp_finalize().')
         total = int(self._dp_state.total_samples)
-        if total <= 0:
-            self._dp_state = None
-            return 0
         C = float(self._dp_state.max_grad_norm)
         sigma = float(noise_multiplier)
-        std = sigma * C / float(total)
+        if not math.isclose(sigma, float(self._dp_state.noise_multiplier), rel_tol=1e-12):
+            raise ValueError('noise_multiplier changed inside one logical batch')
+        release_denom = float(self._dp_state.expected_batch_size)
+        std = sigma * C / release_denom
+        slack_indicator: Optional[Tensor] = None
+        raw_slack_indicator: Optional[Tensor] = None
+        if self._dp_state.slack_sum is not None and self._dp_state.slack_lambda > 0:
+            if self.telemetry_mode == 'research_raw':
+                # Exact, non-DP oracle corresponding to the same normalization
+                # used by the released/noised Slack Indicator.
+                raw_slack_indicator = self._dp_state.slack_sum / (
+                    float(self._dp_state.slack_lambda) * release_denom
+                )
+            slack_noise = self._generate_dp_noise(self._dp_state.slack_sum, sigma * C)
+            slack_indicator = (
+                self._dp_state.slack_sum + slack_noise
+            ) / (float(self._dp_state.slack_lambda) * release_denom)
         signal_norm_sq = 0.0
+        raw_unclipped_norm_sq = 0.0
+        clipping_bias_norm_sq = 0.0
         noise_norm_sq = 0.0
+        raw_unclipped_clipped_inner = 0.0
+        raw_clipped_noisy_inner = 0.0
+        noisy_gradient_norm_sq = 0.0
+        effective_update_norm_sq = 0.0
         update_clip_coef_min = 1.0
         trust_ratio_min = float('inf')
         trust_ratio_max = 0.0
@@ -584,6 +1102,7 @@ class PRISM(torch.optim.Optimizer):
         floorA_max = 0.0
         floorB_min = float('inf')
         floorB_max = 0.0
+        factor_relative_gram_eigenvalue_min = float('inf')
         for group, pA, pB in self._pair_iter():
             lr: float = float(group['lr'])
             st = self.state[pA]['prism']
@@ -592,32 +1111,78 @@ class PRISM(torch.optim.Optimizer):
                 continue
             A = cache['A']
             B = cache['B']
-            M_pinv = cache['M_pinv']
-            N_pinv = cache['N_pinv']
-            M_invsqrt = cache['M_invsqrt']
-            N_invsqrt = cache['N_invsqrt']
+            M_inv = cache['M_inv']
+            N_inv = cache['N_inv']
+            RA = cache['RA']
+            RB = cache['RB']
             QA = cache.get('QA')
-            if QA is None:
-                QA, _ = torch.linalg.qr(A, mode='reduced')
-            gradA = st.dp_accum_A / float(total)
-            gradB = st.dp_accum_B / float(total)
+            if QA is None or RA is None or RB is None:
+                raise RuntimeError('exact full-rank QR cache missing during PRISM DP release')
+            factor_relative_gram_eigenvalue_min = min(
+                factor_relative_gram_eigenvalue_min,
+                float(cache['rank_stats_A']['relative_gram_eigenvalue']),
+                float(cache['rank_stats_B']['relative_gram_eigenvalue']),
+            )
+            gradA = st.dp_accum_A / release_denom
+            gradB = st.dp_accum_B / release_denom
             if std > 0:
-                U = torch.randn_like(A)
-                V = torch.randn_like(B)
-                projU = _apply_projector_Q(QA, U)
-                U_perp = U - projU
-                noise_A = U_perp @ N_invsqrt * std
-                noise_B = V @ M_invsqrt * std
+                U = self._generate_dp_noise(A, 1.0)
+                V = self._generate_dp_noise(B, 1.0)
+                unit_noise_A, unit_noise_B = _factorized_isotropic_tangent_noise(
+                    U,
+                    V,
+                    QA,
+                    RA,
+                    RB,
+                )
+                noise_A = unit_noise_A * std
+                noise_B = unit_noise_B * std
             else:
                 noise_A = torch.zeros_like(A)
                 noise_B = torch.zeros_like(B)
             gradA_noisy = gradA + noise_A
             gradB_noisy = gradB + noise_B
+            noisy_n2 = _tangent_fro_norm_sq(gradA_noisy, gradB_noisy, A, B)
+            noisy_gradient_norm_sq += float(noisy_n2.item())
             if self.lift_gauge_fix in {'pre_moment', 'both'}:
                 gradA_noisy, gradB_noisy = _horizontalize_lift(gradA_noisy, gradB_noisy, A, B, eps=self.gauge_fix_eps)
-            sig_n2 = _tangent_fro_norm_sq(gradA, gradB, A, B)
             noi_n2 = _tangent_fro_norm_sq(noise_A, noise_B, A, B)
-            signal_norm_sq += float(sig_n2.item())
+            if self.telemetry_mode == 'research_raw':
+                sig_n2 = _tangent_fro_norm_sq(gradA, gradB, A, B)
+                signal_norm_sq += float(sig_n2.item())
+                if st.dp_raw_accum_A is None or st.dp_raw_accum_B is None:
+                    raise RuntimeError('raw telemetry accumulator is missing')
+                raw_gradA = st.dp_raw_accum_A / release_denom
+                raw_gradB = st.dp_raw_accum_B / release_denom
+                raw_n2 = _tangent_fro_norm_sq(raw_gradA, raw_gradB, A, B)
+                bias_n2 = _tangent_fro_norm_sq(
+                    raw_gradA - gradA,
+                    raw_gradB - gradB,
+                    A,
+                    B,
+                )
+                raw_unclipped_norm_sq += float(raw_n2.item())
+                clipping_bias_norm_sq += float(bias_n2.item())
+                raw_unclipped_clipped_inner += float(
+                    _tangent_fro_inner_product(
+                        raw_gradA,
+                        raw_gradB,
+                        gradA,
+                        gradB,
+                        A,
+                        B,
+                    ).item()
+                )
+                raw_clipped_noisy_inner += float(
+                    _tangent_fro_inner_product(
+                        gradA,
+                        gradB,
+                        gradA_noisy,
+                        gradB_noisy,
+                        A,
+                        B,
+                    ).item()
+                )
             noise_norm_sq += float(noi_n2.item())
             base_floor = float(self.dp_precond_floor_factor) * float(std * std)
             if self.dp_floor_mode == 'none':
@@ -632,8 +1197,6 @@ class PRISM(torch.optim.Optimizer):
                 m_dim = float(A.shape[0])
                 r_dim = float(A.shape[1])
                 coefA = max(m_dim - r_dim, 0.0) / max(m_dim, 1.0)
-                N_inv = _psd_inv_from_invsqrt(N_invsqrt)
-                M_inv = _psd_inv_from_invsqrt(M_invsqrt)
                 if self.dp_floor_mode == 'geometry':
                     trN_inv = float(torch.trace(N_inv).item()) / max(r_dim, 1.0)
                     trM_inv = float(torch.trace(M_inv).item()) / max(r_dim, 1.0)
@@ -667,18 +1230,320 @@ class PRISM(torch.optim.Optimizer):
             update_clip_coef_min = min(update_clip_coef_min, float(upd_coef))
             r = A.shape[1]
             A_new, B_new = _retract_rank_r(A, B, dA_dir, dB_dir, eta=lr, r=r, align_to=(A, B))
+            upd_n2 = _factorized_delta_fro_norm_sq(A_new, B_new, A, B)
+            effective_update_norm_sq += float(upd_n2.item())
             self._set_factors(pA, pB, A_new.to(pB.data.dtype), B_new.to(pA.data.dtype))
             st.dp_cache = None
             st.dp_accum_A = None
             st.dp_accum_B = None
-        mb = max(1, int(self._dp_state.microbatches))
-        clip_frac = self._dp_state.clipped_frac_sum / mb
-        coef_mean = self._dp_state.coef_mean_sum / mb
-        coef_min = self._dp_state.coef_min_sum / mb
-        sig = math.sqrt(max(signal_norm_sq, 0.0))
+            st.dp_raw_accum_A = None
+            st.dp_raw_accum_B = None
+        clip_frac = float(self._dp_state.clipped_samples) / max(1, total)
+        coef_mean = float(self._dp_state.coef_sum) / max(1, total)
+        coef_min = float(self._dp_state.coef_min)
         noi = math.sqrt(max(noise_norm_sq, 0.0))
-        snr = float(sig / (noi + 1e-12))
-        self.last_log = {'dp_total_samples': float(total), 'dp_noise_multiplier': float(noise_multiplier), 'dp_std_per_factor': float(std), 'dp_floor_mode_id': float({'none': 0, 'scalar': 1, 'geometry': 2}.get(self.dp_floor_mode, -1)), 'dp_precond_update_mode_id': float({'current': 0, 'delayed': 1}.get(self.precond_update_mode, -1)), 'dp_lift_gauge_fix_id': float({'none': 0, 'pre_moment': 1, 'pre_retract': 2, 'both': 3}.get(self.lift_gauge_fix, -1)), 'dp_floorA_min': float(0.0 if floorA_min == float('inf') else floorA_min), 'dp_floorA_max': float(floorA_max), 'dp_floorB_min': float(0.0 if floorB_min == float('inf') else floorB_min), 'dp_floorB_max': float(floorB_max), 'dp_clip_frac': float(clip_frac), 'dp_coef_mean': float(coef_mean), 'dp_coef_min': float(coef_min), 'dp_signal_norm': float(sig), 'dp_noise_norm': float(noi), 'dp_snr': float(snr), 'dp_update_clip_coef_min': float(update_clip_coef_min), 'dp_trust_ratio_min': float(0.0 if trust_ratio_min == float('inf') else trust_ratio_min), 'dp_trust_ratio_max': float(trust_ratio_max), 'dp_precond_eigA_min': float(0.0 if precond_eigA_min == float('inf') else precond_eigA_min), 'dp_precond_eigA_max': float(precond_eigA_max), 'dp_precond_eigB_min': float(0.0 if precond_eigB_min == float('inf') else precond_eigB_min), 'dp_precond_eigB_max': float(precond_eigB_max)}
+        noisy_grad_norm = math.sqrt(max(noisy_gradient_norm_sq, 0.0))
+        effective_update_norm = math.sqrt(max(effective_update_norm_sq, 0.0))
+        c_next = C
+        threshold_update = None
+        if self.clipping_method == 'slaclip' and slack_indicator is not None:
+            threshold_update = full_slaclip_threshold_update(
+                C,
+                slack_indicator,
+                eta=self.slaclip_eta,
+                c_min=self.slaclip_c_min,
+                c_max=self.slaclip_c_max,
+                target_non_small_clip_fraction=(
+                    self.slaclip_target_non_small_clip_fraction
+                ),
+            )
+            c_next = threshold_update.next_clip
+            self.current_clip = float(c_next)
+        elif self.clipping_method == 'slaclip_q' and slack_indicator is not None:
+            threshold_update = slaclip_q_threshold_update(
+                C,
+                slack_indicator,
+                eta=self.slaclip_eta,
+                target_clip_fraction=self.slaclip_target_clip_fraction,
+                c_min=self.slaclip_c_min,
+                c_max=self.slaclip_c_max,
+            )
+            c_next = threshold_update.next_clip
+            self.current_clip = float(c_next)
+        elif self.clipping_method == 'baseline':
+            self.current_clip = C
+
+        self.last_log = {
+            'telemetry_mode': self.telemetry_mode,
+            'dp_expected_batch_size': float(release_denom),
+            'dp_noise_multiplier': float(noise_multiplier),
+            'dp_clip_threshold': float(C),
+            'dp_next_clip_threshold': float(c_next),
+            'dp_std_per_factor': float(std),
+            'dp_tangent_noise_sampler': 'qr_exact_full_rank',
+            'dp_tangent_query_chart': 'qr_asymmetric_isometric',
+            'dp_factor_rank_rcond': float(self.rcond),
+            'dp_factor_relative_gram_eigenvalue_min': float(
+                0.0
+                if factor_relative_gram_eigenvalue_min == float('inf')
+                else factor_relative_gram_eigenvalue_min
+            ),
+            # Both are post-processing of the DP release/model update.  The
+            # realized noise itself is intentionally kept out of this log.
+            'dp_noisy_tangent_gradient_norm': float(noisy_grad_norm),
+            'dp_factor_product_update_norm': float(effective_update_norm),
+            'dp_floor_mode_id': float({'none': 0, 'scalar': 1, 'geometry': 2}.get(self.dp_floor_mode, -1)),
+            'dp_precond_update_mode_id': float({'current': 0, 'delayed': 1}.get(self.precond_update_mode, -1)),
+            'dp_lift_gauge_fix_id': float({'none': 0, 'pre_moment': 1, 'pre_retract': 2, 'both': 3}.get(self.lift_gauge_fix, -1)),
+            'dp_floorA_min': float(0.0 if floorA_min == float('inf') else floorA_min),
+            'dp_floorA_max': float(floorA_max),
+            'dp_floorB_min': float(0.0 if floorB_min == float('inf') else floorB_min),
+            'dp_floorB_max': float(floorB_max),
+            'dp_update_clip_coef_min': float(update_clip_coef_min),
+            'dp_trust_ratio_min': float(0.0 if trust_ratio_min == float('inf') else trust_ratio_min),
+            'dp_trust_ratio_max': float(trust_ratio_max),
+            'dp_precond_eigA_min': float(0.0 if precond_eigA_min == float('inf') else precond_eigA_min),
+            'dp_precond_eigA_max': float(precond_eigA_max),
+            'dp_precond_eigB_min': float(0.0 if precond_eigB_min == float('inf') else precond_eigB_min),
+            'dp_precond_eigB_max': float(precond_eigB_max),
+        }
+        if slack_indicator is not None:
+            slack_cpu = slack_indicator.detach().to('cpu', dtype=torch.float32)
+            self.last_log['slaclip_num_slots'] = int(self.slaclip_num_slots)
+            self.last_log['slaclip_controller'] = str(self.clipping_method)
+            self.last_log['slack_indicator'] = [float(x) for x in slack_cpu.tolist()]
+            self.last_log['slack_unclipped_proxy'] = float(slack_cpu[0].item())
+            self.last_log['slack_clipped_proxy'] = float(1.0 - slack_cpu[0].item())
+            self.last_log['slack_indicator_noise_std'] = slack_indicator_noise_std(
+                sigma,
+                self.slaclip_num_slots,
+                release_denom,
+            )
+        if threshold_update is not None:
+            self.last_log['slaclip_target_unclipped_proxy'] = float(
+                threshold_update.target_unclipped_proxy
+            )
+            self.last_log[
+                'slaclip_target_unclipped_proxy_preprojection'
+            ] = float(threshold_update.target_unclipped_proxy_preprojection)
+            self.last_log['slaclip_target_clipped_proxy'] = float(
+                1.0 - threshold_update.target_unclipped_proxy
+            )
+            self.last_log['slaclip_observed_unclipped_proxy'] = float(
+                threshold_update.observed_unclipped_proxy
+            )
+            self.last_log['slaclip_controller_error'] = float(
+                threshold_update.controller_error
+            )
+            self.last_log['slaclip_c_next_unbounded'] = float(
+                threshold_update.unbounded_next_clip
+            )
+            self.last_log['slaclip_c_hit_min'] = bool(threshold_update.hit_lower_bound)
+            self.last_log['slaclip_c_hit_max'] = bool(threshold_update.hit_upper_bound)
+            self.last_log['slaclip_eta'] = float(self.slaclip_eta)
+            self.last_log['slaclip_c_min'] = float(self.slaclip_c_min)
+            self.last_log['slaclip_c_max'] = float(self.slaclip_c_max)
+            if self.clipping_method == 'slaclip':
+                self.last_log['slaclip_gamma_t'] = float(
+                    threshold_update.target_unclipped_proxy
+                )
+                self.last_log[
+                    'slaclip_target_non_small_clip_fraction'
+                ] = float(self.slaclip_target_non_small_clip_fraction)
+                self.last_log['slaclip_small_gradient_proxy_noisy'] = float(
+                    threshold_update.small_gradient_proxy_noisy
+                )
+                self.last_log['slaclip_remaining_mass_proxy_noisy'] = float(
+                    threshold_update.remaining_mass_proxy_noisy
+                )
+                # Deprecated telemetry alias retained for old campaign tools.
+                self.last_log['slaclip_beta'] = float(self.slaclip_beta)
+            else:
+                self.last_log['slaclip_target_clip_fraction'] = float(
+                    self.slaclip_target_clip_fraction
+                )
+
+        if self.telemetry_mode == 'research_raw':
+            sig = math.sqrt(max(signal_norm_sq, 0.0))
+            raw_unclipped = math.sqrt(max(raw_unclipped_norm_sq, 0.0))
+            clipping_bias = math.sqrt(max(clipping_bias_norm_sq, 0.0))
+            unclipped_clipped_cosine = _cosine_from_inner(
+                raw_unclipped_clipped_inner,
+                raw_unclipped_norm_sq,
+                signal_norm_sq,
+            )
+            clipped_noisy_cosine = _cosine_from_inner(
+                raw_clipped_noisy_inner,
+                signal_norm_sq,
+                noisy_gradient_norm_sq,
+            )
+            raw: Dict[str, Any] = {
+                'NON_PRIVATE_TELEMETRY': True,
+                'raw_realized_batch_size': int(total),
+                'raw_clip_fraction': float(clip_frac),
+                'raw_clip_coefficient_mean': float(coef_mean),
+                'raw_clip_coefficient_min': float(coef_min),
+                'raw_clipped_signal_norm': float(sig),
+                'raw_unclipped_signal_norm': float(raw_unclipped),
+                'raw_clipping_bias_norm': float(clipping_bias),
+                'raw_realized_noise_norm': float(noi),
+                'raw_signal_to_noise_ratio': float(sig / (noi + 1e-12)),
+                'raw_unclipped_clipped_cosine': float(unclipped_clipped_cosine),
+                'raw_clipped_noisy_cosine': float(clipped_noisy_cosine),
+                'raw_clipping_bias_to_noise_ratio': float(
+                    clipping_bias / (noi + 1e-12)
+                ),
+                'raw_bias_noise_squared_error_proxy': float(
+                    clipping_bias_norm_sq + noise_norm_sq
+                ),
+            }
+            if raw_slack_indicator is not None and slack_indicator is not None:
+                raw_slack_cpu = raw_slack_indicator.detach().to(
+                    'cpu', dtype=torch.float32
+                )
+                residual = (
+                    slack_indicator.detach().to('cpu', dtype=torch.float32)
+                    - raw_slack_cpu
+                )
+                raw['raw_slack_indicator'] = [
+                    float(value) for value in raw_slack_cpu.tolist()
+                ]
+                raw['raw_slack_indicator_noise_residual'] = [
+                    float(value) for value in residual.tolist()
+                ]
+                raw['raw_slack_indicator_noise_residual_l2'] = float(
+                    torch.linalg.vector_norm(residual).item()
+                )
+                raw['raw_slack_indicator_noise_residual_rmse'] = float(
+                    torch.sqrt(torch.mean(residual.square())).item()
+                )
+                raw['raw_slack_indicator_noise_residual_first_coordinate'] = float(
+                    residual[0].item()
+                )
+            if self._dp_state.raw_norms:
+                norms = torch.cat(self._dp_state.raw_norms).float()
+                hist_max = float(self.raw_hist_max if self.raw_hist_max > 0 else 4.0 * C)
+                in_range = norms[norms <= hist_max]
+                counts = torch.histc(in_range, bins=self.raw_hist_bins, min=0.0, max=hist_max)
+                edges = torch.linspace(0.0, hist_max, self.raw_hist_bins + 1)
+                raw.update({
+                    'raw_global_norm_mean': float(norms.mean().item()),
+                    'raw_global_norm_std': float(norms.std(unbiased=False).item()),
+                    'raw_global_norm_min': float(norms.min().item()),
+                    'raw_global_norm_max': float(norms.max().item()),
+                    'raw_global_norm_quantiles': {
+                        str(q): float(torch.quantile(norms, q).item())
+                        for q in (0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99)
+                    },
+                    'raw_global_norm_hist_counts': [int(x) for x in counts.tolist()],
+                    'raw_global_norm_hist_edges': [float(x) for x in edges.tolist()],
+                    'raw_global_norm_hist_overflow': int((norms > hist_max).sum().item()),
+                })
+                # Counterfactual full-SlaClip calibration for fixed-C scans.
+                # This is exact, access-controlled research telemetry only: it
+                # does not add slack coordinates to the DP query, alter the
+                # clipped gradient, consume controller output, or change the
+                # Gaussian release.  It mirrors the implemented full-SlaClip
+                # small-gradient proxy so a fixed run's whole-batch clipping
+                # rate is not incorrectly reused as the conditional rho.
+                reference_slots = int(self.slaclip_num_slots)
+                if reference_slots > 0:
+                    reference_slack, reference_lambda = build_slack_vectors(
+                        norms,
+                        float(C),
+                        reference_slots,
+                    )
+                    reference_indicator_last = float(
+                        (
+                            reference_slack[:, -1].sum()
+                            / (
+                                float(reference_lambda)
+                                * float(release_denom)
+                            )
+                        ).item()
+                    )
+                    reference_indicator = reference_slack.sum(dim=0) / (
+                        float(reference_lambda) * float(release_denom)
+                    )
+                    reference_indicator_first = float(reference_indicator[0].item())
+                    reference_unclipped_mass = (
+                        float(total - self._dp_state.clipped_samples)
+                        / float(release_denom)
+                    )
+                    # Public counterfactual noise scale only: the observer
+                    # never samples noise or changes the release RNG stream.
+                    reference_indicator_noise = slack_indicator_noise_std(
+                        sigma, reference_slots, release_denom
+                    )
+                    reference_small_proxy = reference_indicator_last / (
+                        float(C) + 1e-6
+                    )
+                    reference_remaining_proxy = 1.0 - reference_small_proxy
+                    reference_valid = bool(
+                        math.isfinite(reference_remaining_proxy)
+                        and reference_remaining_proxy > 1e-12
+                    )
+                    # Full SlaClip's released indicator and z_t both use the
+                    # public expected batch size as their denominator.  Keep
+                    # the counterfactual clipped mass in that same coordinate
+                    # system.  ``clip_frac`` is realized-batch normalized and
+                    # therefore cannot be divided by (1-z_t) directly when
+                    # Poisson sampling changes the realized batch size.
+                    reference_expected_normalized_clip_mass = (
+                        float(self._dp_state.clipped_samples)
+                        / float(release_denom)
+                    )
+                    reference_conditional = (
+                        reference_expected_normalized_clip_mass
+                        / reference_remaining_proxy
+                        if reference_valid
+                        else None
+                    )
+                    raw.update({
+                        'raw_reference_slaclip_num_slots': reference_slots,
+                        'raw_reference_conditional_normalization': (
+                            'expected_batch_size'
+                        ),
+                        'raw_reference_expected_batch_size_normalization': (
+                            float(release_denom)
+                        ),
+                        'raw_reference_realized_to_expected_batch_ratio': (
+                            float(total) / float(release_denom)
+                        ),
+                        'raw_reference_expected_normalized_clip_mass': (
+                            reference_expected_normalized_clip_mass
+                        ),
+                        'raw_reference_slack_indicator_last': (
+                            reference_indicator_last
+                        ),
+                        'raw_reference_slack_indicator': (
+                            [float(value) for value in reference_indicator.tolist()]
+                        ),
+                        'raw_reference_slack_indicator_first': reference_indicator_first,
+                        'raw_reference_expected_normalized_unclipped_mass': (
+                            reference_unclipped_mass
+                        ),
+                        'raw_reference_unclipped_cdf_bias': (
+                            reference_indicator_first - reference_unclipped_mass
+                        ),
+                        'raw_reference_slack_indicator_noise_std': reference_indicator_noise,
+                        'raw_reference_small_gradient_proxy_noise_std': (
+                            reference_indicator_noise / (float(C) + 1e-6)
+                        ),
+                        'raw_reference_small_gradient_proxy': (
+                            reference_small_proxy
+                        ),
+                        'raw_reference_remaining_mass_proxy': (
+                            reference_remaining_proxy
+                        ),
+                        'raw_reference_conditional_clip_fraction': (
+                            reference_conditional
+                        ),
+                        'raw_reference_conditional_clip_fraction_valid': (
+                            reference_valid
+                        ),
+                    })
+            self.last_raw_log = raw
         self._dp_state = None
         return total
 
@@ -722,6 +1587,11 @@ def balanced_full_rank_lora_init_peft_model(model: torch.nn.Module, *, adapter_n
         lora_A = mod.lora_A[adapter_name]
         lora_B = mod.lora_B[adapter_name]
         if not (hasattr(lora_A, 'weight') and hasattr(lora_B, 'weight')):
+            continue
+        # Multimodal backbones such as Gemma 3 may receive suffix-matched LoRA
+        # modules inside their frozen vision tower.  PRISM is text-only here;
+        # never alter a frozen base weight during spectral residual init.
+        if not (lora_A.weight.requires_grad and lora_B.weight.requires_grad):
             continue
         r = int(lora_A.weight.shape[0])
         in_features = int(lora_A.weight.shape[1])
@@ -780,6 +1650,11 @@ def spectral_init_peft_model(model: torch.nn.Module, *, adapter_name: str='defau
         lora_A = mod.lora_A[adapter_name]
         lora_B = mod.lora_B[adapter_name]
         if not (hasattr(lora_A, 'weight') and hasattr(lora_B, 'weight')):
+            continue
+        # Suffix matching can inject adapters into a multimodal vision tower.
+        # Frozen adapters are outside the text-only mechanism and their base
+        # weights must not be rewritten by the residual initialization.
+        if not (lora_A.weight.requires_grad and lora_B.weight.requires_grad):
             continue
         r = int(lora_A.weight.shape[0])
         if svd_rank is not None:

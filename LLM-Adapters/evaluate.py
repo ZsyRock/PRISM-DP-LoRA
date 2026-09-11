@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import argparse
+import random
 from pathlib import Path
 
 import fire
@@ -16,6 +17,14 @@ sys.path.append(str(_THIS_DIR / "peft" / "src"))
 from peft import PeftModel
 from tqdm import tqdm
 from transformers import GenerationConfig, LlamaTokenizer, AutoModelForCausalLM, AutoTokenizer
+
+try:
+    from prism_cli.modeling import load_base_model
+except ImportError:
+    # Keep the legacy evaluator usable when launched outside the repository's
+    # train_eval.py entry point.
+    def load_base_model(model_id, **kwargs):
+        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
 
 
 # ---------------------------
@@ -122,7 +131,15 @@ def load_data(args) -> list:
     file_path = DATASET_DIR / dname / "test.json"
     if not file_path.exists():
         raise FileNotFoundError(f"can not find dataset file : {file_path}")
-    return json.load(open(file_path, "r"))
+    records = json.load(open(file_path, "r"))
+    if args.max_examples is not None and args.max_examples > 0:
+        indices = sorted(
+            random.Random(args.sample_seed).sample(
+                range(len(records)), min(args.max_examples, len(records))
+            )
+        )
+        records = [records[index] for index in indices]
+    return records
 
 
 def create_batch(dataset, batch_size: int):
@@ -155,10 +172,22 @@ def parse_args():
         ],
         required=True,
     )
+    parser.add_argument(
+        "--sample_seed",
+        type=int,
+        default=1729,
+        help="Locked seed used when --max_examples selects an exploratory subset.",
+    )
     parser.add_argument("--model", choices=["LLaMA-7B", "BLOOM-7B", "GPT-j-6B", "other"], required=True)
     parser.add_argument("--adapter", choices=["LoRA", "AdapterP", "AdapterH", "Parallel", "Prefix"], required=True)
     parser.add_argument("--base_model", required=True)
+    parser.add_argument("--model_revision", default=None)
     parser.add_argument("--lora_weights", required=True)
+    parser.add_argument(
+        "--output_file",
+        default=None,
+        help="Optional run-specific prediction JSON path (safe for concurrent evaluations).",
+    )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--load_8bit", action="store_true", default=False)
 
@@ -167,6 +196,12 @@ def parse_args():
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--max_input_length", type=int, default=1024)
     parser.add_argument("--log_every", type=int, default=0)  # 0 = silent per-example
+    parser.add_argument(
+        "--max_examples",
+        type=int,
+        default=0,
+        help="Deterministic task-prefix limit for exploratory evaluation; 0 uses all rows.",
+    )
 
     return parser.parse_args()
 
@@ -199,9 +234,13 @@ def load_model(args) -> tuple:
 
     # Tokenizer
     if args.model == "LLaMA-7B":
-        tokenizer = LlamaTokenizer.from_pretrained(base_model)
+        tokenizer = LlamaTokenizer.from_pretrained(base_model, revision=args.model_revision)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_model,
+            revision=args.model_revision,
+            trust_remote_code=True,
+        )
 
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
@@ -210,52 +249,21 @@ def load_model(args) -> tuple:
         else:
             tokenizer.pad_token_id = 0
 
-    # Base model
-    if device == "cuda":
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model,
-                load_in_8bit=load_8bit,
-                torch_dtype=dtype,
-                device_map="auto",
-                trust_remote_code=True,
-            )
-        except TypeError:
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model,
-                load_in_8bit=load_8bit,
-                dtype=dtype,
-                device_map="auto",
-                trust_remote_code=True,
-            )
-        model = _load_peft_adapter(model, lora_weights, dtype=dtype, device_map="auto")
-    elif device == "mps":
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model,
-                device_map={"": device},
-                torch_dtype=dtype,
-                trust_remote_code=True,
-            )
-        except TypeError:
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model,
-                device_map={"": device},
-                dtype=dtype,
-                trust_remote_code=True,
-            )
-        model = _load_peft_adapter(model, lora_weights, dtype=dtype, device_map={"": device})
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            device_map={"": device},
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-        model = _load_peft_adapter(model, lora_weights, dtype=dtype, device_map={"": device})
-
-        if not load_8bit and dtype in (torch.float16, torch.bfloat16):
-            model = model.to(dtype)
+    # Base model. Gemma 3 4B+ checkpoints require a multimodal conditional-
+    # generation class even though these benchmarks provide text only.
+    device_map = "auto" if device == "cuda" else {"": device}
+    load_kwargs = {"low_cpu_mem_usage": True}
+    if load_8bit:
+        load_kwargs["load_in_8bit"] = True
+    model = load_base_model(
+        base_model,
+        revision=args.model_revision,
+        torch_dtype=dtype,
+        device_map=device_map,
+        trust_remote_code=True,
+        **load_kwargs,
+    )
+    model = _load_peft_adapter(model, lora_weights, dtype=dtype, device_map=device_map)
 
     # Align special token ids
     if getattr(model.config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
@@ -370,7 +378,12 @@ def main(
 
     # Determine dataset & output file naming
     ds_dir = _dataset_dir_name(args.dataset)
-    save_file = EXPERIMENT_DIR / f"{args.model}-{args.adapter}-{ds_dir}.json"
+    save_file = (
+        Path(args.output_file).expanduser().resolve()
+        if args.output_file
+        else EXPERIMENT_DIR / f"{args.model}-{args.adapter}-{ds_dir}.json"
+    )
+    save_file.parent.mkdir(parents=True, exist_ok=True)
 
     total_batches = len(batches)
     correct = 0
@@ -414,9 +427,17 @@ def main(
             if args.log_every and (seen % int(args.log_every) == 0):
                 print(f"[{args.dataset}] seen={seen} acc={correct/seen:.4f}")
 
-        # Write after each batch (matches repo style)
-        with open(save_file, "w+") as f:
-            json.dump(output_data, f, indent=4)
+        # Preserve progress after each batch without exposing readers to a
+        # partially written JSON document.
+        temporary = save_file.with_name(f".{save_file.name}.{os.getpid()}.tmp")
+        try:
+            with open(temporary, "w", encoding="utf-8") as f:
+                json.dump(output_data, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, save_file)
+        finally:
+            temporary.unlink(missing_ok=True)
 
         pbar.update(1)
 
