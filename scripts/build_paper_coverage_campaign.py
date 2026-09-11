@@ -66,6 +66,17 @@ def _quantile_target_module():
     spec.loader.exec_module(module)
     return module
 
+
+def _range_target_module():
+    """Load min/max interval-position targets, distinct from empirical quantiles."""
+    spec = importlib.util.spec_from_file_location(
+        "range_target_screen", Path(__file__).with_name("range_target_screen.py")
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 BREADTH_SETTINGS = (
     {
         "id": "glue8-4b-eps6-r16",
@@ -921,6 +932,11 @@ def build_manifest(
     profile: str = "paper-breadth",
     model_12b_revision: str | None = None,
 ) -> dict[str, Any]:
+    if profile == "glue-range-target-screen":
+        return _range_target_module().build_manifest(
+            _builder_api(), code_sha, model_4b_revision, model_9b_revision,
+            model_12b_revision,
+        )
     if profile == "glue-quantile-target-screen":
         return _quantile_target_module().build_manifest(
             _builder_api(), code_sha, model_4b_revision, model_9b_revision,
@@ -1580,6 +1596,7 @@ def _plan_bytes(manifest: dict[str, Any], lane: int, include_all: bool = False) 
             "glue-target-baseline-screen",
             "glue-weighted-target-screen",
             "glue-quantile-target-screen",
+            "glue-range-target-screen",
         }:
             priority = {
                 setting: index
@@ -1628,7 +1645,10 @@ def _plan_bytes(manifest: dict[str, Any], lane: int, include_all: bool = False) 
 
 def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision: str, profile: str, model_12b_revision: str | None = None) -> None:
     quantile_sources = None
-    if profile == "glue-quantile-target-screen":
+    range_sources = None
+    if profile == "glue-range-target-screen":
+        range_sources = _range_target_module().verify_sources(_builder_api(), root)
+    elif profile == "glue-quantile-target-screen":
         quantile_sources = _quantile_target_module().verify_sources(_builder_api(), root)
     elif profile == "glue-weighted-target-screen":
         _weighted_target_module().verify_sources(_builder_api(), root)
@@ -1648,6 +1668,8 @@ def prepare(root: Path, code_sha: str, model_4b_revision: str, model_9b_revision
     _with_sha(root / "plans" / "manifest.json", _json_bytes(manifest))
     if quantile_sources is not None:
         _with_sha(root / "selection" / "quantile-sources.lock.json", _json_bytes(quantile_sources))
+    if range_sources is not None:
+        _with_sha(root / "selection" / "range-sources.lock.json", _json_bytes(range_sources))
     _with_sha(root / "plans" / "lane-0.tsv", _plan_bytes(manifest, 0))
     _with_sha(root / "plans" / "lane-1.tsv", _plan_bytes(manifest, 1))
     _with_sha(root / "plans" / "sequential.tsv", _plan_bytes(manifest, 0, include_all=True))
@@ -3411,6 +3433,108 @@ def _build_glue_target_baseline_selection(
     }
 
 
+def _build_range_screen_reports(
+    manifest: dict[str, Any],
+    results: list[dict[str, Any]],
+    artifact_hashes: dict[str, Any],
+    manifest_sha256: str,
+    source_lock_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Select the best of three on validation only; retain every candidate.
+
+    Result rows have already passed the full focused-arm configuration,
+    contiguous-telemetry and public-holdout validators. Selection is an
+    exploratory result, not an unbiased estimate of confirmation performance.
+    """
+    comparisons = []
+    selections = []
+    arms = manifest["arms"]
+    arm_by_key = {(a["setting_id"], a["candidate_id"]): a for a in arms}
+    for sid in dict.fromkeys(a["setting_id"] for a in arms):
+        group = [r for r in results if r["setting_id"] == sid]
+        defaults = [r for r in group if r["candidate_role"] == "range_default_fixed"]
+        tuned = [r for r in group if r["candidate_role"] == "fresh_fixed_comparator"]
+        adaptive = [r for r in group if r["method"] == "slaclip"]
+        if len(defaults) != 1 or len(tuned) != 1 or len(adaptive) != 3:
+            raise CampaignError("each range setting needs two fixed controls and three SlaClip arms")
+        default, strong = defaults[0], tuned[0]
+        if default["initial_C"] != 1.0:
+            raise CampaignError("default range control must use C=1")
+        setting_comparisons = []
+        for row in adaptive:
+            arm = arm_by_key[(sid, row["candidate"])]
+            if (row["seed"] != default["seed"] or row["seed"] != strong["seed"]
+                    or row["initial_C"] != default["initial_C"]):
+                raise CampaignError("range arms must match seeds and default C0=1")
+            record = {
+                "setting_id": sid, "candidate": row["candidate"],
+                "arm_id": arm["arm_id"], "relative_root": arm["relative_root"],
+                "seed": arm["seed"], "steps": arm["steps"],
+                "range_position": arm["range_position"], "rho": row["rho"],
+                "slaclip_initial_C": row["initial_C"],
+                "default_fixed_C": default["initial_C"],
+                "tuned_fixed_C": strong["initial_C"],
+                "slaclip_validation_loss": row["public_validation_loss"],
+                "default_fixed_validation_loss": default["public_validation_loss"],
+                "tuned_fixed_validation_loss": strong["public_validation_loss"],
+                "loss_improvement_vs_default": default["public_validation_loss"] - row["public_validation_loss"],
+                "loss_improvement_vs_tuned": strong["public_validation_loss"] - row["public_validation_loss"],
+                "endpoint_win_vs_default": row["public_validation_loss"] < default["public_validation_loss"],
+                "endpoint_win_vs_tuned": row["public_validation_loss"] < strong["public_validation_loss"],
+                "full_auc_not_worse_vs_default": row["full_normalized_validation_loss_auc"] <= default["full_normalized_validation_loss_auc"],
+                "full_auc_not_worse_vs_tuned": row["full_normalized_validation_loss_auc"] <= strong["full_normalized_validation_loss_auc"],
+                "late_auc_not_worse_vs_default": row["late_window_normalized_validation_loss_auc"] <= default["late_window_normalized_validation_loss_auc"],
+                "late_auc_not_worse_vs_tuned": row["late_window_normalized_validation_loss_auc"] <= strong["late_window_normalized_validation_loss_auc"],
+                "C_hit_min_steps": row["C_hit_min_steps"],
+                "C_hit_max_steps": row["C_hit_max_steps"],
+            }
+            comparisons.append(record)
+            setting_comparisons.append(record)
+        ranking = sorted(setting_comparisons, key=lambda r: (
+            r["slaclip_validation_loss"], r["rho"], r["candidate"],
+        ))
+        winner = ranking[0]
+        selections.append({
+            "setting_id": sid,
+            "selected_candidate": winner["candidate"],
+            "selected_arm": arm_by_key[(sid, winner["candidate"])],
+            "selected_validation_loss": winner["slaclip_validation_loss"],
+            "selected_beats_default": winner["endpoint_win_vs_default"],
+            "selected_beats_tuned": winner["endpoint_win_vs_tuned"],
+            "ranking": ranking,
+        })
+    if len(comparisons) != 12 or len(selections) != 4:
+        raise CampaignError("range screen requires twelve comparisons and four selections")
+    shared = {
+        "schema_version": 1,
+        "profile": manifest["profile"], "code_sha": manifest["code_sha"],
+        "manifest_sha256": manifest_sha256,
+        "source_lock_sha256": source_lock_sha256,
+        "NON_PRIVATE_TELEMETRY": True, "NON_PRIVATE_CALIBRATION": True,
+        "end_to_end_dp_claim": False,
+        "accuracy_evaluated": False, "journal_confirmation_ready": False,
+        "inference": "single_fresh_seed_150_step_exploratory_best_of_three_validation_selection",
+        "target_source": "paper_default_C1_all_500_steps_min_max_interval_positions",
+        "target_formula": "rho_q=r_min+q*(r_max-r_min)",
+        "controller_global_target": "p_star_t=rho_q*(1-z_t)",
+        "inverse_small_mass_adjustment": False,
+        "selection_metric": "step_150_public_holdout_response_only_mean_per_record_loss",
+        "selection_rule": "ascending endpoint validation loss, then rho, then candidate id",
+        "test_metrics_used_for_selection": False,
+        "next_step": "freeze selections before full-length fresh-seed official-utility confirmation; retain unsuccessful settings",
+    }
+    comparison = {
+        **shared,
+        "comparison_rule": "same-seed same-budget C0=1 adaptive vs default fixed C1, plus independently tuned fixed benchmark",
+        "comparisons": comparisons,
+        "selected_default_wins": sum(s["selected_beats_default"] for s in selections),
+        "selected_tuned_wins": sum(s["selected_beats_tuned"] for s in selections),
+        "settings": selections,
+    }
+    selection = {**shared, "settings": selections, "arm_artifact_sha256": artifact_hashes}
+    return comparison, selection
+
+
 def analyze(root: Path) -> None:
     manifest_path = root / "plans" / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -3418,6 +3542,18 @@ def analyze(root: Path) -> None:
     high_c_lock = None
     r8_slack_lock = None
     weighted_lock = None
+    if manifest.get("profile") == "glue-range-target-screen":
+        range_sources = _range_target_module().verify_sources(_builder_api(), root)
+        _with_sha(root / "selection" / "range-sources.lock.json", _json_bytes(range_sources))
+        expected = build_manifest(
+            manifest["code_sha"], _weighted_target_module().MODEL_REVISION,
+            "0" * 40, profile="glue-range-target-screen",
+        )
+        if (manifest.get("arms") != expected["arms"]
+                or manifest.get("range_target_screen") != expected["range_target_screen"]):
+            raise CampaignError("range plan or target recipe differs from the immutable profile")
+        if len(analysis_arms) != 20 or len({a["arm_id"] for a in analysis_arms}) != 20:
+            raise CampaignError("range screen requires 20 unique arms")
     if manifest.get("profile") == "glue-quantile-target-screen":
         quantile_sources = _quantile_target_module().verify_sources(_builder_api(), root)
         _with_sha(root / "selection" / "quantile-sources.lock.json", _json_bytes(quantile_sources))
@@ -3519,6 +3655,7 @@ def analyze(root: Path) -> None:
             "glue-r8-slack-screen", "glue-target-baseline-screen",
             "glue-weighted-target-screen",
             "glue-quantile-target-screen",
+            "glue-range-target-screen",
         }
         raw_records = None
         if focused_screen:
@@ -4014,7 +4151,7 @@ def analyze(root: Path) -> None:
     best_fixed = {}
     for row in results:
         paired_rank8_fixed = (
-            manifest.get("profile") not in {"glue-r8-slack-screen", "glue-weighted-target-screen", "glue-quantile-target-screen"}
+            manifest.get("profile") not in {"glue-r8-slack-screen", "glue-weighted-target-screen", "glue-quantile-target-screen", "glue-range-target-screen"}
             or row["candidate_role"] == "fresh_fixed_comparator"
         )
         if row["method"] == "baseline" and paired_rank8_fixed:
@@ -4073,7 +4210,15 @@ def analyze(root: Path) -> None:
         ),
         "rows": regime_rows,
     }))
-    if manifest.get("profile") == "glue-quantile-target-screen":
+    if manifest.get("profile") == "glue-range-target-screen":
+        comparison, selection = _build_range_screen_reports(
+            manifest, results, focused_artifact_hashes,
+            _file_sha256(manifest_path),
+            _file_sha256(root / "selection" / "range-sources.lock.json"),
+        )
+        _with_sha(out / "range_target_comparison.json", _json_bytes(comparison))
+        _with_sha(root / "selection" / "best-range-targets.lock.json", _json_bytes(selection))
+    elif manifest.get("profile") == "glue-quantile-target-screen":
         comparisons = []
         arm_by_id = {(a["setting_id"], a["candidate_id"]): a for a in analysis_arms}
         for sid in dict.fromkeys(a["setting_id"] for a in analysis_arms):
@@ -4483,6 +4628,7 @@ def parser() -> argparse.ArgumentParser:
             "glue-target-baseline-screen",
             "glue-weighted-target-screen",
             "glue-quantile-target-screen",
+            "glue-range-target-screen",
         ),
         default="paper-breadth",
     )

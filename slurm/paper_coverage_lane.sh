@@ -31,7 +31,8 @@ is_focused_glue_profile() {
       || "${COVERAGE_PROFILE}" == glue-r8-slack-screen \
       || "${COVERAGE_PROFILE}" == glue-target-baseline-screen \
       || "${COVERAGE_PROFILE}" == glue-weighted-target-screen \
-      || "${COVERAGE_PROFILE}" == glue-quantile-target-screen ]]
+      || "${COVERAGE_PROFILE}" == glue-quantile-target-screen \
+      || "${COVERAGE_PROFILE}" == glue-range-target-screen ]]
 }
 
 is_baseline_only_profile() {
@@ -150,7 +151,8 @@ run_training() {
   fi
   if [[ "${COVERAGE_PROFILE}" == glue-target-baseline-screen \
       || "${COVERAGE_PROFILE}" == glue-weighted-target-screen \
-      || "${COVERAGE_PROFILE}" == glue-quantile-target-screen ]]; then
+      || "${COVERAGE_PROFILE}" == glue-quantile-target-screen \
+      || "${COVERAGE_PROFILE}" == glue-range-target-screen ]]; then
     raw_hist_bins=512
     raw_hist_max=200.0
   fi
@@ -158,7 +160,8 @@ run_training() {
   local controller_c_bounds="not_applicable_to_fixed_baseline"
   local controller_c_max=15.0
   if [[ "${COVERAGE_PROFILE}" == glue-weighted-target-screen \
-      || "${COVERAGE_PROFILE}" == glue-quantile-target-screen ]]; then
+      || "${COVERAGE_PROFILE}" == glue-quantile-target-screen \
+      || "${COVERAGE_PROFILE}" == glue-range-target-screen ]]; then
     controller_c_max=100.0
   fi
   if [[ "${method}" == slaclip ]]; then
@@ -436,6 +439,12 @@ run_one_real_smoke() {
       smoke_telemetry_mode=research_raw
       smoke_raw_args+=(--allow_non_private_telemetry --raw_hist_bins 512 --raw_hist_max 200.0)
     fi
+    if [[ "${COVERAGE_PROFILE}" == glue-range-target-screen ]]; then
+      # Exercise the same C0=1 path as the default-baseline-derived range arms.
+      smoke_initial_c=1.0
+      smoke_telemetry_mode=research_raw
+      smoke_raw_args+=(--allow_non_private_telemetry --raw_hist_bins 512 --raw_hist_max 200.0)
+    fi
     local -a args=(
       "${PYTHON_BIN}" -u train_eval.py --config "${config}"
       --dataset "${dataset}" --method "${method}" --privacy dp
@@ -457,6 +466,10 @@ run_one_real_smoke() {
           || "${COVERAGE_PROFILE}" == glue-quantile-target-screen ]]; then
         smoke_c_max=100.0
         smoke_rho=0.79
+      fi
+      if [[ "${COVERAGE_PROFILE}" == glue-range-target-screen ]]; then
+        smoke_c_max=100.0
+        smoke_rho=0.65
       fi
       args+=(--slaclip_target_non_small_clip_fraction "${smoke_rho}" --slaclip_eta 0.05 --slaclip_c_min 0.1 --slaclip_c_max "${smoke_c_max}")
     fi
@@ -529,6 +542,50 @@ for row in rows:
         or len(row.get("raw_global_norm_hist_edges", [])) != 513
     ):
         raise SystemExit("target-baseline real smoke telemetry semantics mismatch")
+PY
+    fi
+    if [[ "${COVERAGE_PROFILE}" == glue-range-target-screen ]]; then
+      "${PYTHON_BIN}" - "${root}/adapter/run_status.json" \
+        "${root}/results/research_raw/NON_PRIVATE_train_log.jsonl" "${method}" <<'PY'
+import json
+import math
+import sys
+
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+config = status.get("config", {})
+rows = [json.loads(line) for line in open(sys.argv[2], encoding="utf-8") if line.strip()]
+method = sys.argv[3]
+if (
+    config.get("method") != method
+    or config.get("telemetry_mode") != "research_raw"
+    or config.get("dp_max_grad_norm") != 1.0
+    or config.get("slaclip_num_slots") != 15
+    or config.get("raw_hist_bins") != 512
+    or config.get("raw_hist_max") != 200.0
+    or [row.get("step") for row in rows] != [1, 2]
+):
+    raise SystemExit("range real smoke did not lock C0=1 research telemetry")
+if method == "slaclip" and (
+    config.get("slaclip_target_non_small_clip_fraction") != 0.65
+    or config.get("slaclip_eta") != 0.05
+    or config.get("slaclip_c_min") != 0.1
+    or config.get("slaclip_c_max") != 100.0
+):
+    raise SystemExit("range real smoke Full SlaClip controller lock mismatch")
+for row in rows:
+    realized = int(row["raw_realized_batch_size"])
+    counts = row.get("raw_global_norm_hist_counts", [])
+    edges = row.get("raw_global_norm_hist_edges", [])
+    overflow = row.get("raw_global_norm_hist_overflow")
+    if (
+        row.get("telemetry_schema_version") != 7
+        or not math.isfinite(float(row["raw_clip_fraction"]))
+        or len(counts) != 512
+        or len(edges) != 513
+        or not isinstance(overflow, int)
+        or sum(counts) + overflow != realized
+    ):
+        raise SystemExit("range real smoke raw clipping/histogram telemetry mismatch")
 PY
     fi
   done

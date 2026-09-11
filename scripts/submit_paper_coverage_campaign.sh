@@ -85,7 +85,8 @@ if [[ "${COVERAGE_PROFILE}" != paper-breadth \
     && "${COVERAGE_PROFILE}" != glue-r8-slack-screen \
     && "${COVERAGE_PROFILE}" != glue-target-baseline-screen \
     && "${COVERAGE_PROFILE}" != glue-weighted-target-screen \
-    && "${COVERAGE_PROFILE}" != glue-quantile-target-screen ]]; then
+    && "${COVERAGE_PROFILE}" != glue-quantile-target-screen \
+    && "${COVERAGE_PROFILE}" != glue-range-target-screen ]]; then
   echo "error: unsupported PRISM_COVERAGE_PROFILE" >&2
   exit 2
 fi
@@ -98,6 +99,7 @@ if [[ ( "${COVERAGE_PROFILE}" == glue-high-c-refinement \
       || "${COVERAGE_PROFILE}" == glue-target-baseline-screen \
       || "${COVERAGE_PROFILE}" == glue-weighted-target-screen \
       || "${COVERAGE_PROFILE}" == glue-quantile-target-screen \
+      || "${COVERAGE_PROFILE}" == glue-range-target-screen \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-cached \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-all-cached \
       || "${COVERAGE_PROFILE}" == baseline-gap-fill-math-only-cached ) \
@@ -121,6 +123,7 @@ for required in \
   scripts/build_paper_coverage_campaign.py \
   scripts/weighted_target_screen.py \
   scripts/quantile_target_screen.py \
+  scripts/range_target_screen.py \
   scripts/prepare_glue_eval_assets.py \
   scripts/preflight_hpc.py \
   scripts/smoke_dp_path.py \
@@ -153,6 +156,7 @@ if [[ "${COVERAGE_PROFILE}" != glue-slaclip-screen \
     && "${COVERAGE_PROFILE}" != glue-target-baseline-screen \
     && "${COVERAGE_PROFILE}" != glue-weighted-target-screen \
     && "${COVERAGE_PROFILE}" != glue-quantile-target-screen \
+    && "${COVERAGE_PROFILE}" != glue-range-target-screen \
     && "${COVERAGE_PROFILE}" != baseline-gap-fill-cached \
     && "${COVERAGE_PROFILE}" != baseline-gap-fill-all-cached \
     && "${COVERAGE_PROFILE}" != baseline-gap-fill-math-only-cached ]]; then
